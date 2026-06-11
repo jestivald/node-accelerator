@@ -81,9 +81,18 @@ install_xanmod() {
     fi
 
     mkdir -p /etc/apt/keyrings
-    # Добавлен ключ --yes для автоматического затирания старого ключа при переустановке
+    
+    # --- ДВУХКАНАЛЬНЫЙ ИМПОРТ КЛЮЧА ---
+    # 1. Сначала пробуем скачать ключ напрямую с официального сайта XanMod
     if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
-        warn "Не скачал ключ XanMod — пропускаю установку ядра"; return 1
+        warn "Прямая ссылка dl.xanmod.org заблокирована Cloudflare (стандартно для Hetzner/GCP). Пробую резервный Keyserver..."
+        
+        # 2. Если прямой запрос заблокирован, скачиваем ключ с официального Ubuntu Keyserver по сигнатуре 86F7D09EE734E623
+        if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x86F7D09EE734E623" | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
+            warn "Резервный Keyserver также недоступен. Пропускаю установку ядра"; return 1
+        else
+            ok "Ключ XanMod успешно импортирован через резервный Keyserver!"
+        fi
     fi
     chmod 0644 "$keyring"
 
@@ -135,7 +144,8 @@ install_xanmod() {
             
             tput civis 2>/dev/null || true  # Временно скрываем курсор
             
-            # Конвейер с умным парсингом логов. Избегаем local внутри цикла while.
+            # Используем stdbuf -oL для отключения буферизации вывода в pipe,
+            # и выводим статус-лог прямо в stdout (FD 1). Лишний текстовый вывод отсекается в цикле.
             if ! DEBIAN_FRONTEND=noninteractive stdbuf -oL apt-get -o APT::Status-Fd=1 install -y "$p" 2>"$err_log" | while IFS=: read -r f1 f2 f3 f4 rest; do
                 case "$f1" in
                     pmstatus|dlstatus)
