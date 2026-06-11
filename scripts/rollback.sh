@@ -41,7 +41,7 @@ rollback_optimize() {
             DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg" >/dev/null 2>&1 || warn "не удалил $pkg"
             update-grub >/dev/null 2>&1 || true
             
-            # НОВОЕ: Очищаем репозитории и GPG-ключи XanMod при полном удалении ядра
+            # Очищаем репозитории и GPG-ключи XanMod при полном удалении ядра
             info "Удаляю репозиторий и GPG-ключ XanMod из системы..."
             rm -f /etc/apt/sources.list.d/xanmod*.list
             rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
@@ -92,4 +92,4 @@ case "$WHAT" in
     all)      rollback_protect; rollback_optimize ;;
     *) err "Использование: $0 [optimize|protect|all]"; exit 1 ;;
 esac
-ok "Бэкапы остаются in /var/backups/node-accelerator/"
+ok "Бэкапы остаются в /var/backups/node-accelerator/"
