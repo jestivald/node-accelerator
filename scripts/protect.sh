@@ -149,7 +149,8 @@ ANTISPOOF=""
 if [[ -n "$WAN" ]]; then
     ANTISPOOF="        # anti-spoofing: приватные/bogon источники на WAN = спуф
         udp sport 67 udp dport 68 accept
-        iifname \"${WAN}\" ip saddr @bogon_v4 drop"
+        iifname \"${WAN}\" ip saddr @bogon_v4 drop
+        iifname \"${WAN}\" ip6 saddr @bogon_v6 drop"
 fi
 
 # portscan → autoban (включается флагом)
@@ -194,8 +195,11 @@ table inet na_filter {
     set whitelist_v4 { type ipv4_addr; flags interval; auto-merge; $WL4_LINE }
     set whitelist_v6 { type ipv6_addr; flags interval; auto-merge; $WL6_LINE }
 
-    set autoban_v4 { type ipv4_addr; flags timeout; }
-    set autoban_v6 { type ipv6_addr; flags timeout; }
+    # size — потолок записей: portscan-бан ловит чистый SYN (тривиально спуфится),
+    # без лимита спуф-флуд раздул бы set в памяти ядра. При переполнении новые баны
+    # просто не добавляются (старые живут по timeout).
+    set autoban_v4 { type ipv4_addr; flags timeout; size 65536; }
+    set autoban_v6 { type ipv6_addr; flags timeout; size 65536; }
 
     # bogon/martian источники (RFC1918, CGNAT, loopback, link-local, TEST-NET, multicast)
     set bogon_v4 {
@@ -205,6 +209,16 @@ table inet na_filter {
             169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24,
             192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24,
             224.0.0.0/3
+        }
+    }
+
+    # bogon-источники IPv6, которые НЕ могут легитимно прийти как saddr на WAN.
+    # СОЗНАТЕЛЬНО без fe80::/10 (NDP/RA — link-local source) и без ff00::/8 (multicast):
+    # их дроп убил бы соседство/автоконфиг IPv6. Только однозначно поддельные диапазоны.
+    set bogon_v6 {
+        type ipv6_addr; flags interval; auto-merge
+        elements = {
+            ::1/128, ::/128, ::ffff:0:0/96, 100::/64, 2001:db8::/32, fc00::/7
         }
     }
 
@@ -415,6 +429,37 @@ fi
 STAT
 chmod +x /usr/local/sbin/na-fw-status
 
+# ─── top-talkers хелпер ──────────────────────────────────────────────────────
+# Если нода за реверс-прокси/балансировщиком/CDN — трафик идёт с горстки upstream-IP,
+# и per-IP лимиты их режут. Хелпер показывает топ источников → кандидаты в WHITELIST=.
+cat > /usr/local/sbin/na-fw-top-talkers <<'TT'
+#!/usr/bin/env bash
+# Топ удалённых IP по числу установленных TCP-соединений на сервисных портах.
+# Если нода за реверс-прокси/балансировщиком/CDN — легитимный трафик приходит с
+# небольшого набора upstream-адресов; их стоит занести в WHITELIST=, чтобы per-IP
+# лимиты (CONN_LIMIT/SYN_RATE) их не резали. Хелпер показывает кандидатов.
+#   na-fw-top-talkers [порт[,порт...]] [N]   (по умолчанию порты из protect, N=25)
+set -u
+DEF=443
+if [ -r /var/lib/node-accelerator/protect.installed ]; then
+    DEF="$(awk -F= '/^tcp_ports=/{print $2}' /var/lib/node-accelerator/protect.installed)"
+fi
+PORTS="${1:-${DEF:-443}}"
+N="${2:-25}"
+filt=""
+for p in ${PORTS//,/ }; do
+    [ -n "$p" ] || continue
+    filt="${filt:+$filt or }sport = :$p"
+done
+[ -n "$filt" ] || { echo "нет портов для анализа"; exit 1; }
+echo "── Топ-$N удалённых IP по established TCP на портах: $PORTS ──"
+ss -Hnt state established "( $filt )" 2>/dev/null \
+    | awk '{print $5}' \
+    | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
+    | sort | uniq -c | sort -rn | head -n "$N"
+TT
+chmod +x /usr/local/sbin/na-fw-top-talkers
+
 # ─── Маркер ──────────────────────────────────────────────────────────────────
 mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/protect.installed" <<EOF
@@ -446,4 +491,4 @@ else
     warn "Подтверди доступ и сними: systemctl stop na-fw-safety.timer"
 fi
 echo
-ok "Готово. Статус: na-fw-status"
+ok "Готово. Статус: na-fw-status | топ источников (для WHITELIST за CDN/LB): na-fw-top-talkers"
