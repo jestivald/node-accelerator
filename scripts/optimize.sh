@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # optimize.sh — ⚡ Оптимизатор ноды.
-#   • XanMod-ядро (BBRv3) — авто-выбор сборки по psABI, пропуск на контейнерах/ARM
+#   • XanMod-ядро (BBRv3) — авто-выбор сборки по psABI, пропуск на контейнерах/ARM (с поддержкой Ubuntu 22)
 #   • sysctl: BBR + fq, большие буферы, conntrack, anti-spoof, syncookies
 #   • RPS/RFS/XPS — размазывает обработку пакетов по всем ядрам (главное на virtio-VPS)
 #   • лимиты nofile/nproc, swap, journald cap, THP off, CPU governor=performance, NIC tune
@@ -22,6 +22,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 require_root
 detect_os
 
+# ─── Очистка старых битых репозиториев ───────────────────────────────────────
+# Удаляем файлы прошлых неудачных попыток установки, чтобы они не блокировали apt в начале скрипта
+rm -f /etc/apt/sources.list.d/xanmod*.list
+
 ENABLE_XANMOD="${ENABLE_XANMOD:-1}"
 XANMOD_FLAVOR="${XANMOD_FLAVOR:-lts}"
 BACKUP="$(backup_dir)"
@@ -39,6 +43,15 @@ install_xanmod() {
     local codename keyring=/etc/apt/keyrings/xanmod-archive-keyring.gpg
     local list=/etc/apt/sources.list.d/xanmod-release.list
     codename="$(os_codename)"
+    local is_jammy=false
+
+    # Если мы на Ubuntu 22.04 (jammy), используем совместимый репозиторий 'bookworm' и только LTS-версию ядра
+    if [[ "$codename" == "jammy" ]]; then
+        info "Обнаружена Ubuntu 22.04 (jammy). Подменяем репозиторий на 'bookworm' и переводим сборку в режим LTS..."
+        codename="bookworm"
+        XANMOD_FLAVOR="lts"
+        is_jammy=true
+    fi
 
     mkdir -p /etc/apt/keyrings
     if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o "$keyring" 2>/dev/null; then
@@ -49,9 +62,14 @@ install_xanmod() {
     # Сначала пробуем по codename (новый формат репо), при неудаче — releases (старый).
     echo "deb [signed-by=$keyring] http://deb.xanmod.org ${codename:-releases} main" > "$list"
     if ! apt-get update -qq 2>/dev/null; then
-        warn "Репозиторий по '$codename' не поднялся, пробую 'releases'"
-        echo "deb [signed-by=$keyring] http://deb.xanmod.org releases main" > "$list"
-        apt-get update -qq 2>/dev/null || { warn "XanMod-репо недоступен"; return 1; }
+        if [[ "$is_jammy" == "true" ]]; then
+            warn "Репозиторий bookworm не поднялся"
+            return 1
+        else
+            warn "Репозиторий по '$codename' не поднялся, пробую 'releases'"
+            echo "deb [signed-by=$keyring] http://deb.xanmod.org releases main" > "$list"
+            apt-get update -qq 2>/dev/null || { warn "XanMod-репо недоступен"; return 1; }
+        fi
     fi
 
     # Выбор сборки: явный XANMOD_PKG > по psABI-уровню. Деградация v3→v2→v1.
@@ -60,7 +78,12 @@ install_xanmod() {
     [[ "$flv" == "main" ]] && pref=""
     [[ "$flv" == "edge" ]] && pref="edge-"
     [[ "$flv" == "rt"  ]] && pref="rt-"
-    lvl="$(cpu_psabi_level)"
+    
+    # Пытаемся получить уровень процессора. Если функция из lib/common.sh пуста/ошибочна, используем awk-тест
+    lvl="$(cpu_psabi_level 2>/dev/null || echo "")"
+    if [[ -z "$lvl" || ! "$lvl" =~ ^[1-4]$ ]]; then
+        lvl=$(curl -fsSL https://dl.xanmod.org/check_x86-64_psabi.sh | awk -f - 2>/dev/null | grep -oP 'x86-64-v\K\d' || echo "2")
+    fi
     info "psABI уровень CPU: x86-64-v$lvl, сборка: ${flv}"
 
     local candidates=()
