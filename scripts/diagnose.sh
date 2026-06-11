@@ -171,6 +171,16 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     info "autoban: v4=$AB4  v6=$AB6"
     WLN=$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
     [[ "$WLN" -gt 0 ]] && pass "whitelist_v4: $WLN адрес(ов)" || wrn "whitelist пуст — твой IP не защищён от автобана!"
+    # датчик: насколько близко самый «жирный» источник к CONN_LIMIT (виден ли per-IP потолок)
+    CLIM=$(nft list chain inet na_filter input 2>/dev/null | grep -oE 'ct count over [0-9]+' | head -1 | grep -oE '[0-9]+')
+    if [[ -n "$CLIM" ]]; then
+        MAXIP=$(ss -tnH state established 2>/dev/null | awk '{print $NF}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' | sort | uniq -c | sort -rn | head -1 | awk '{print $1+0}')
+        if [[ "${MAXIP:-0}" -ge $((CLIM*80/100)) ]]; then
+            wrn "макс. конн. с одного IP = ${MAXIP:-0} при CONN_LIMIT=$CLIM (≥80%) — за CGNAT возможны дропы, подними CONN_LIMIT"
+        else
+            pass "макс. конн. с одного IP = ${MAXIP:-0} / CONN_LIMIT $CLIM (запас есть)"
+        fi
+    fi
 else
     wrn "na_filter не активна — защита не стоит (запусти 🛡 protect)"
 fi
