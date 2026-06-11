@@ -82,16 +82,16 @@ install_xanmod() {
 
     mkdir -p /etc/apt/keyrings
     
-    # --- ДВУХКАНАЛЬНЫЙ ИМПОРТ КЛЮЧА ---
+    # --- ДВУХКАНАЛЬНЫЙ ИМПОРТ КЛЮЧА (С ТАЙМАУТАМИ) ---
     # 1. Сначала пробуем скачать ключ напрямую с официального сайта XanMod
-    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
+    if ! curl -fsSL --connect-timeout 5 --max-time 15 https://dl.xanmod.org/archive.key | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
         warn "Прямая ссылка dl.xanmod.org заблокирована Cloudflare (стандартно для Hetzner/GCP). Пробую резервный Keyserver..."
         
         # 2. Если прямой запрос заблокирован, скачиваем ключ с официального Ubuntu Keyserver по сигнатуре 86F7D09EE734E623
-        if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x86F7D09EE734E623" | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
+        if ! curl -fsSL --connect-timeout 5 --max-time 15 "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x86F7D09EE734E623" | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
             warn "Резервный Keyserver также недоступен. Пропускаю установку ядра"; return 1
         else
-            ok "Ключ XanMod успешно импортирован через резервный Keyserver!"
+            ok "Ключ XanMod успешно импортирован через резервный Keyserver! (Прямой доступ заблокирован)"
         fi
     fi
     chmod 0644 "$keyring"
@@ -116,10 +116,10 @@ install_xanmod() {
     [[ "$flv" == "edge" ]] && pref="edge-"
     [[ "$flv" == "rt"  ]] && pref="rt-"
     
-    # Пытаемся получить уровень процессора. Если функция из lib/common.sh пуста/ошибочна, используем awk-тест
+    # Пытаемся получить уровень процессора. Если функция из lib/common.sh пуста/ошибочна, используем awk-тест с таймаутом
     lvl="$(cpu_psabi_level 2>/dev/null || echo "")"
     if [[ -z "$lvl" || ! "$lvl" =~ ^[1-4]$ ]]; then
-        lvl=$(curl -fsSL https://dl.xanmod.org/check_x86-64_psabi.sh | awk -f - 2>/dev/null | grep -oP 'x86-64-v\K\d' || echo "2")
+        lvl=$(curl -fsSL --connect-timeout 5 --max-time 15 https://dl.xanmod.org/check_x86-64_psabi.sh | awk -f - 2>/dev/null | grep -oP 'x86-64-v\K\d' || echo "2")
     fi
     info "psABI уровень CPU: x86-64-v$lvl, сборка: ${flv}"
 
