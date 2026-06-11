@@ -32,6 +32,33 @@ BACKUP="$(backup_dir)"
 REBOOT_NEEDED=0
 info "Бэкап изменяемых файлов: $BACKUP"
 
+# ─── Вспомогательные функции прогресс-бара ──────────────────────────────────
+# Отрисовка графического прогресс-бара в реальном времени
+draw_progress_bar() {
+    local percent=$1
+    local desc=$2
+    local width=30
+    local filled=$((percent * width / 100))
+    local empty=$((width - filled))
+    
+    # Создаем заполненную часть шкалы (символ #)
+    local filled_bar=""
+    for ((i=0; i<filled; i++)); do filled_bar="${filled_bar}#"; done
+    
+    # Создаем пустую часть шкалы (символ -)
+    local empty_bar=""
+    for ((i=0; i<empty; i++)); do empty_bar="${empty_bar}-"; done
+    
+    # Обрезаем описание, чтобы шкала не съезжала на узких экранах
+    local max_desc_len=35
+    if [ ${#desc} -gt $max_desc_len ]; then
+        desc="${desc:0:$((max_desc_len - 3))}..."
+    fi
+    
+    # Печатаем прогресс-бар и очищаем остаток консольной строки (ANSI \033[K)
+    printf "\r[*] [%s%s] %3d%% (%s)\033[K" "$filled_bar" "$empty_bar" "$percent" "$desc"
+}
+
 # ─── 1. Зависимости ──────────────────────────────────────────────────────────
 title "Зависимости"
 apt_install ca-certificates curl gnupg irqbalance ethtool
@@ -54,7 +81,8 @@ install_xanmod() {
     fi
 
     mkdir -p /etc/apt/keyrings
-    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o "$keyring" 2>/dev/null; then
+    # Добавлен ключ --yes для автоматического затирания старого ключа при переустановке
+    if ! curl -fsSL https://dl.xanmod.org/archive.key | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
         warn "Не скачал ключ XanMod — пропускаю установку ядра"; return 1
     fi
     chmod 0644 "$keyring"
@@ -101,9 +129,63 @@ install_xanmod() {
     for p in "${candidates[@]}"; do
         if apt-cache show "$p" >/dev/null 2>&1; then
             info "Ставлю $p (это надолго — компилит initramfs)..."
-            if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$p" >/dev/null 2>&1; then
-                pkg="$p"; break
+            
+            local err_log
+            err_log=$(mktemp)
+            
+            tput civis 2>/dev/null || true  # Временно скрываем курсор
+            
+            # Конвейер с умным парсингом логов. Избегаем local внутри цикла while.
+            if ! DEBIAN_FRONTEND=noninteractive stdbuf -oL apt-get -o APT::Status-Fd=1 install -y "$p" 2>"$err_log" | while IFS=: read -r f1 f2 f3 f4 rest; do
+                case "$f1" in
+                    pmstatus|dlstatus)
+                        percent_raw="$f3"
+                        desc_raw="$f4"
+                        
+                        # Если в f3 нет числа, пробуем взять его из f2 (защита от плавающего формата)
+                        if [[ ! "$percent_raw" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                            if [[ "$f2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                                percent_raw="$f2"
+                                desc_raw="$f3"
+                            else
+                                continue
+                            fi
+                        fi
+                        
+                        # Превращаем float во integer (например, 14.2500 -> 14)
+                        percent="${percent_raw%%.*}"
+                        
+                        # Финальная валидация и отрисовка
+                        if [[ "$percent" =~ ^[0-9]+$ ]]; then
+                            [[ $percent -gt 100 ]] && percent=100
+                            
+                            action_prefix=""
+                            if [[ "$f1" == "dlstatus" ]]; then
+                                action_prefix="Загрузка: "
+                            else
+                                action_prefix="Установка: "
+                            fi
+                            
+                            draw_progress_bar "$percent" "${action_prefix}${desc_raw}"
+                        fi
+                        ;;
+                esac
+            done; then
+                # Если произошла ошибка при установке ядра
+                printf "\r\033[K"  # Стираем строку прогресса
+                tput cnorm 2>/dev/null || true # Возвращаем курсор
+                warn "Ошибка при установке пакета $p:"
+                cat "$err_log" >&2
+                rm -f "$err_log"
+                return 1
             fi
+            
+            # Успешное завершение установки
+            printf "\r\033[K"  # Стираем строку прогресса
+            tput cnorm 2>/dev/null || true # Возвращаем курсор
+            rm -f "$err_log"
+            pkg="$p"
+            break
         fi
     done
     [[ -z "${pkg:-}" ]] && { warn "Ни одна сборка XanMod не поставилась"; return 1; }
