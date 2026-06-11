@@ -35,6 +35,19 @@ info "OS:     ${PRETTY_NAME:-$(. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME
 info "Kernel: $(uname -r)   Arch: $(arch)"
 info "Virt:   $VIRT   CPU: ${CORES} ядер   RAM: ${MEM:-?}"
 info "Uptime: $(uptime -p 2>/dev/null || uptime)"
+# CPU steal: сколько CPU у нашей VPS отбирает гипервизор — главный скрытый потолок,
+# не виден в load/governor. Дельта за 1 секунду по агрегату /proc/stat.
+read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+sleep 1
+read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+DT=$(( (u2+n2+s2+i2+w2+q2+sq2+st2) - (u1+n1+s1+i1+w1+q1+sq1+st1) ))
+if [[ "${DT:-0}" -gt 0 ]]; then
+    STEAL=$(( (st2 - st1) * 100 / DT ))
+    if   [[ "$STEAL" -ge 10 ]]; then bad  "CPU steal = ${STEAL}% — гипервизор активно отбирает CPU (оверселл/шумный сосед)"
+    elif [[ "$STEAL" -ge 3  ]]; then wrn  "CPU steal = ${STEAL}% (заметный — под пиками может проседать)"
+    else                             pass "CPU steal = ${STEAL}% (CPU ноды не отбирают)"
+    fi
+fi
 
 # ─── Ядро / BBR ──────────────────────────────────────────────────────────────
 title "Ядро и congestion control"
@@ -59,6 +72,18 @@ QD="$(val net.core.default_qdisc)"
 if [[ "$(arch)" == "x86_64" ]]; then
     LVL="$(cpu_psabi_level)"
     info "CPU psABI: поддерживает до x86-64-v${LVL} (выбор сборки XanMod)"
+fi
+# Реальность поверх sysctl: сколько живых TCP-сокетов реально на BBR + доля ретрансмитов.
+BBRN="$(ss -tin 2>/dev/null | grep -c bbr || true)"
+[[ "${BBRN:-0}" -gt 0 ]] && info "Живых TCP-сокетов на BBR сейчас: $BBRN"
+eval "$(awk '
+  /^Tcp:/ { if (!h){for(i=2;i<=NF;i++)nm[i]=$i; h=1; next}
+            for(i=2;i<=NF;i++){ if(nm[i]=="OutSegs")print "OUT="$i; if(nm[i]=="RetransSegs")print "RTX="$i } }
+  ' /proc/net/snmp 2>/dev/null)"
+if [[ -n "${OUT:-}" && "${OUT:-0}" -gt 0 ]]; then
+    PCT=$(( ${RTX:-0} * 100 / OUT ))
+    [[ "$PCT" -ge 5 ]] && wrn  "TCP-ретрансмиты ${PCT}% (${RTX:-0}/${OUT}, с загрузки) — потери/перегруз на аплинке" \
+                       || pass "TCP-ретрансмиты ${PCT}% (${RTX:-0}/${OUT}, с загрузки) — линк чистый"
 fi
 
 # ─── Sysctl-ключи ────────────────────────────────────────────────────────────
@@ -148,6 +173,12 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     [[ "$WLN" -gt 0 ]] && pass "whitelist_v4: $WLN адрес(ов)" || wrn "whitelist пуст — твой IP не защищён от автобана!"
 else
     wrn "na_filter не активна — защита не стоит (запусти 🛡 protect)"
+fi
+# Взведённый сейфти-таймер: protect в неинтерактиве оставляет na-fw-safety активным.
+# Если не снять — na_filter САМОУДАЛИТСЯ через SAFETY_DELAY. Ловим это громко.
+if systemctl is-active --quiet na-fw-safety.timer 2>/dev/null \
+   || { [[ -f /tmp/na-fw-safety.pid ]] && kill -0 "$(cat /tmp/na-fw-safety.pid 2>/dev/null)" 2>/dev/null; }; then
+    bad "ВЗВЕДЁН сейфти-таймер na-fw-safety — na_filter СКОРО САМОУДАЛИТСЯ! Сними после проверки доступа: systemctl stop na-fw-safety.timer"
 fi
 if command -v cscli >/dev/null 2>&1; then
     systemctl is-active --quiet crowdsec && pass "CrowdSec агент активен" || wrn "CrowdSec установлен, но не active"
