@@ -40,6 +40,12 @@ rollback_optimize() {
             info "Удаляю XanMod-пакет $pkg ..."
             DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg" >/dev/null 2>&1 || warn "не удалил $pkg"
             update-grub >/dev/null 2>&1 || true
+            
+            # НОВОЕ: Очищаем репозитории и GPG-ключи XanMod при полном удалении ядра
+            info "Удаляю репозиторий и GPG-ключ XanMod из системы..."
+            rm -f /etc/apt/sources.list.d/xanmod*.list
+            rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
+            apt-get update -qq 2>/dev/null || true
         else
             warn "XanMod ($pkg) оставлен. Сейчас грузимся: $(uname -r)."
             warn "Чтобы убрать: загрузись со стокового ядра и запусти NA_REMOVE_XANMOD=1 rollback optimize."
@@ -86,4 +92,4 @@ case "$WHAT" in
     all)      rollback_protect; rollback_optimize ;;
     *) err "Использование: $0 [optimize|protect|all]"; exit 1 ;;
 esac
-ok "Бэкапы остаются в /var/backups/node-accelerator/"
+ok "Бэкапы остаются in /var/backups/node-accelerator/"
