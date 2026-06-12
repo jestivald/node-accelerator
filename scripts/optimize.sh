@@ -246,6 +246,13 @@ net.ipv4.tcp_keepalive_probes     = 5
 net.ipv4.tcp_max_syn_backlog      = 65535
 net.ipv4.tcp_max_tw_buckets       = 2000000
 net.ipv4.tcp_mtu_probing          = 1
+# Floor the probe MSS well above the kernel default of 48: with mtu_probing on,
+# repeated RTOs on a lossy link make the kernel suspect a PMTU black hole and
+# ratchet the send MSS down toward this floor. At 48B a segment is ~97% header
+# overhead and throughput collapses with no recovery. 512 keeps probing useful
+# for genuine black holes while never destroying goodput (and stays above the
+# CVE-2019-11479 mitigation minimum).
+net.ipv4.tcp_min_snd_mss          = 512
 net.ipv4.tcp_no_metrics_save      = 1
 net.ipv4.tcp_rfc1337              = 1
 net.ipv4.tcp_sack                 = 1
