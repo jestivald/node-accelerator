@@ -32,6 +32,10 @@ require_root
 detect_os
 BACKUP="$(backup_dir)"
 
+# Подхватываем сохранённый конфиг ноды (если есть): ре-ран без ENV не сбрасывает
+# поднятые под эту ноду ручки на дефолты. ENV по-прежнему всё переопределяет.
+load_conf "$CONF_DIR/protect.conf"
+
 # ─── Параметры ───────────────────────────────────────────────────────────────
 SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}"
 TCP_PORTS="${TCP_PORTS:-443,2087}"
@@ -57,6 +61,35 @@ ENABLE_SYNPROXY="${ENABLE_SYNPROXY:-0}"
 SAFETY_DELAY="${SAFETY_DELAY:-300}"
 DRY_RUN="${DRY_RUN:-0}"
 WAN="$(default_iface || true)"
+
+# ── v3.0: ban-once, защита node-port, блоклисты, fleet-sync, ctguard ──────────
+# ban-once: первое нарушение → suspect (наблюдение, без drop), второе в окне →
+# confirmed (drop). Режет ложные баны за CGNAT. 1=вкл (дефолт), 0=сразу банить.
+ENABLE_BANONCE="${ENABLE_BANONCE:-1}"
+SUSPECT_TIME="${SUSPECT_TIME:-30m}"        # окно наблюдения за «подозреваемым»
+# node-agent порт: открыт миру (мягкий лимит) или только whitelist. 'auto' =
+# whitelist-only, если оператор задал WHITELIST (значит, знает свой доверенный набор);
+# если WHITELIST пуст — оставляем мягкий лимит, чтобы не отрезать неизвестную панель.
+NODE_PORT_WHITELIST_ONLY="${NODE_PORT_WHITELIST_ONLY:-auto}"
+# Статич-блоклисты (Spamhaus DROP + FireHOL L1 [+ Tor]) — opt-in, обновляются таймером.
+ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-0}"
+BLOCK_TOR="${BLOCK_TOR:-0}"
+BLOCKLIST_REFRESH="${BLOCKLIST_REFRESH:-12h}"
+# Remnawave fleet auto-sync: ноды флота сами держат IP друг друга в whitelist.
+# 'auto' = вкл при заданных REMNAWAVE_URL+TOKEN; 1=форс; 0=выкл.
+REMNAWAVE_URL="${REMNAWAVE_URL:-}"
+REMNAWAVE_TOKEN="${REMNAWAVE_TOKEN:-}"
+FLEET_SYNC="${FLEET_SYNC:-auto}"
+FLEET_SYNC_INTERVAL="${FLEET_SYNC_INTERVAL:-5min}"
+# conntrack phantom-eviction (защита от distributed connect-and-hold) — opt-in,
+# по умолчанию observe-режим (только лог, без эвикта), включать осознанно.
+ENABLE_CTGUARD="${ENABLE_CTGUARD:-0}"
+NA_CTG_ENFORCE="${NA_CTG_ENFORCE:-0}"
+NA_CTG_PHANTOM_MIN="${NA_CTG_PHANTOM_MIN:-4000}"  # conntrack-порог «холдера» (выше CGNAT-churn)
+NA_CTG_LIVE_FLOOR="${NA_CTG_LIVE_FLOOR:-2}"       # ≤ столько живых сокетов = фантом
+NA_CTG_COARSE_MULT="${NA_CTG_COARSE_MULT:-3}"     # дамп conntrack только если ct ≥ ss×N
+NA_CTG_BANTIME="${NA_CTG_BANTIME:-15m}"
+NA_CTG_INTERVAL="${NA_CTG_INTERVAL:-20s}"
 
 if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" && "$DRY_RUN" != "1" ]]; then
     title "Параметры защиты"
@@ -85,14 +118,37 @@ validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
 # поэтому непровалидированный ENV здесь — не «root сам себе», а реальный вектор.
 _is_uint()     { [[ "$1" =~ ^[0-9]+$ ]]; }
 _is_duration() { [[ "$1" =~ ^[0-9]+(s|m|h|d)?$ ]]; }
+# systemd-time (OnUnitActiveSec): один числовой терм с опц. словом-единицей. Уходит
+# в .timer-юнит → валидируем, чтобы непровалидированный ENV не дописал директив.
+_is_systime()  { [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d|day)?$ ]]; }
 for _k in SYN_RATE SYN_BURST UDP_RATE UDP_BURST CONN_LIMIT ICMP_RATE ICMP_BURST \
-          SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY; do
+          SSH_RATE SSH_BURST PORTSCAN_RATE PORTSCAN_BURST SAFETY_DELAY \
+          NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR NA_CTG_COARSE_MULT; do
     _is_uint "${!_k}" || { err "$_k='${!_k}' — ожидается целое число"; exit 1; }
 done
-for _k in SSH_BAN_TIME PORTSCAN_BAN_TIME; do
+for _k in SSH_BAN_TIME PORTSCAN_BAN_TIME SUSPECT_TIME NA_CTG_BANTIME; do
     _is_duration "${!_k}" || { err "$_k='${!_k}' — ожидается число с опц. суффиксом s|m|h|d"; exit 1; }
 done
+for _k in BLOCKLIST_REFRESH FLEET_SYNC_INTERVAL NA_CTG_INTERVAL; do
+    _is_systime "${!_k}" || { err "$_k='${!_k}' — ожидается systemd-интервал (напр. 12h, 5min)"; exit 1; }
+done
+# enum-флаги 0/1 (+auto где уместно)
+for _k in ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY ENABLE_BANONCE \
+          ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD NA_CTG_ENFORCE; do
+    [[ "${!_k}" =~ ^[01]$ ]] || { err "$_k='${!_k}' — ожидается 0 или 1"; exit 1; }
+done
+[[ "$NODE_PORT_WHITELIST_ONLY" =~ ^(auto|0|1)$ ]] || { err "NODE_PORT_WHITELIST_ONLY должно быть auto|0|1"; exit 1; }
+[[ "$FLEET_SYNC" =~ ^(auto|0|1)$ ]] || { err "FLEET_SYNC должно быть auto|0|1"; exit 1; }
+if [[ -n "$REMNAWAVE_URL" && ! "$REMNAWAVE_URL" =~ ^https?://[A-Za-z0-9._~:/?#=%@-]+$ ]]; then
+    err "REMNAWAVE_URL='$REMNAWAVE_URL' — ожидается http(s)://… без спецсимволов"; exit 1
+fi
 unset _k
+
+# Резолв NODE_PORT_WHITELIST_ONLY=auto: whitelist-only только если оператор задал
+# WHITELIST (знает доверенный набор). Пустой WHITELIST → мягкий лимит (не отрезаем панель).
+if [[ "$NODE_PORT_WHITELIST_ONLY" == "auto" ]]; then
+    [[ -n "$WHITELIST" ]] && NODE_PORT_WHITELIST_ONLY=1 || NODE_PORT_WHITELIST_ONLY=0
+fi
 
 # whitelist → v4/v6
 WL4=""; WL6=""
@@ -184,27 +240,122 @@ if [[ -n "$WAN" ]]; then
         iifname \"${WAN}\" ip6 saddr @bogon_v6 drop"
 fi
 
-# portscan → autoban (включается флагом)
-PORTSCAN=""
-if [[ "$ENABLE_PORTSCAN_BAN" == "1" ]]; then
-    PORTSCAN="        # ANTI-SCAN: SYN на несервисный порт. Бан НЕ по одному пакету (иначе за CGNAT
-        # один шальной коннект банит весь оператор на ${PORTSCAN_BAN_TIME}), а только если IP
-        # бьёт по закрытым портам быстрее ${PORTSCAN_RATE}/min — это реальный сканер. Шальные
-        # одиночные SYN под порогом просто молча дропаются финальным правилом ниже, без бана.
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 5/second log prefix \"[na portscan] \" level info
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
+# node-agent порт: whitelist-only (drop мир) или мягкий per-IP лимит для неизвестных.
+if [[ "$NODE_PORT_WHITELIST_ONLY" == "1" ]]; then
+    NODE_RULES="        # node-agent: ТОЛЬКО whitelist (принят выше) — остальным drop (контрол-порт не светим)
+        tcp dport ${NODE_PORT} ct state new drop"
+    info "node-agent порт ${NODE_PORT}: whitelist-only (WHITELIST задан)"
+else
+    NODE_RULES="        # node-agent: whitelist (выше) + мягкий per-IP лимит для неизвестных
+        tcp dport ${NODE_PORT} ct state new meter na4 { ip saddr limit rate 30/second burst 60 packets } accept
+        tcp dport ${NODE_PORT} ct state new meter na6 { ip6 saddr limit rate 30/second burst 60 packets } accept
+        tcp dport ${NODE_PORT} ct state new drop"
 fi
 
-# опциональный synproxy (по умолчанию off — требует совпадения mss/wscale)
-SYNPROXY_PRE=""; SYNPROXY_IN=""
+# portscan → autoban (включается флагом). При ENABLE_BANONCE=1 — двухступенчато:
+# 1-й быстрый скан → suspect (наблюдение, БЕЗ полного бана: скан-пакеты и так дропает
+# финальный catch-all, но легит-трафик IP не режется), повторный в окне SUSPECT_TIME →
+# confirmed-бан. Снимает ложные баны целых CGNAT-операторов из-за одного шального скана.
+PORTSCAN=""
+if [[ "$ENABLE_PORTSCAN_BAN" == "1" ]]; then
+    _ps_log4="meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 5/second log prefix \"[na portscan] \" level info"
+    if [[ "$ENABLE_BANONCE" == "1" ]]; then
+        PORTSCAN="        # ANTI-SCAN (ban-once): 1-й быстрый скан → suspect, 2-й в окне ${SUSPECT_TIME} → бан.
+        $_ps_log4
+        # уже suspect и снова бьёт быстрее порога → confirmed-бан
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new ip saddr @suspect_v4 meter psc4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new ip6 saddr @suspect_v6 meter psc6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        # ещё не suspect и бьёт быстрее порога → пометить suspect (без бана; скан дропнет catch-all)
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} }
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} }"
+    else
+        PORTSCAN="        # ANTI-SCAN: бьёт по закрытым портам быстрее ${PORTSCAN_RATE}/min → бан ${PORTSCAN_BAN_TIME}.
+        $_ps_log4
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
+    fi
+fi
+
+# ─── SYNPROXY (опционально, done-right) ──────────────────────────────────────
+# notrack ТОЛЬКО для трафика к самому хосту (fib daddr type local): иначе правило в
+# prerouting цепляет conntrack/NAT ТРАНЗИТА (Docker-контейнер панели → удалённая нода)
+# и ломает его. Требует ядро ≥5.14 + модуль nf_synproxy. Запрошен, но недоступен →
+# fail-loud (маркер degraded + warn), БЕЗ тихой деградации; synproxy-правила не ставятся.
+SYNPROXY_PRE=""; SYNPROXY_IN=""; SP_MODPROBE=""; SYNPROXY_OK=0
+rm -f "$STATE_DIR/.synproxy-degraded" 2>/dev/null || true
 if [[ "$ENABLE_SYNPROXY" == "1" ]]; then
-    SP_PORTS="$(echo "$TCP_PORTS" | tr ',' ' ')"; SP_SET="$(echo "$TCP_PORTS")"
-    SYNPROXY_PRE="    chain prerouting {
+    _kmaj="$(uname -r | cut -d. -f1)"; _kmin="$(uname -r | cut -d. -f2)"
+    [[ "$_kmaj" =~ ^[0-9]+$ ]] || _kmaj=0; [[ "$_kmin" =~ ^[0-9]+$ ]] || _kmin=0
+    if { [[ "$_kmaj" -gt 5 ]] || { [[ "$_kmaj" -eq 5 ]] && [[ "$_kmin" -ge 14 ]]; }; } && modprobe nf_synproxy 2>/dev/null; then
+        SYNPROXY_OK=1
+        SP_SET="$TCP_PORTS"
+        # mss из MTU аплинка (−40Б IPv4+TCP), wscale 7 (дефолт Linux); клампим в 536..1460.
+        _mtu="$(cat /sys/class/net/"$WAN"/mtu 2>/dev/null || echo 1500)"; [[ "$_mtu" =~ ^[0-9]+$ ]] || _mtu=1500
+        SP_MSS=$(( _mtu - 40 )); { [[ "$SP_MSS" -gt 1460 ]] || [[ "$SP_MSS" -lt 536 ]]; } && SP_MSS=1460
+        SP_MODPROBE="ExecStartPre=/bin/sh -c 'modprobe nf_synproxy 2>/dev/null || true'"
+        SYNPROXY_PRE="    chain prerouting {
         type filter hook prerouting priority -300; policy accept;
-        tcp dport { ${SP_SET} } tcp flags syn notrack
+        fib daddr type local tcp dport { ${SP_SET} } tcp flags syn notrack
     }"
-    SYNPROXY_IN="        tcp dport { ${SP_SET} } ct state invalid,untracked synproxy mss 1460 wscale 7 timestamp sack-perm"
+        SYNPROXY_IN="        tcp dport { ${SP_SET} } ct state invalid,untracked synproxy mss ${SP_MSS} wscale 7 timestamp sack-perm"
+        ok "SYNPROXY: ядро $(uname -r) ок, mss ${SP_MSS} wscale 7 (notrack только host-local)"
+    else
+        warn "SYNPROXY запрошен, но недоступен (нужно ядро ≥5.14 + модуль nf_synproxy). Защита БЕЗ synproxy."
+        mkdir -p "$STATE_DIR"; echo "kernel=$(uname -r) reason=no_nf_synproxy at=$(date -Is)" > "$STATE_DIR/.synproxy-degraded"
+    fi
+fi
+
+# ── Условные сеты/правила v3.0 (ban-once / blocklists / fleet) ────────────────
+# suspect-сеты для ban-once (timeout + size-cap как у autoban).
+SUSPECT_SETS=""
+if [[ "$ENABLE_BANONCE" == "1" ]]; then
+    SUSPECT_SETS="    set suspect_v4 { type ipv4_addr; flags timeout; size 65536; }
+    set suspect_v6 { type ipv6_addr; flags timeout; size 65536; }"
+fi
+
+# blocklist-сеты (наполняет na-blocklist-update таймером) + drop-правило.
+BLOCKLIST_SETS=""; BLOCKLIST_DROP=""
+if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
+    BLOCKLIST_SETS="    set blocklist_v4 { type ipv4_addr; flags interval; auto-merge; }
+    set blocklist_v6 { type ipv6_addr; flags interval; auto-merge; }"
+    BLOCKLIST_DROP="        # статич-блоклисты (Spamhaus DROP / FireHOL L1 [/ Tor]) — обновляет na-blocklist-update
+        ip  saddr @blocklist_v4 drop
+        ip6 saddr @blocklist_v6 drop"
+fi
+
+# fleet-сеты (наполняет na-fleet-sync с панели Remnawave) + accept сразу после whitelist.
+FLEET_ON=0
+case "$FLEET_SYNC" in
+    1) FLEET_ON=1;;
+    auto) [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]] && FLEET_ON=1 \
+          || { [[ -f "$CONF_DIR/fleet.env" ]] && FLEET_ON=1; };;
+esac
+FLEET_SETS=""; FLEET_ACCEPT=""
+if [[ "$FLEET_ON" == "1" ]]; then
+    FLEET_SETS="    set na_fleet_v4 { type ipv4_addr; flags interval; auto-merge; }
+    set na_fleet_v6 { type ipv6_addr; flags interval; auto-merge; }"
+    FLEET_ACCEPT="        # ноды флота (авто-синк с панели) — свои серверы, обходят все лимиты
+        ip  saddr @na_fleet_v4 accept
+        ip6 saddr @na_fleet_v6 accept"
+fi
+
+# SSH connect-flood: с ban-once (suspect→confirmed) или прямой бан.
+if [[ "$ENABLE_BANONCE" == "1" ]]; then
+    SSH_RULES="        # SSH connect-flood (ban-once): перебор → 1-й раз suspect+drop, 2-й в окне → бан ${SSH_BAN_TIME}
+        tcp dport ${SSH_PORT} ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport ${SSH_PORT} ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport ${SSH_PORT} ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
+        tcp dport ${SSH_PORT} ct state new ip saddr @suspect_v4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
+        tcp dport ${SSH_PORT} ct state new ip6 saddr @suspect_v6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
+        tcp dport ${SSH_PORT} ct state new meta nfproto ipv4 add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} } drop
+        tcp dport ${SSH_PORT} ct state new meta nfproto ipv6 add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} } drop"
+else
+    SSH_RULES="        # SSH connect-flood: >${SSH_RATE}/мин новых с одного IP → бан ${SSH_BAN_TIME}
+        tcp dport ${SSH_PORT} ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport ${SSH_PORT} ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport ${SSH_PORT} ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
+        tcp dport ${SSH_PORT} ct state new meta nfproto ipv4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
+        tcp dport ${SSH_PORT} ct state new meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop"
 fi
 
 WL4_LINE=""; [[ -n "$WL4" ]] && WL4_LINE="elements = { $WL4 }"
@@ -234,6 +385,9 @@ table inet na_filter {
     # просто не добавляются (старые живут по timeout).
     set autoban_v4 { type ipv4_addr; flags timeout; size 65536; }
     set autoban_v6 { type ipv6_addr; flags timeout; size 65536; }
+$SUSPECT_SETS
+$BLOCKLIST_SETS
+$FLEET_SETS
 
     # bogon/martian источники (RFC1918, CGNAT, loopback, link-local, TEST-NET, multicast)
     set bogon_v4 {
@@ -274,10 +428,12 @@ $SYNPROXY_PRE
         # whitelist — всегда сверху (в т.ч. твой текущий SSH-IP)
         ip  saddr @whitelist_v4 accept
         ip6 saddr @whitelist_v6 accept
+$FLEET_ACCEPT
 
         # уже забаненные
         ip  saddr @autoban_v4 drop
         ip6 saddr @autoban_v6 drop
+$BLOCKLIST_DROP
 
 $ANTISPOOF
 
@@ -303,12 +459,7 @@ $ANTISPOOF
 
 $SYNPROXY_IN
 
-        # SSH connect-flood: >${SSH_RATE}/мин новых с одного IP → бан ${SSH_BAN_TIME}
-        tcp dport ${SSH_PORT} ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport ${SSH_PORT} ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport ${SSH_PORT} ct state new limit rate 5/second log prefix "[na ssh-flood] " level warn
-        tcp dport ${SSH_PORT} ct state new meta nfproto ipv4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport ${SSH_PORT} ct state new meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
+$SSH_RULES
 
         # сервисные TCP-порты (per-IP лимиты)
 $TCP_RULES
@@ -316,10 +467,7 @@ $TCP_RULES
         # сервисные UDP-порты (per-IP лимиты)
 $UDP_RULES
 
-        # node-agent: только whitelist (выше) + мягкий per-IP лимит
-        tcp dport ${NODE_PORT} ct state new meter na4 { ip saddr limit rate 30/second burst 60 packets } accept
-        tcp dport ${NODE_PORT} ct state new meter na6 { ip6 saddr limit rate 30/second burst 60 packets } accept
-        tcp dport ${NODE_PORT} ct state new drop
+$NODE_RULES
 
 $PORTSCAN
 
@@ -359,12 +507,19 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+$SP_MODPROBE
 ExecStart=/usr/sbin/nft -f $NFT_FILE
 ExecReload=/usr/sbin/nft -f $NFT_FILE
 
 [Install]
 WantedBy=multi-user.target
 EOF
+# nf_synproxy грузим на boot (на стоковых ядрах модульный; на XanMod встроен — no-op).
+if [[ "$SYNPROXY_OK" == "1" ]]; then
+    echo "nf_synproxy" > /etc/modules-load.d/na-synproxy.conf
+else
+    rm -f /etc/modules-load.d/na-synproxy.conf 2>/dev/null || true
+fi
 systemctl daemon-reload
 systemctl enable na-firewall.service >/dev/null 2>&1 || true
 systemctl enable nftables >/dev/null 2>&1 || true
@@ -447,6 +602,301 @@ else
     info "ENABLE_CROWDSEC=0 — CrowdSec пропущен"
 fi
 
+# ═══ v3.0 МОДУЛИ: fleet-sync · blocklists · ctguard ═══════════════════════════
+# Зависимости только под включённые модули (jq — fleet/blocklists, conntrack — ctguard).
+_dep_list=()
+[[ "$FLEET_ON" == "1" || "$ENABLE_BLOCKLISTS" == "1" ]] && _dep_list+=(jq)
+[[ "$ENABLE_CTGUARD" == "1" ]] && _dep_list+=(conntrack)
+if [[ "${#_dep_list[@]}" -gt 0 ]]; then
+    apt_install "${_dep_list[@]}" || warn "не доустановил зависимости: ${_dep_list[*]}"
+fi
+
+# ── Fleet auto-sync: ноды флота из Remnawave-панели → nft-сет na_fleet_* ──────
+if [[ "$FLEET_ON" == "1" ]]; then
+    title "Fleet auto-sync (ноды флота → whitelist)"
+    if [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]]; then
+        umask 077; mkdir -p "$CONF_DIR"
+        printf 'REMNAWAVE_URL=%s\nREMNAWAVE_TOKEN=%s\n' "$REMNAWAVE_URL" "$REMNAWAVE_TOKEN" > "$CONF_DIR/fleet.env"
+        chmod 0600 "$CONF_DIR/fleet.env"; chown root:root "$CONF_DIR/fleet.env" 2>/dev/null || true
+        ok "токен панели сохранён в $CONF_DIR/fleet.env (root:root 0600, НЕ в protect.conf)"
+    elif [[ -f "$CONF_DIR/fleet.env" ]]; then
+        info "использую сохранённый $CONF_DIR/fleet.env"
+    fi
+    cat > /usr/local/sbin/na-fleet-sync <<'FSYNC'
+#!/usr/bin/env bash
+# na-fleet-sync — тянет адреса нод флота из Remnawave (GET /api/nodes по Bearer) и
+# держит их в nft-сете na_fleet_v4/v6 (accept сразу после whitelist). Токен уходит
+# ТОЛЬКО на заданный оператором $REMNAWAVE_URL. Fail-safe: панель недоступна / кривой
+# ответ / 0 валидных IP → текущий whitelist нод НЕ трогаем (last-known-good). Применение
+# отдельной nft-транзакцией: битые данные не ломают na_filter.
+set -u
+TAG=na-fleet-sync
+ENVF=/etc/node-accelerator/fleet.env
+[ -r "$ENVF" ] || { logger -t "$TAG" "нет $ENVF — выкл"; exit 0; }
+# shellcheck disable=SC1090
+. "$ENVF"
+URL="${REMNAWAVE_URL:-}"; TOKEN="${REMNAWAVE_TOKEN:-}"
+[ -n "$URL" ] && [ -n "$TOKEN" ] || { logger -t "$TAG" "URL/TOKEN пуст — выкл"; exit 0; }
+URL="${URL%/}"
+command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
+command -v jq   >/dev/null 2>&1 || { logger -t "$TAG" "нет jq"; exit 1; }
+nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет na_fleet нет (protect без fleet) — выкл"; exit 0; }
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+HTTP="$(curl -fsS --max-time 15 -o "$TMP/r.json" -w '%{http_code}' \
+        -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
+        "$URL/api/nodes" 2>/dev/null || true)"
+[ "$HTTP" = "200" ] && [ -s "$TMP/r.json" ] || { logger -t "$TAG" "панель недоступна (HTTP=$HTTP) — last-known-good"; exit 0; }
+jq -r '.. | objects | .address? // empty' "$TMP/r.json" 2>/dev/null | awk 'NF' | sort -u > "$TMP/addr"
+[ -s "$TMP/addr" ] || { logger -t "$TAG" "в ответе нет address — last-known-good"; exit 0; }
+: > "$TMP/v4"; : > "$TMP/v6"
+while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    if printf '%s' "$a" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then echo "$a" >> "$TMP/v4"; continue; fi
+    if printf '%s' "$a" | grep -qE '^[0-9a-fA-F:]+$' && printf '%s' "$a" | grep -q ':'; then echo "$a" >> "$TMP/v6"; continue; fi
+    getent ahostsv4 "$a" 2>/dev/null | awk '{print $1}' >> "$TMP/v4"
+    getent ahostsv6 "$a" 2>/dev/null | awk '{print $1}' >> "$TMP/v6"
+done < "$TMP/addr"
+V4="$(grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "$TMP/v4" 2>/dev/null | sort -u | paste -sd, -)"
+V6="$(grep -E '^[0-9a-fA-F:]+$' "$TMP/v6" 2>/dev/null | grep ':' | sort -u | paste -sd, -)"
+[ -n "$V4" ] || [ -n "$V6" ] || { logger -t "$TAG" "0 валидных IP — last-known-good"; exit 0; }
+{
+    echo "flush set inet na_filter na_fleet_v4"
+    [ -n "$V4" ] && echo "add element inet na_filter na_fleet_v4 { $V4 }"
+    echo "flush set inet na_filter na_fleet_v6"
+    [ -n "$V6" ] && echo "add element inet na_filter na_fleet_v6 { $V6 }"
+} > "$TMP/upd.nft"
+n4=$(printf '%s' "$V4" | tr ',' '\n' | grep -c . || true)
+n6=$(printf '%s' "$V6" | tr ',' '\n' | grep -c . || true)
+if nft -f "$TMP/upd.nft" 2>/dev/null; then
+    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + ${n6} v6 (из $URL/api/nodes)"
+else
+    logger -t "$TAG" "nft apply не прошёл — last-known-good сохранён"
+fi
+FSYNC
+    chmod +x /usr/local/sbin/na-fleet-sync
+    cat > /etc/systemd/system/na-fleet-sync.service <<'EOF'
+[Unit]
+Description=node-accelerator fleet whitelist sync (Remnawave /api/nodes)
+After=na-firewall.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/na-fleet-sync
+EOF
+    cat > /etc/systemd/system/na-fleet-sync.timer <<EOF
+[Unit]
+Description=node-accelerator fleet sync timer
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=$FLEET_SYNC_INTERVAL
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now na-fleet-sync.timer >/dev/null 2>&1 || true
+    /usr/local/sbin/na-fleet-sync >/dev/null 2>&1 || true
+    ok "fleet-sync включён (интервал $FLEET_SYNC_INTERVAL). Лог: journalctl -t na-fleet-sync"
+fi
+
+# ── Статич-блоклисты: Spamhaus DROP + FireHOL L1 [+ Tor] → nft-сет blocklist_* ─
+if [[ "$ENABLE_BLOCKLISTS" == "1" ]]; then
+    title "Статич-блоклисты (Spamhaus DROP / FireHOL L1$([[ "$BLOCK_TOR" == "1" ]] && echo ' / Tor'))"
+    cat > /usr/local/sbin/na-blocklist-update <<'BLUP'
+#!/usr/bin/env bash
+# na-blocklist-update — обновляет nft-сеты blocklist_v4/v6 из публичных threat-фидов.
+# Источники: Spamhaus DROP (json v4+v6), FireHOL Level 1 (v4), опц. Tor exit-list.
+# Плюс /etc/node-accelerator/custom-blocklist.txt (локальные дополнения оператора).
+# Bogon/private-фильтр, валидация, отдельная nft-транзакция (битый фид не ломает
+# na_filter), last-known-good при недоступности фидов.
+set -u
+TAG=na-blocklist
+BLOCK_TOR_FLAG="${1:-0}"
+CUSTOM=/etc/node-accelerator/custom-blocklist.txt
+nft list set inet na_filter blocklist_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет blocklist нет — выкл"; exit 0; }
+command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+fetch() { curl -fsSL --connect-timeout 10 --max-time 60 "$1" 2>/dev/null; }
+: > "$TMP/v4.raw"; : > "$TMP/v6.raw"
+# Spamhaus DROP (json). jq может не быть — тогда фид пропускается.
+if command -v jq >/dev/null 2>&1; then
+    fetch https://www.spamhaus.org/drop/drop_v4.json | jq -r '.cidr // empty' 2>/dev/null >> "$TMP/v4.raw"
+    fetch https://www.spamhaus.org/drop/drop_v6.json | jq -r '.cidr // empty' 2>/dev/null >> "$TMP/v6.raw"
+fi
+# FireHOL Level 1 (v4, high-confidence)
+fetch https://iplists.firehol.org/files/firehol_level1.netset | grep -vE '^#' >> "$TMP/v4.raw"
+# Tor exit nodes (опц.)
+[ "$BLOCK_TOR_FLAG" = "1" ] && fetch https://check.torproject.org/torbulkexitlist >> "$TMP/v4.raw"
+# локальные дополнения оператора (v4 и v6 вперемешку)
+[ -r "$CUSTOM" ] && grep -vE '^\s*#|^\s*$' "$CUSTOM" >> "$TMP/v4.raw" && grep ':' "$CUSTOM" 2>/dev/null >> "$TMP/v6.raw"
+# v4: только валидные IP/CIDR, без приватных/CGNAT/loopback/0.0.0.0
+grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' "$TMP/v4.raw" 2>/dev/null \
+  | grep -vE '^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+  | sort -u > "$TMP/v4.clean"
+# v6: из jq-чистых .cidr (+ кастомные), базовая sanity
+grep -hE '^[0-9a-fA-F:/]+$' "$TMP/v6.raw" 2>/dev/null | grep ':' | sort -u > "$TMP/v6.clean"
+N4="$(grep -c . "$TMP/v4.clean" 2>/dev/null || echo 0)"
+N6="$(grep -c . "$TMP/v6.clean" 2>/dev/null || echo 0)"
+[ "$N4" -gt 0 ] || { logger -t "$TAG" "0 v4-записей (фиды недоступны?) — last-known-good"; exit 0; }
+{
+    echo "flush set inet na_filter blocklist_v4"
+    echo "add element inet na_filter blocklist_v4 { $(paste -sd, "$TMP/v4.clean") }"
+    if [ "$N6" -gt 0 ]; then
+        echo "flush set inet na_filter blocklist_v6"
+        echo "add element inet na_filter blocklist_v6 { $(paste -sd, "$TMP/v6.clean") }"
+    fi
+} > "$TMP/bl.nft"
+if nft -f "$TMP/bl.nft" 2>/dev/null; then
+    logger -t "$TAG" "blocklist обновлён: ${N4} v4 + ${N6} v6"
+else
+    logger -t "$TAG" "nft apply не прошёл — last-known-good"
+fi
+BLUP
+    chmod +x /usr/local/sbin/na-blocklist-update
+    cat > /etc/systemd/system/na-blocklist.service <<EOF
+[Unit]
+Description=node-accelerator threat blocklist update
+After=na-firewall.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/na-blocklist-update $BLOCK_TOR
+EOF
+    cat > /etc/systemd/system/na-blocklist.timer <<EOF
+[Unit]
+Description=node-accelerator blocklist refresh timer
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=$BLOCKLIST_REFRESH
+RandomizedDelaySec=300
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now na-blocklist.timer >/dev/null 2>&1 || true
+    /usr/local/sbin/na-blocklist-update "$BLOCK_TOR" >/dev/null 2>&1 || true
+    ok "блоклисты включены (обновление $BLOCKLIST_REFRESH). Лог: journalctl -t na-blocklist"
+fi
+
+# ── conntrack phantom-eviction (защита от distributed connect-and-hold) ───────
+if [[ "$ENABLE_CTGUARD" == "1" ]]; then
+    title "conntrack-guard (phantom-eviction)$([[ "$NA_CTG_ENFORCE" == "1" ]] && echo ' [ENFORCE]' || echo ' [observe]')"
+    cat > "$CONF_DIR/ctguard.conf" <<EOF
+# node-accelerator ctguard — детект distributed connect-and-hold по «живым» сокетам.
+# Источник-фантом: conntrack ≫ живых сокетов (ss) → соединения брошены. CGNAT-safe:
+# эвикт только концентрированный холдер с conntrack ≥ PHANTOM_MIN и live ≤ LIVE_FLOOR.
+NA_CTG_ENFORCE=$NA_CTG_ENFORCE
+NA_CTG_PHANTOM_MIN=${NA_CTG_PHANTOM_MIN:-4000}
+NA_CTG_LIVE_FLOOR=${NA_CTG_LIVE_FLOOR:-2}
+NA_CTG_BANTIME=${NA_CTG_BANTIME:-15m}
+NA_CTG_COARSE_MULT=${NA_CTG_COARSE_MULT:-3}
+EOF
+    chmod 0640 "$CONF_DIR/ctguard.conf"
+    cat > /usr/local/sbin/na-ctguard <<'CTG'
+#!/usr/bin/env bash
+# na-ctguard — liveness-aware защита от distributed connect-and-hold флуда. Класс атаки,
+# который статичные rate-limit'ы не ловят: сотни IP открывают тысячи TCP, проходят
+# handshake и БРОСАЮТ их — conntrack пухнет, приложение (xray) захлёбывается, но per-IP
+# счётчики молчат (пик атаки пересекается с легит-CGNAT-потолком). Признак фантома:
+# conntrack ≫ живых сокетов (ss). Дёшево: дорогой `conntrack -L` только если коарс-гейт
+# (conntrack ≫ ss) сработал. CGNAT-safe: пропускаем источники с живыми сокетами,
+# малым conntrack или в whitelist. observe-режим (NA_CTG_ENFORCE=0) — только лог.
+set -u
+TAG=na-ctguard
+CONF=/etc/node-accelerator/ctguard.conf
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+ENFORCE="${NA_CTG_ENFORCE:-0}"
+PHANTOM_MIN="${NA_CTG_PHANTOM_MIN:-4000}"
+LIVE_FLOOR="${NA_CTG_LIVE_FLOOR:-2}"
+BANTIME="${NA_CTG_BANTIME:-15m}"
+COARSE_MULT="${NA_CTG_COARSE_MULT:-3}"
+command -v conntrack >/dev/null 2>&1 || { logger -t "$TAG" "нет conntrack-tools"; exit 0; }
+
+# своя изолированная таблица (priority -5 → раньше na_filter); rollback = удалить таблицу
+nft list table inet na_ctguard >/dev/null 2>&1 || nft -f - <<'NFTG'
+table inet na_ctguard {
+    set phantom_v4 { type ipv4_addr; flags timeout; size 131072; }
+    set phantom_v6 { type ipv6_addr; flags timeout; size 131072; }
+    chain input {
+        type filter hook input priority -5; policy accept;
+        ip  saddr @phantom_v4 drop
+        ip6 saddr @phantom_v6 drop
+    }
+}
+NFTG
+
+CT_TOTAL="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
+SS_TOTAL="$(ss -tnH state established 2>/dev/null | wc -l)"
+# коарс-гейт: дорогой дамп только если conntrack заметно больше живых сокетов И велик
+[ "$CT_TOTAL" -ge "$PHANTOM_MIN" ] || exit 0
+[ "$CT_TOTAL" -ge $((SS_TOTAL * COARSE_MULT)) ] || exit 0
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# живые established по src-IP клиента
+ss -tnH state established 2>/dev/null | awk '{print $NF}' \
+  | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' | sort | uniq -c > "$TMP/live"
+# conntrack по ПЕРВОМУ src= (это клиентский IP) — только tcp
+conntrack -L -p tcp 2>/dev/null \
+  | awk '{for(i=1;i<=NF;i++) if($i ~ /^src=/){print substr($i,5); break}}' \
+  | sort | uniq -c | sort -rn > "$TMP/ct"
+
+is_white() {  # в whitelist na_filter или в fleet-сете?
+    local ip="$1" s4 s6
+    if printf '%s' "$ip" | grep -q ':'; then s4=whitelist_v6; s6=na_fleet_v6; else s4=whitelist_v4; s6=na_fleet_v4; fi
+    nft get element inet na_filter "$s4" "{ $ip }" >/dev/null 2>&1 && return 0
+    nft get element inet na_filter "$s6" "{ $ip }" >/dev/null 2>&1 && return 0
+    return 1
+}
+cand=0; eict=0
+while read -r cnt ip; do
+    [ -n "${ip:-}" ] || continue
+    [ "$cnt" -ge "$PHANTOM_MIN" ] || break   # отсортировано по убыванию → дальше только меньше
+    is_white "$ip" && continue
+    live="$(awk -v ip="$ip" '$2==ip{print $1; f=1} END{if(!f)print 0}' "$TMP/live")"
+    [ "${live:-0}" -le "$LIVE_FLOOR" ] || continue   # есть живые сокеты → легит/shared-front, щадим
+    cand=$((cand+1))
+    if [ "$ENFORCE" = "1" ]; then
+        if printf '%s' "$ip" | grep -q ':'; then setn=phantom_v6; else setn=phantom_v4; fi
+        nft add element inet na_ctguard "$setn" "{ $ip timeout $BANTIME }" 2>/dev/null \
+            && conntrack -D -s "$ip" >/dev/null 2>&1 && eict=$((eict+1))
+        logger -t "$TAG" "evict $ip ct=$cnt live=$live (bantime $BANTIME)"
+    else
+        logger -t "$TAG" "[observe] phantom-кандидат $ip ct=$cnt live=$live (NA_CTG_ENFORCE=0 — без эвикта)"
+    fi
+done < "$TMP/ct"
+[ "$cand" -gt 0 ] && logger -t "$TAG" "тик: ct_total=$CT_TOTAL ss=$SS_TOTAL кандидатов=$cand эвиктов=$eict enforce=$ENFORCE"
+exit 0
+CTG
+    chmod +x /usr/local/sbin/na-ctguard
+    cat > /etc/systemd/system/na-ctguard.service <<'EOF'
+[Unit]
+Description=node-accelerator conntrack phantom-eviction
+After=na-firewall.service
+[Service]
+Type=oneshot
+# не отбираем CPU у xray под атакой
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/na-ctguard
+EOF
+    cat > /etc/systemd/system/na-ctguard.timer <<EOF
+[Unit]
+Description=node-accelerator ctguard timer
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=${NA_CTG_INTERVAL:-20s}
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now na-ctguard.timer >/dev/null 2>&1 || true
+    if [[ "$NA_CTG_ENFORCE" == "1" ]]; then
+        ok "ctguard ENFORCE: фантом-холдеры эвиктятся. Лог: journalctl -t na-ctguard"
+    else
+        warn "ctguard в OBSERVE (только лог). Убедись по journalctl -t na-ctguard, что кандидаты = только атакеры (live≤$LIVE_FLOOR), затем NA_CTG_ENFORCE=1 + ре-ран protect."
+    fi
+fi
+
 # ─── fw-status хелпер ────────────────────────────────────────────────────────
 cat > /usr/local/sbin/na-fw-status <<'STAT'
 #!/usr/bin/env bash
@@ -456,7 +906,31 @@ echo
 echo "── autoban (живые баны) ──"
 echo "v4: $(nft list set inet na_filter autoban_v4 2>/dev/null | grep -oE '[0-9.]+ timeout' | wc -l)   v6: $(nft list set inet na_filter autoban_v6 2>/dev/null | grep -c timeout)"
 nft list set inet na_filter autoban_v4 2>/dev/null | grep -oE '[0-9.]+ (timeout|expires)[^,]*' | head -15
+if nft list set inet na_filter suspect_v4 >/dev/null 2>&1; then
+    echo "suspect (наблюдение, ban-once) v4: $(nft list set inet na_filter suspect_v4 2>/dev/null | grep -c timeout)   v6: $(nft list set inet na_filter suspect_v6 2>/dev/null | grep -c timeout)"
+fi
 echo
+if nft list set inet na_filter blocklist_v4 >/dev/null 2>&1; then
+    echo "── threat-блоклисты ──"
+    echo "v4: $(nft list set inet na_filter blocklist_v4 2>/dev/null | grep -coE '[0-9.]+')   v6: $(nft list set inet na_filter blocklist_v6 2>/dev/null | grep -c ':')   (обновляет na-blocklist-update)"
+    echo
+fi
+if nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1; then
+    echo "── fleet-sync (ноды флота → whitelist) ──"
+    echo "v4: $(nft list set inet na_filter na_fleet_v4 2>/dev/null | grep -coE '[0-9.]+')   v6: $(nft list set inet na_filter na_fleet_v6 2>/dev/null | grep -c ':')   (последний синк: $(journalctl -t na-fleet-sync -n1 --no-pager -o cat 2>/dev/null | head -c 80))"
+    echo
+fi
+if nft list table inet na_ctguard >/dev/null 2>&1; then
+    echo "── ctguard (phantom-eviction) ──"
+    enf="$(awk -F= '/^NA_CTG_ENFORCE/{print $2}' /etc/node-accelerator/ctguard.conf 2>/dev/null)"
+    echo "режим: $([ "${enf:-0}" = 1 ] && echo ENFORCE || echo observe)   фантомов в блоке v4: $(nft list set inet na_ctguard phantom_v4 2>/dev/null | grep -c timeout)   v6: $(nft list set inet na_ctguard phantom_v6 2>/dev/null | grep -c timeout)"
+    journalctl -t na-ctguard -n3 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+    echo
+fi
+if [ -f /var/lib/node-accelerator/.synproxy-degraded ]; then
+    echo "⚠ SYNPROXY DEGRADED: $(cat /var/lib/node-accelerator/.synproxy-degraded)"
+    echo
+fi
 if command -v cscli >/dev/null 2>&1; then
     echo "── CrowdSec ──"
     cscli decisions list 2>/dev/null | head -20
@@ -509,6 +983,22 @@ node_port=$NODE_PORT
 crowdsec=$ENABLE_CROWDSEC
 nft_file=$NFT_FILE
 EOF
+
+# Персист эффективного конфига → ре-ран без ENV сохранит эти значения (ENV всё ещё
+# переопределяет). WHITELIST хранит только заданный оператором список (без транзитного
+# авто-IP текущей SSH-сессии — тот добавляется в WL4/WL6 отдельно).
+# REMNAWAVE_URL/TOKEN сюда НЕ пишем — токен живёт в fleet.env (0600), fleet-режим
+# восстанавливается по наличию fleet.env.
+save_conf "$CONF_DIR/protect.conf" \
+    SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT WHITELIST \
+    SYN_RATE SYN_BURST UDP_RATE UDP_BURST CONN_LIMIT \
+    ICMP_RATE ICMP_BURST SSH_RATE SSH_BURST SSH_BAN_TIME \
+    PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST \
+    ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY \
+    ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \
+    NODE_PORT_WHITELIST_ONLY SAFETY_DELAY \
+    ENABLE_CTGUARD NA_CTG_ENFORCE NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR \
+    NA_CTG_COARSE_MULT NA_CTG_BANTIME NA_CTG_INTERVAL
 
 # ─── Подтверждение работы ────────────────────────────────────────────────────
 title "Подтверждение (защита от самоблокировки)"
