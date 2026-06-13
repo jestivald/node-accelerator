@@ -1,5 +1,81 @@
 # Changelog
 
+## v3.0 — 2026-06-13
+
+Крупный релиз: персист-конфиг, fleet auto-sync, новый класс DDoS-защиты
+(phantom-eviction), статич-блоклисты, ban-once, tier-aware тюнинг, `--json`-
+диагностика. Все новые тяжёлые модули **opt-in** и **ничего не меняют у текущих
+пользователей**, пока их явно не включат; багфиксы/footgun-фиксы применяются всегда.
+Часть концепций DDoS-защиты вдохновлена наработками коллеги-оператора (по его просьбе —
+без имени).
+
+### 🔧 Footgun-фиксы (применяются всегда)
+- **Персист конфига ноды.** Эффективные значения сохраняются в `/etc/node-accelerator/
+  {protect,optimize}.conf` (идиома `: "${KEY:=value}"`) и подхватываются на ре-ране.
+  Раньше повторный `protect.sh` БЕЗ ENV молча сбрасывал поднятые под ноду ручки
+  (`CONN_LIMIT`/`WHITELIST`/…) к дефолтам — на нодах за CDN/мостом это рвало бы upstream.
+  Прецеденс: **ENV > сохранённый конфиг > встроенный дефолт**.
+- **node-agent порт больше не светится в мир.** При заданном `WHITELIST` контрол-порт
+  (`NODE_PORT`) становится whitelist-only (раньше был открыт всем под лимитом 30/с).
+  Управляется `NODE_PORT_WHITELIST_ONLY=auto|0|1`.
+
+### 🛡 protect.sh — новые слои защиты
+- **conntrack phantom-eviction (`ENABLE_CTGUARD=1`).** Ловит **distributed
+  connect-and-hold** — класс атаки, который статичные rate-limit'ы не видят (сотни IP
+  открывают тысячи TCP, проходят handshake и бросают; conntrack пухнет, xray
+  захлёбывается, per-IP счётчики молчат). Детект по **живым сокетам**: `conntrack ≫ ss`.
+  CGNAT-safe (эвикт только концентрированный холдер с `conntrack ≥ NA_CTG_PHANTOM_MIN`
+  и `live ≤ NA_CTG_LIVE_FLOOR`; whitelist/fleet щадятся). Дешёвый коарс-гейт перед
+  дорогим `conntrack -L`. **observe по умолчанию** (`NA_CTG_ENFORCE=0` — только лог).
+  Изолированная таблица `inet na_ctguard` (priority −5).
+- **Remnawave fleet auto-sync (`REMNAWAVE_URL`+`REMNAWAVE_TOKEN`).** Таймер тянет
+  `GET /api/nodes` по Bearer и держит IP всех нод флота в nft-сете `na_fleet_*`
+  (accept сразу после whitelist). Новую ноду добавил в панель → остальные подхватят сами.
+  Fail-safe **last-known-good** (панель легла → whitelist нод не трогаем). Токен — в
+  `/etc/node-accelerator/fleet.env` (root:root 0600), **не** в protect.conf.
+- **Статич-блоклисты (`ENABLE_BLOCKLISTS=1`).** Spamhaus DROP (json v4+v6) + FireHOL L1
+  (+ Tor по `BLOCK_TOR=1`) + `custom-blocklist.txt` оператора. Bogon-фильтр фидов,
+  отдельная nft-транзакция, last-known-good. Обновление таймером (`BLOCKLIST_REFRESH`).
+- **ban-once (`ENABLE_BANONCE=1`, дефолт).** Двухступенчатый автобан: 1-е нарушение →
+  `suspect` (наблюдение, без полного бана), 2-е в окне `SUSPECT_TIME` → `confirmed` (бан).
+  Режет ложные баны целых CGNAT-операторов из-за одного шального скана/перебора.
+- **SYNPROXY done-right.** `notrack` теперь ТОЛЬКО для host-local (`fib daddr type
+  local`) — больше не ломает conntrack/NAT транзита (Docker-контейнер панели → нода).
+  Проверка ядра ≥5.14 + `nf_synproxy`, mss из MTU аплинка, **fail-loud** (маркер
+  `.synproxy-degraded` + видно в diagnose/na-fw-status), модуль грузится на boot.
+
+### ⚡ optimize.sh
+- **Tier-aware sysctl по RAM** (TIER 1–4): потолки сокетов (`rmem/wmem_max`,
+  `tcp_rmem/wmem`) масштабируются от RAM — мелкая VPS не уходит в OOM от 64MB×сокеты,
+  крупная получает полный размер. `netdev_budget` поднят под высокий PPS.
+- **`tcp_ecn` 1 → 2 (пассивный)** по умолчанию — безопаснее на исходящих через битые
+  middlebox (настраивается `TCP_ECN_MODE`). **TFO выключаемо** (`DISABLE_TFO=1`).
+  `overcommit` на tier1 → heuristic (0) вместо агрессивного 1.
+- **zram-swap на tier 1/2** (компрессированный swap в RAM, lz4) вместо дискового
+  `/swapfile`; fallback на swapfile. `SETUP_NO_ZRAM=1` форсит swapfile.
+- **MSS clamp к PMTU (`ENABLE_MSS_CLAMP=1`, opt-in)** — против PMTU-блэкхолов на туннелях
+  (WireGuard/routed). Своя таблица `inet na_mss`. Дополняет `tcp_min_snd_mss`-пол из v2.4.
+
+### 🩺 diagnose.sh
+- **`diagnose.sh --json`** — один машинно-читаемый объект для флот-мониторинга
+  (Zabbix/Prometheus/SSH-поллинг): ядро, steal, ретрансмиты, conntrack%, MSS, firewall,
+  autoban/suspect/blocklist/fleet, ctguard, synproxy, safety, reboot_needed.
+- **Сенсор MSS-коллапса** — считает живые сокеты с обрезанным MSS (<256) + проверяет
+  `tcp_min_snd_mss`/`mtu_probing`. Ловит ровно прод-инцидент, что чинит v2.4.
+- Сенсоры новых компонентов (blocklist/fleet/ctguard/synproxy-degraded) в отчёте и
+  `na-fw-status`.
+
+### install.sh
+- **Опц. проверка подписи модулей** в curl|bash-режиме (`NA_REQUIRE_SIG=1` +
+  `NA_MINISIGN_PUBKEY` или `NA_SIG_FINGERPRINT`) — supply-chain hardening поверх `NA_REF`.
+- `diagnose --json` пробрасывается через `install.sh diagnose --json`.
+
+### ↩️ rollback.sh / CI
+- Откат снимает все новые компоненты (fleet-sync/blocklists/ctguard/mss-clamp/zram,
+  таблицы `na_ctguard`/`na_mss`, конфиги, токен) — `custom-blocklist.txt` оператора сохраняется.
+- CI: добавлен DRY_RUN с включёнными blocklists/fleet/whitelist-only (full-feature
+  `nft -c`) + smoke `diagnose --json`.
+
 ## v2.4 — 2026-06-12
 
 Фикс MSS-коллапса под потерями на оптимизаторе.

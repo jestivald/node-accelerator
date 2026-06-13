@@ -50,9 +50,23 @@ jobs:
             bash curl gnupg nftables iproute2 gawk procps kmod coreutils irqbalance ethtool
       - name: Syntax (bash -n)
         run: bash -n install.sh scripts/*.sh scripts/lib/*.sh
-      - name: protect.sh DRY_RUN (генерация + nft -c, без применения)
+      - name: protect.sh DRY_RUN (дефолты — генерация + nft -c)
         run: DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
+      - name: protect.sh DRY_RUN (full-feature — blocklists/fleet/whitelist-only/ban-once → nft -c)
+        run: |
+          DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 \
+            ENABLE_BLOCKLISTS=1 BLOCK_TOR=1 ENABLE_BANONCE=1 \
+            FLEET_SYNC=1 REMNAWAVE_URL=https://panel.example.com REMNAWAVE_TOKEN=ci-token \
+            WHITELIST="1.2.3.4,2001:db8::1" NODE_PORT_WHITELIST_ONLY=1 \
+            bash scripts/protect.sh
+      - name: protect.sh — отказ на кривом ENV (валидация)
+        run: |
+          if SYN_RATE='x; rm' DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
+            echo "валидация НЕ сработала на кривом SYN_RATE"; exit 1
+          else echo "ok: кривой ENV отвергнут"; fi
       - name: diagnose.sh (read-only, не должен падать жёстко)
         run: bash scripts/diagnose.sh || true
+      - name: diagnose.sh --json (machine-readable smoke)
+        run: bash scripts/diagnose.sh --json || true
       - name: XanMod репозиторий+ключ+кандидат резолвятся (без установки ядра)
         run: XANMOD_PROBE=1 ENABLE_XANMOD=1 bash scripts/optimize.sh
