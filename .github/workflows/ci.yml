@@ -77,6 +77,7 @@ jobs:
       - name: na-report smoke (--json / --ip / --port)
         run: |
           bash scripts/na-report.sh --json | grep -q '"drops_by_reason"' || { echo "na-report --json без drops_by_reason"; exit 1; }
+          L="$(bash scripts/na-report.sh --json | wc -l)"; [ "$L" -eq 1 ] || { echo "na-report --json должен быть ОДНОЙ строкой (битый JSON), получено: $L"; exit 1; }
           bash scripts/na-report.sh --ip 127.0.0.1 >/dev/null 2>&1 || true
           bash scripts/na-report.sh --port 443 >/dev/null 2>&1 || true
           echo "ok: na-report --json/--ip/--port отработали"
