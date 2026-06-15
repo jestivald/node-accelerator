@@ -135,7 +135,9 @@ na-diagnose                  # 🩺 health-отчёт (read-only)
 na-diagnose --json           # JSON для флот-мониторинга (Zabbix/Prometheus/панель)
 na-diagnose --retrans        # 🔬 разбор ПРИЧИН TCP-retransmits (TX/RX, тип, хвост, CC, дропы)
 na-report                    # 🔥 форензика атак за 24ч (кто/откуда/чем/когда)
-na-report --json             # JSON форензики; --hours N, --top N, --ip <addr>
+na-report --json             # JSON форензики; --hours N, --top N
+na-report --ip 1.2.3.4       # глубокий вердикт по IP (rDNS, nft-сеты, conntrack, таймлайн)
+na-report --port 443         # топ дроп-источников по порту + кто слушает
 nft list table inet na_filter
 cscli decisions list
 journalctl -t na-fleet-sync -t na-blocklist -t na-ctguard   # логи модулей

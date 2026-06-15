@@ -52,7 +52,7 @@ verify_sig() {  # verify_sig <файл> <url-без-расширения>
 if [[ ! -d "$SCRIPTS" ]]; then
     SCRIPTS="$(mktemp -d)/scripts"; mkdir -p "$SCRIPTS/lib"
     echo "[*] Скачиваю модули из $REPO_URL ..."
-    for f in lib/common.sh optimize.sh protect.sh diagnose.sh rollback.sh; do
+    for f in lib/common.sh optimize.sh protect.sh diagnose.sh na-report.sh rollback.sh; do
         curl -fsSL "$REPO_URL/scripts/$f" -o "$SCRIPTS/$f" || { echo "[x] Не скачал $f"; exit 1; }
         if [[ "$NA_REQUIRE_SIG" == "1" ]]; then
             verify_sig "$SCRIPTS/$f" "$REPO_URL/scripts/$f" \

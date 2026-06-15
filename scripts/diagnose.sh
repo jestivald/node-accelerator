@@ -311,6 +311,18 @@ if [[ -n "$CTMAX" ]]; then
 else
     info "nf_conntrack ещё не загружен (появится при первом пакете через firewall)"
 fi
+# Разбивка дропов (если есть conntrack-tools): early_drop=давление по памяти,
+# insert_failed=хеш-коллизии, drop=таблица переполнена. Decimal — mawk-safe.
+if command -v conntrack >/dev/null 2>&1; then
+    read -r CT_IF CT_DR CT_ED < <(conntrack -S 2>/dev/null | awk '
+        {for(i=1;i<=NF;i++){split($i,kv,"="); if(kv[1]=="insert_failed")f+=kv[2]; else if(kv[1]=="drop")d+=kv[2]; else if(kv[1]=="early_drop")e+=kv[2]}}
+        END{printf "%d %d %d", f+0, d+0, e+0}')
+    if [[ "$(( ${CT_IF:-0} + ${CT_DR:-0} + ${CT_ED:-0} ))" -gt 0 ]]; then
+        wrn "conntrack дропы: insert_failed=${CT_IF:-0} drop=${CT_DR:-0} early_drop=${CT_ED:-0} (early_drop=память, insert_failed=хеш, drop=таблица полна)"
+    else
+        pass "conntrack без дропов (insert_failed/drop/early_drop = 0)"
+    fi
+fi
 
 # ─── MSS (анти-коллапс) ──────────────────────────────────────────────────────
 # Ловит ровно тот прод-инцидент, что чинит v2.4: при mtu_probing=1 на лоссовом плече
@@ -347,6 +359,14 @@ if [[ -n "$NIC" ]]; then
     if command -v ethtool >/dev/null; then
         OFF="$(ethtool -k "$NIC" 2>/dev/null | awk '/generic-receive-offload:|tcp-segmentation-offload:|generic-segmentation-offload:/{print $1$2}' | tr '\n' ' ')"
         [[ -n "$OFF" ]] && info "offloads: $OFF"
+    fi
+    # RX/TX drops/errors (накопительно с загрузки) — индикатор качества линка/ring-буфера
+    read -r RXE RXD TXE TXD < <(ip -s link show dev "$NIC" 2>/dev/null | awk '
+        /RX:/{getline; e=$3; d=$4} /TX:/{getline; te=$3; td=$4} END{printf "%d %d %d %d", e+0, d+0, te+0, td+0}')
+    if [[ "$(( ${RXD:-0} + ${TXD:-0} + ${RXE:-0} + ${TXE:-0} ))" -gt 0 ]]; then
+        info "NIC drops/errors (с загрузки): RXdrop=${RXD:-0} RXerr=${RXE:-0} TXdrop=${TXD:-0} TXerr=${TXE:-0}"
+    else
+        pass "NIC без drop/error счётчиков"
     fi
     systemctl is-active --quiet na-rps.service 2>/dev/null && pass "na-rps.service активен" || info "na-rps.service не запущен (ставится оптимизатором)"
 else
@@ -439,6 +459,26 @@ if command -v ping >/dev/null; then
     RTT="$(ping -c2 -W2 1.1.1.1 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5" ms"}')"
     [[ -n "$RTT" ]] && info "RTT до 1.1.1.1: avg $RTT" || info "ICMP-тест не прошёл (возможно ICMP режется аптайм-провайдером)"
 fi
+
+# ─── Здоровье: давление, диск, инциденты ─────────────────────────────────────
+title "Здоровье: давление, диск, инциденты"
+# PSI — стол ядра под нагрузкой (avg10 по 'some'); современные ядра
+if [[ -r /proc/pressure/cpu ]]; then
+    for r in cpu memory io; do
+        A="$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){sub(/avg10=/,"",$i); print $i}}' "/proc/pressure/$r" 2>/dev/null)"; A="${A:-0}"
+        if awk -v x="$A" 'BEGIN{exit !(x+0>=10)}'; then wrn "PSI $r some avg10=${A}% — заметный стол ядра"; else info "PSI $r some avg10=${A}%"; fi
+    done
+else info "PSI недоступен (старое ядро)"; fi
+# Диск + inodes (лог-флуд жрёт inodes раньше места)
+DSP="$(df -P / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
+DIN="$(df -Pi / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
+if [[ "${DSP:-0}" -ge 85 ]] 2>/dev/null; then wrn "/ занят на ${DSP}%"; else info "/ занят на ${DSP:-?}%"; fi
+if [[ "${DIN:-0}" -ge 85 ]] 2>/dev/null; then wrn "inodes / заняты на ${DIN}% (лог-флуд?)"; else info "inodes /: ${DIN:-?}%"; fi
+# Инциденты ядра/сервисов
+OOM="$(journalctl -k --since '-24h' --no-pager 2>/dev/null | grep -ciE 'out of memory|oom-killer|soft lockup|hung task')"
+if [[ "${OOM:-0}" -gt 0 ]]; then wrn "kern-лог за 24ч: $OOM строк OOM/lockup/hung — память/перегруз"; else pass "kern-лог чист (OOM/lockup/hung за 24ч нет)"; fi
+FAILED="$(systemctl --failed --no-legend 2>/dev/null | grep -c .)"
+if [[ "${FAILED:-0}" -gt 0 ]]; then wrn "упавших systemd-юнитов: $FAILED (см. systemctl --failed)"; else pass "упавших systemd-юнитов нет"; fi
 
 # ─── Итог ────────────────────────────────────────────────────────────────────
 hr

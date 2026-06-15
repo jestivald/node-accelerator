@@ -1,5 +1,25 @@
 # Changelog
 
+## v3.3 — 2026-06-15
+
+Расширение read-only наблюдаемости (поведение защиты/тюнинга НЕ меняется) + фикс деплоя.
+
+### 🩺 diagnose.sh — новые health-проверки
+- conntrack-дропы `insert_failed`/`drop`/`early_drop` (если есть conntrack-tools) — память vs хеш vs переполнение;
+- **PSI** (`/proc/pressure` cpu/mem/io) — стол ядра под нагрузкой;
+- NIC drops/errors (`ip -s link`);
+- диск + **inode-исчерпание** (`df` / `df -i`); инциденты ядра (OOM/lockup/hung за 24ч) и упавшие systemd-юниты.
+
+### 🔥 na-report — обогащение
+- `--ip <addr>`: rDNS + паттерн сканера, точное членство во ВСЕХ наших nft-сетах (`nft get element`), активные conntrack-сессии, per-IP таймлайн по часам;
+- `--port <N>`: топ дроп-источников по порту + кто слушает;
+- в отчёте: SSH brute (топ юзернеймов/source-IP) и топ CrowdSec-сценариев.
+
+### 🐞 Фикс
+- `install.sh` (curl|bash) теперь докачивает `na-report.sh` → `install.sh persist` ставит и `na-report` (не только `na-diagnose`).
+
+Концепция диагностик/форензики вдохновлена наработками коллеги-оператора (по его просьбе — без имени).
+
 ## v3.2 — 2026-06-15
 
 Диагностика **причин** TCP-retransmits (read-only, поведение не меняется).

@@ -74,12 +74,20 @@ jobs:
         run: bash scripts/diagnose.sh --json || true
       - name: diagnose.sh --retrans (deep-dive smoke, короткое окно)
         run: bash scripts/diagnose.sh --retrans --window 5 || true
-      - name: install.sh persist → CLI na-diagnose создаётся и отдаёт JSON
+      - name: na-report smoke (--json / --ip / --port)
+        run: |
+          bash scripts/na-report.sh --json | grep -q '"drops_by_reason"' || { echo "na-report --json без drops_by_reason"; exit 1; }
+          bash scripts/na-report.sh --ip 127.0.0.1 >/dev/null 2>&1 || true
+          bash scripts/na-report.sh --port 443 >/dev/null 2>&1 || true
+          echo "ok: na-report --json/--ip/--port отработали"
+      - name: install.sh persist → CLI na-diagnose + na-report создаются и отдают JSON
         run: |
           bash install.sh persist
           test -x /usr/local/sbin/na-diagnose || { echo "na-diagnose не создан"; exit 1; }
+          test -x /usr/local/sbin/na-report   || { echo "na-report не создан"; exit 1; }
           /usr/local/sbin/na-diagnose --json | grep -q '"firewall"' || { echo "na-diagnose --json не отдал JSON"; exit 1; }
-          echo "ok: na-diagnose установлен и отдаёт JSON"
+          /usr/local/sbin/na-report --json | grep -q '"drops_by_reason"' || { echo "na-report --json не отдал JSON"; exit 1; }
+          echo "ok: na-diagnose + na-report установлены и отдают JSON"
       - name: DRY_RUN persist — без побочных эффектов
         run: |
           rm -f /usr/local/sbin/na-diagnose
@@ -91,6 +99,7 @@ jobs:
           bash install.sh persist
           bash install.sh rollback all
           test ! -e /usr/local/sbin/na-diagnose || { echo "na-diagnose не снят rollback'ом"; exit 1; }
+          test ! -e /usr/local/sbin/na-report   || { echo "na-report не снят rollback'ом"; exit 1; }
           echo "ok: rollback убрал CLI"
       - name: XanMod репозиторий+ключ+кандидат резолвятся (без установки ядра)
         run: XANMOD_PROBE=1 ENABLE_XANMOD=1 bash scripts/optimize.sh
