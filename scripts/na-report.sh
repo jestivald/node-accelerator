@@ -71,8 +71,12 @@ count_reason() { awk -F'\t' -v r="$1" '$2==r{c++} END{print c+0}' "$TMP"; }
 events_total() { wc -l < "$TMP" | tr -d ' '; }
 ban_rate_5m()  { awk -F'\t' -v now="$NOW" '$1>=now-300{c++} END{print c+0}' "$TMP"; }
 crowdsec_count() {
+    # ВАЖНО: ровно ОДНО целое на stdout (значение уходит в JSON). grep -c печатает 0
+    # и выходит с кодом 1 при нуле совпадений — старый `grep -oc … || echo 0` давал
+    # "0\n0" и ломал JSON на нодах с cscli, но 0 решений. Захватываем в переменную.
     command -v cscli >/dev/null 2>&1 || { echo 0; return; }
-    cscli decisions list -o json 2>/dev/null | grep -oc '"value"' || echo 0
+    local c; c="$(cscli decisions list -o json 2>/dev/null | grep -c '"value"')"
+    echo "${c:-0}"
 }
 
 # timeline: 12 бакетов по 5 мин за последний час, число событий в каждом.
