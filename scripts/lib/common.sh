@@ -135,6 +135,10 @@ ssh_client_ip() {
 
 STATE_DIR=/var/lib/node-accelerator
 CONF_DIR=/etc/node-accelerator
+# Куда install.sh кладёт скрипты для постоянных CLI-обёрток (na-diagnose / na-report).
+# curl|bash гоняет модули из временной папки → без персиста на ноде НЕ остаётся
+# стабильной команды для мониторинга/повторного прогона. Снимается rollback'ом.
+NA_LIB_DIR=/usr/local/lib/node-accelerator
 
 # ─── Персист конфига ноды ─────────────────────────────────────────────────────
 # Зачем: тулкит параметризуется через ENV. Без персиста ре-ран модуля БЕЗ ENV

@@ -97,10 +97,21 @@ rollback_protect() {
     fi
 }
 
+# CLI-обёртки (na-diagnose/na-report) и персист скриптов снимаем ТОЛЬКО когда не
+# осталось ни одного установленного модуля — иначе частичный откат (напр. protect
+# при живом optimize) убил бы команду, которая ещё нужна для мониторинга.
+remove_cli_if_orphaned() {
+    [[ -f "$STATE_DIR/optimize.installed" || -f "$STATE_DIR/protect.installed" ]] && return 0
+    rm -f /usr/local/sbin/na-diagnose /usr/local/sbin/na-report
+    rm -rf "$NA_LIB_DIR"
+    ok "CLI na-diagnose/na-report сняты (модулей не осталось)"
+}
+
 case "$WHAT" in
     optimize) rollback_optimize ;;
     protect)  rollback_protect ;;
     all)      rollback_protect; rollback_optimize ;;
     *) err "Использование: $0 [optimize|protect|all]"; exit 1 ;;
 esac
+remove_cli_if_orphaned
 ok "Бэкапы остаются в /var/backups/node-accelerator/"

@@ -72,5 +72,23 @@ jobs:
         run: bash scripts/diagnose.sh || true
       - name: diagnose.sh --json (machine-readable smoke)
         run: bash scripts/diagnose.sh --json || true
+      - name: install.sh persist → CLI na-diagnose создаётся и отдаёт JSON
+        run: |
+          bash install.sh persist
+          test -x /usr/local/sbin/na-diagnose || { echo "na-diagnose не создан"; exit 1; }
+          /usr/local/sbin/na-diagnose --json | grep -q '"firewall"' || { echo "na-diagnose --json не отдал JSON"; exit 1; }
+          echo "ok: na-diagnose установлен и отдаёт JSON"
+      - name: DRY_RUN persist — без побочных эффектов
+        run: |
+          rm -f /usr/local/sbin/na-diagnose
+          DRY_RUN=1 bash install.sh persist
+          test ! -e /usr/local/sbin/na-diagnose || { echo "DRY_RUN всё равно создал CLI"; exit 1; }
+          echo "ok: DRY_RUN ничего не пишет"
+      - name: rollback снимает CLI, когда модулей не осталось
+        run: |
+          bash install.sh persist
+          bash install.sh rollback all
+          test ! -e /usr/local/sbin/na-diagnose || { echo "na-diagnose не снят rollback'ом"; exit 1; }
+          echo "ok: rollback убрал CLI"
       - name: XanMod репозиторий+ключ+кандидат резолвятся (без установки ядра)
         run: XANMOD_PROBE=1 ENABLE_XANMOD=1 bash scripts/optimize.sh

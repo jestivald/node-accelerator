@@ -8,11 +8,15 @@
 #   sudo bash install.sh diagnose     — 🩺 диагностика (read-only)
 #   sudo bash install.sh all          — optimize → protect → diagnose
 #   sudo bash install.sh rollback [optimize|protect|all]
+#   sudo bash install.sh persist      — (пере)создать CLI na-diagnose/na-report
 #
 # curl-bash:
 #   curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/install.sh | sudo bash -s all
 #   # прод: пиньте тег (компрометация ветки main тогда не утечёт сразу на весь флот):
 #   export NA_REF=v2.1; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+#
+# После optimize/protect/all на ноде остаётся read-only команда `na-diagnose --json`
+# (стабильный JSON для мониторинга/панели — без повторного curl|bash). Снимается rollback'ом.
 
 set -euo pipefail
 # ${BASH_SOURCE[0]:-$0}: при запуске через curl|bash (bash -s) BASH_SOURCE пуст, и под
@@ -63,8 +67,38 @@ fi
 require_root
 detect_os
 
-run_optimize() { bash "$SCRIPTS/optimize.sh"; }
-run_protect()  { bash "$SCRIPTS/protect.sh"; }
+# ─── Персист CLI (na-diagnose / na-report) ───────────────────────────────────
+# curl|bash гоняет модули из временной папки → после установки на ноде НЕ остаётся
+# постоянной команды для мониторинга/повторного прогона. Панели/Zabbix/SSH-поллингу
+# нужен стабильный `na-diagnose --json`. Кладём нужные скрипты в $NA_LIB_DIR и
+# создаём тонкие обёртки в /usr/local/sbin. Идемпотентно; снимается rollback'ом.
+_na_wrapper() {  # _na_wrapper <имя-команды> <путь-к-целевому-скрипту>
+    local name="$1" target="$2"
+    cat > "/usr/local/sbin/$name" <<EOF
+#!/usr/bin/env bash
+# node-accelerator CLI (создаётся install.sh, снимается rollback). Не редактировать.
+exec bash "$target" "\$@"
+EOF
+    chmod +x "/usr/local/sbin/$name"
+}
+persist_toolkit() {
+    local extra=""
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then info "DRY_RUN: пропускаю установку CLI (na-diagnose/na-report)"; return 0; fi
+    install -d -m 0755 "$NA_LIB_DIR/lib"
+    install -m 0644 "$SCRIPTS/lib/common.sh" "$NA_LIB_DIR/lib/common.sh"
+    install -m 0755 "$SCRIPTS/diagnose.sh"   "$NA_LIB_DIR/diagnose.sh"
+    _na_wrapper na-diagnose "$NA_LIB_DIR/diagnose.sh"
+    # na-report появится в v3.1 (форензика для панели) — персистим, если есть в модулях.
+    if [[ -f "$SCRIPTS/na-report.sh" ]]; then
+        install -m 0755 "$SCRIPTS/na-report.sh" "$NA_LIB_DIR/na-report.sh"
+        _na_wrapper na-report "$NA_LIB_DIR/na-report.sh"
+        extra=", na-report"
+    fi
+    ok "CLI: na-diagnose${extra} (read-only, в /usr/local/sbin) → для мониторинга/панели"
+}
+
+run_optimize() { bash "$SCRIPTS/optimize.sh"; persist_toolkit; }
+run_protect()  { bash "$SCRIPTS/protect.sh"; persist_toolkit; }
 run_diagnose() { bash "$SCRIPTS/diagnose.sh" "$@"; }
 run_rollback() { bash "$SCRIPTS/rollback.sh" "${1:-all}"; }
 
@@ -116,7 +150,8 @@ case "${1:-}" in
     diagnose|diag) shift; run_diagnose "$@" ;;
     all)      run_optimize; run_protect; run_diagnose ;;
     rollback) run_rollback "${2:-all}" ;;
+    persist)  persist_toolkit ;;
     "")       show_menu ;;
-    -h|--help) sed -n '2,18p' "$0" ;;
-    *) err "Неизвестная команда: $1"; sed -n '2,18p' "$0"; exit 1 ;;
+    -h|--help) sed -n '2,20p' "$0" ;;
+    *) err "Неизвестная команда: $1"; sed -n '2,20p' "$0"; exit 1 ;;
 esac
