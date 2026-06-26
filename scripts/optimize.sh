@@ -237,6 +237,12 @@ TCP_ECN_MODE="${TCP_ECN_MODE:-2}"; [[ "$TCP_ECN_MODE" =~ ^[012]$ ]] || TCP_ECN_M
 # TFO можно выключить (DISABLE_TFO=1): часть сетей режет SYN с TFO-payload.
 DISABLE_TFO="${DISABLE_TFO:-0}"; [[ "$DISABLE_TFO" =~ ^[01]$ ]] || DISABLE_TFO=0
 TFO_VAL=3; [[ "$DISABLE_TFO" == "1" ]] && TFO_VAL=0
+# nf_conntrack_tcp_timeout_established: за сколько «established» без трафика реклеймится.
+# Дефолт 7440с (124 мин) — выше keepalive живого VLESS-мультиплекса, но много короче
+# стокового 5-суточного потолка ядра: брошенные / connect-and-hold сессии не раздувают
+# таблицу. idle-туннели/мосты без частого keepalive могут поднять (напр. 14400=4ч).
+CT_EST_TIMEOUT="${CT_EST_TIMEOUT:-7440}"
+[[ "$CT_EST_TIMEOUT" =~ ^[0-9]+$ ]] && [[ "$CT_EST_TIMEOUT" -ge 120 && "$CT_EST_TIMEOUT" -le 432000 ]] || CT_EST_TIMEOUT=7440
 # overcommit: на tier1 (≤1.2G) heuristic (0) безопаснее агрессивного always-overcommit (1).
 OVERCOMMIT=1; [[ "$TIER" -le 1 ]] && OVERCOMMIT=0
 info "RAM-tier $TIER (~${_mem_mb} MB): sock_max=$SOCK_MAX def=$SOCK_DEF ecn=$TCP_ECN_MODE tfo=$TFO_VAL overcommit=$OVERCOMMIT"
@@ -298,10 +304,10 @@ net.ipv4.ip_forward               = 1
 net.ipv4.conf.all.forwarding      = 1
 net.ipv6.conf.all.forwarding      = 1
 
-# --- Conntrack: timeout здесь; ёмкость (max/buckets) — отдельным drop-in ниже,
-# масштабируется от RAM (99-node-accelerator-conntrack.conf), чтобы мелкая VPS под
-# флудом не словила OOM в ядре ---
-net.netfilter.nf_conntrack_tcp_timeout_established = 7440
+# --- Conntrack: timeout здесь (tunable CT_EST_TIMEOUT); ёмкость (max/buckets) —
+# отдельным drop-in ниже, масштабируется от RAM (99-node-accelerator-conntrack.conf),
+# чтобы мелкая VPS под флудом не словила OOM в ядре ---
+net.netfilter.nf_conntrack_tcp_timeout_established = $CT_EST_TIMEOUT
 
 # --- SYN flood (ядро) ---
 net.ipv4.tcp_syncookies           = 1
@@ -643,7 +649,7 @@ EOF
 # Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
 save_conf "$CONF_DIR/optimize.conf" \
     ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
-    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM
+    DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT
 
 title "ГОТОВО"
 ok "Оптимизатор применён."

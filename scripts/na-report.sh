@@ -11,12 +11,18 @@
 #   na-report.sh --top 20        — сколько top-IP/ASN показывать
 #   na-report.sh --ip 1.2.3.4    — глубокий вердикт по IP (rDNS, nft-сеты, conntrack, таймлайн)
 #   na-report.sh --port 443      — топ дроп-источников по порту + кто слушает
+#   na-report.sh --proxyware     — self-audit: следы proxyware/residential-proxy (для abuse-тикетов; + --json)
 #
 # JSON-схема:
 #   {window_hours, generated_at, events_total, ban_rate_5m,
 #    drops_by_reason{portscan,synflood,ssh-flood,badflags,crowdsec},
 #    timeline[12],                                  # последние 60 мин, бакеты по 5 мин
 #    top_asn[{asn,name,country,pct}], top_ips[{ip,asn,country,hits,verdict}]}
+#
+# JSON-схема (--proxyware --json):
+#   {verdict:"clean|suspect", generated_at,
+#    hits{processes[],services[],cron[],files[],docker[]},
+#    c2_connections[], external_listeners[]}
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 # ─── Аргументы ────────────────────────────────────────────────────────────────
-JSON=0; HOURS=24; TOPN=15; FOCUS_IP=""; FOCUS_PORT=""
+JSON=0; HOURS=24; TOPN=15; FOCUS_IP=""; FOCUS_PORT=""; PROXYAUDIT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json) JSON=1 ;;
@@ -32,7 +38,8 @@ while [[ $# -gt 0 ]]; do
         --top) TOPN="${2:-15}"; shift ;;
         --ip) FOCUS_IP="${2:-}"; shift ;;
         --port) FOCUS_PORT="${2:-}"; shift ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        --proxyware) PROXYAUDIT=1 ;;
+        -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *) err "Неизвестный аргумент: $1"; exit 1 ;;
     esac
     shift
@@ -296,7 +303,128 @@ port_focus() {
     else info "ss недоступен"; fi
 }
 
+# ─── Self-audit: proxyware / residential-proxy (`--proxyware`) ──────────────────
+# Read-only доказательство «нода НЕ резидентный прокси и proxyware-SDK на ней нет».
+# Для ответа на abuse-тикеты (IPIDEA/PacketSDK/Honeygain/EarnApp/…). Сигнатуры —
+# ТОЛЬКО конкретные имена продуктов: generic «proxy» не матчим, иначе ложно
+# сработает на самом xray/VLESS (нода легально — прокси-сервер).
+PROXYWARE_SIG='packetsdk|ipidea|honeygain|earnapp|peer2profit|proxyrack|iproyal|pawnsapp|repocket|packetstream|traffmonetizer|bitping|earnfm|proxylite|infatica|nodemaven|gaganode|urnetwork'
+PROXYWARE_C2='api-seed.packetsdk.net packetsdk.net api-seed.packetsdk.xyz martianinc.co dnsnb8.net'
+
+# shellcheck disable=SC2009  # нужен match по args, не по имени — pgrep не подходит
+pw_proc()     { ps -eo pid=,args= 2>/dev/null | grep -iE "$PROXYWARE_SIG" | grep -ivE 'na-report|--proxyware| grep ' | sed 's/^ *//' | head -20; }
+pw_services() { { systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
+                  systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}'
+                  grep -rilE "$PROXYWARE_SIG" /etc/systemd/system /lib/systemd/system /run/systemd/system 2>/dev/null
+                } | grep -iE "$PROXYWARE_SIG" | sort -u | head -20; }
+pw_cron()     { { crontab -l 2>/dev/null
+                  while IFS=: read -r _u _; do crontab -l -u "$_u" 2>/dev/null; done < /etc/passwd
+                  grep -rhsiE "$PROXYWARE_SIG" /etc/crontab /etc/cron.d /etc/cron.* /var/spool/cron 2>/dev/null
+                } | grep -iE "$PROXYWARE_SIG" | sort -u | head -20; }
+pw_files()    { timeout 20 find /usr/local /opt /usr/bin /usr/sbin /root /home -maxdepth 4 -xdev -type f 2>/dev/null \
+                  | grep -iE "$PROXYWARE_SIG" | head -20; }
+pw_docker()   { command -v docker >/dev/null 2>&1 || return 0
+                docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -iE "$PROXYWARE_SIG" | head -20; }
+# Коннекты к C2: резолвим домены → IP, ищем среди ESTABLISHED peer-адресов.
+pw_c2conn()   {
+    local ips
+    ips="$(for d in $PROXYWARE_C2; do getent hosts "$d" 2>/dev/null | awk '{print $1}'; done | sort -u)"
+    [[ -z "$ips" ]] && return 0
+    ss -tnH state established 2>/dev/null | awk '{print $4}' \
+      | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
+      | grep -Fxf <(printf '%s\n' "$ips") 2>/dev/null | sort -u | head -20
+}
+# Внешне-доступные listener'ы — контекст: оператор сверяет, что незнакомых нет.
+pw_listeners() {
+    ss -tlnHp 2>/dev/null | awk '
+        $4 ~ /(^0\.0\.0\.0:)|(^\*:)|(^\[::\]:)|(^\[::ffff:0\.0\.0\.0\]:)/ {
+            p=$0; sub(/.*users:\(\(\"/,"",p); sub(/\".*/,"",p); if(p==$0)p="?";
+            print $4"  ["p"]" }' | sort -u | head -30
+}
+
+# stdin (строка = элемент) → JSON-массив ["a","b"] (json_str экранирует).
+_json_arr() {
+    local out="" line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        out+="${out:+,}\"$(json_str "$line")\""
+    done
+    printf '[%s]' "$out"
+}
+
+# Секция аудита: печатает и возвращает 1, если есть хиты.
+pw_section() {
+    local label="$1" data="$2"
+    if [[ -n "$data" ]]; then
+        status_line FAIL "$label:"; printf '%s\n' "$data" | sed 's/^/        /'; return 1
+    fi
+    status_line OK "$label — чисто"; return 0
+}
+
+proxyware_audit() {
+    clear 2>/dev/null || true
+    printf "%b" "$BOLD"
+    cat <<'B'
+  ┌────────────────────────────────────────────┐
+  │  🕵  node-accelerator — proxyware self-audit │
+  └────────────────────────────────────────────┘
+B
+    printf "%b" "$NC"
+    info "Read-only проверка на residential-proxy / bandwidth-SDK (для abuse-тикетов)."
+
+    local hit=0
+    title "Сигнатуры известного proxyware"
+    pw_section "процессы"      "$(pw_proc)"     || hit=1
+    pw_section "systemd-юниты" "$(pw_services)" || hit=1
+    pw_section "cron"          "$(pw_cron)"     || hit=1
+    pw_section "файлы"         "$(pw_files)"    || hit=1
+    pw_section "docker-образы" "$(pw_docker)"   || hit=1
+
+    title "Соединения к C2-инфраструктуре proxyware"
+    local c2; c2="$(pw_c2conn)"
+    if [[ -n "$c2" ]]; then
+        status_line FAIL "установленные коннекты к C2:"; printf '%s\n' "$c2" | sed 's/^/        /'; hit=1
+    else
+        status_line OK "активных соединений к C2 нет (проверено: $PROXYWARE_C2)"
+    fi
+
+    title "Внешне-доступные слушающие порты (контекст)"
+    local lst; lst="$(pw_listeners)"
+    if [[ -n "$lst" ]]; then printf '%s\n' "$lst" | sed 's/^/  • /'; else info "внешних listener'ов нет"; fi
+    info "для VPN-ноды :443 и порт входа моста — норма; убедись, что незнакомых служб нет"
+
+    hr
+    if [[ "$hit" -eq 0 ]]; then
+        ok "ВЕРДИКТ: признаков proxyware / residential-proxy НЕ найдено — нода чиста."
+    else
+        err "ВЕРДИКТ: есть индикаторы proxyware (см. ✘ выше) — разобраться вручную."
+    fi
+    hr
+}
+
+proxyware_json() {
+    local proc svc cron files dock c2 lst verdict
+    proc="$(pw_proc)";  svc="$(pw_services)"; cron="$(pw_cron)"
+    files="$(pw_files)"; dock="$(pw_docker)"; c2="$(pw_c2conn)"; lst="$(pw_listeners)"
+    if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"; else verdict="clean"; fi
+    printf '{'
+    printf '"verdict":"%s","generated_at":%s,' "$verdict" "$NOW"
+    printf '"hits":{"processes":%s,"services":%s,"cron":%s,"files":%s,"docker":%s},' \
+        "$(printf '%s\n' "$proc"  | _json_arr)" \
+        "$(printf '%s\n' "$svc"   | _json_arr)" \
+        "$(printf '%s\n' "$cron"  | _json_arr)" \
+        "$(printf '%s\n' "$files" | _json_arr)" \
+        "$(printf '%s\n' "$dock"  | _json_arr)"
+    printf '"c2_connections":%s,"external_listeners":%s}\n' \
+        "$(printf '%s\n' "$c2"  | _json_arr)" \
+        "$(printf '%s\n' "$lst" | _json_arr)"
+}
+
 # ─── Диспетч ────────────────────────────────────────────────────────────────────
+if [[ "$PROXYAUDIT" == "1" ]]; then
+    if [[ "$JSON" == "1" ]]; then proxyware_json; else proxyware_audit; fi
+    exit 0
+fi
 if [[ "$JSON" == "1" ]]; then emit_json; exit 0; fi
 [[ -n "$FOCUS_PORT" ]] && { port_focus; exit 0; }
 [[ -n "$FOCUS_IP" ]] && { focus_ip; exit 0; }

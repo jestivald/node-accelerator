@@ -39,7 +39,8 @@
 - **conntrack phantom-eviction** *(opt-in)* — защита от **distributed connect-and-hold**
   по живым сокетам (`conntrack ≫ ss`), CGNAT-safe, observe-режим по умолчанию.
 - **SYNPROXY** *(opt-in, done-right)* — `notrack` только host-local (`fib daddr type local`,
-  не ломает Docker/транзит), verify ядра/модуля, fail-loud при недоступности.
+  не ломает Docker/транзит), verify ядра/модуля, fail-loud при недоступности. На VPN-relay
+  обычно избыточен (syncookies + per-IP ct-лимиты уже дают анти-спуф) — **default off**.
 - **статич-блоклисты** *(opt-in)* — Spamhaus DROP + FireHOL L1 (+ Tor), bogon-фильтр, таймер.
 - **Remnawave fleet auto-sync** *(opt-in)* — ноды флота сами держат IP друг друга в whitelist (с панели).
 - **ICMP rate-limit** (пинг жив, флуд режется).
@@ -104,7 +105,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `ENABLE_PORTSCAN_BAN` | `1` | автобан за скан закрытых портов |
 | `PORTSCAN_RATE`/`PORTSCAN_BURST` | `15`/`30` | порог скана (SYN на закрытые порты/мин, per-IP) до бана — ниже порога просто дроп, без бана |
 | `ENABLE_CROWDSEC` | `1` | ставить CrowdSec + bouncer |
-| `ENABLE_SYNPROXY` | `0` | nft synproxy на сервисные порты (advanced) |
+| `ENABLE_SYNPROXY` | `0` | nft synproxy на сервисные порты (advanced). На VPN-relay избыточен — syncookies + per-IP ct-лимиты уже дают анти-спуф; включать под подтверждённый спуф-SYN-флуд |
 | `CROWDSEC_ENROLL_KEY` | _пусто_ | enroll в CrowdSec Console |
 | `SAFETY_DELAY` | `300` | сек до авто-сброса правил, если не подтвердить SSH |
 | `DRY_RUN` | `0` | `1` — только сгенерировать + `nft -c`, не применять |
@@ -121,7 +122,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `NA_CTG_ENFORCE` | `0` | `0` — observe (только лог), `1` — эвиктить фантомы |
 | `NA_CTG_PHANTOM_MIN` / `NA_CTG_LIVE_FLOOR` | `4000` / `2` | порог conntrack-холдера / порог живых сокетов |
 
-`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`. Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
+`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`. Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
 `XANMOD_PROBE=1` — проверить, что репозиторий+ключ+сборка ядра резолвятся на этой ОС, **без установки** (для CI и быстрой проверки совместимости).
 
 ---
