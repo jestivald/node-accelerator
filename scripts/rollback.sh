@@ -90,6 +90,9 @@ rollback_protect() {
         nft delete table ip crowdsec 2>/dev/null || true
         nft delete table ip6 crowdsec6 2>/dev/null || true
         rm -f /etc/crowdsec/parsers/s02-enrich/na-whitelist.yaml /etc/crowdsec/acquis.d/na-sshd.yaml
+        # пиннингованный APT-репо CrowdSec (создаёт setup_crowdsec_repo в protect.sh)
+        rm -f /etc/apt/sources.list.d/crowdsec.list /etc/apt/keyrings/crowdsec-archive-keyring.gpg
+        apt-get update -qq 2>/dev/null || true
         ok "CrowdSec удалён"
     else
         info "CrowdSec оставлен работать (NA_PURGE_CROWDSEC=1 чтобы удалить)."
