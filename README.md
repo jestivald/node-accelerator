@@ -5,7 +5,7 @@
 Оптимизация, диагностика и защита VPN-ноды (Remnawave / Xray / VLESS-Reality, xHTTP, Hysteria2/TUIC).
 Три модуля, все идемпотентны, всё откатывается одной командой.
 
-> **Поддержка:** Debian 11/12/13, Ubuntu 20.04–24.04. Тестируется на нодах с `network_mode: host`.
+> **Поддержка:** Debian 11/12/13, Ubuntu 20.04–26.04. Тестируется на нодах с `network_mode: host`.
 
 ---
 
@@ -45,11 +45,14 @@
 - **Remnawave fleet auto-sync** *(opt-in)* — ноды флота сами держат IP друг друга в whitelist (с панели).
 - **ICMP rate-limit** (пинг жив, флуд режется).
 - **CrowdSec + `crowdsec-firewall-bouncer-nftables`** — поведенческий IPS + community-блоклист.
+  Ставится из **пиннингованного APT-репо** (полный отпечаток ключа сверяется; фоллбэк на
+  официальный установщик — только если репо недоступен, с громким warn). `CROWDSEC_PROBE=1` —
+  проверить резолв репо/пакетов на этой ОС без установки.
 - Полный **IPv6-паритет**, **rate-limit на логи**, **авто-whitelist твоего SSH-IP** + **сейфти-таймер** от самоблокировки.
 - **Персист конфига** — ре-ран без ENV не сбрасывает поднятые под ноду ручки.
 
 ### 🩺 Диагностика (`scripts/diagnose.sh`)
-Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели; `--retrans [--window N]` — разбор причин TCP-retransmits).
+Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. Плюс сенсоры **стека ноды**: контейнер `remnanode` (статус/рестарты/`SPAWN_ERROR` за час — ловит коллизию node-address в панели), **сроки TLS-сертификатов** (LE/acme.sh; свои пути — `NA_CERT_PATHS="глоб1 глоб2"`), **свежесть fleet-sync/blocklist**, IPv6 default-route, UDP `RcvbufErrors` (QUIC/Hysteria2). После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели — теперь с `na_version`, `hostname`, `uptime_s`, `load1`, `mem_used_pct`, WAN rx/tx-байтами; `--retrans [--window N]` — разбор причин TCP-retransmits).
 
 ### 🔥 Форензика атак (`scripts/na-report.sh`)
 Read-only: кто/откуда/чем/когда — из журнала ядра, nft-сетов и CrowdSec. **`na-report`** (человекочитаемо) или **`na-report --json`**: `drops_by_reason`, `timeline`, `top_ips` с вердиктом, `top_asn` (ASN/гео — best-effort через Team Cymru whois). Флаги: `--hours N`, `--top N`, `--ip <addr>`.
@@ -80,7 +83,12 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v2.1
+export NA_REF=v3.6
+curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+
+# максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
+export NA_REF=v3.6 NA_REQUIRE_SIG=1 \
+       NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
 
@@ -116,13 +124,14 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `BLOCK_TOR` | `0` | добавить Tor exit-nodes в блоклист |
 | `BLOCKLIST_REFRESH` | `12h` | интервал обновления блоклистов |
 | `REMNAWAVE_URL` / `REMNAWAVE_TOKEN` | _пусто_ | панель для fleet auto-sync (токен → `fleet.env` 0600) |
+| `REMNAWAVE_NODES_URL` | _пусто_ | fleet-sync **без токена на ноде**: URL статического списка нод (JSON вида `/api/nodes` или plain-text «адрес на строку») |
 | `FLEET_SYNC` | `auto` | `auto` (вкл при URL+TOKEN) / `1` / `0` |
 | `FLEET_SYNC_INTERVAL` | `5min` | интервал синка нод флота |
 | `ENABLE_CTGUARD` | `0` | conntrack phantom-eviction (анти connect-and-hold) |
 | `NA_CTG_ENFORCE` | `0` | `0` — observe (только лог), `1` — эвиктить фантомы |
 | `NA_CTG_PHANTOM_MIN` / `NA_CTG_LIVE_FLOOR` | `4000` / `2` | порог conntrack-холдера / порог живых сокетов |
 
-`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`. Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
+`optimize.sh`: `ENABLE_XANMOD=1`, `XANMOD_FLAVOR=lts|main|edge|rt`, `XANMOD_PKG=...`, `REMNAWAVE_SWAP_SIZE=2G`, `TCP_ECN_MODE=2` (0/1/2), `DISABLE_TFO=0`, `CT_EST_TIMEOUT=7440` (conntrack established-timeout, сек; ↑ напр. до `14400` для idle-туннелей/мостов без частого keepalive), `QDISC=fq|fq_codel|cake` (cake — против bufferbloat на слабых аплинках; сравнивай A/B), `ENABLE_MSS_CLAMP=0` (для routed/WireGuard-нод), `SETUP_NO_ZRAM=0`. Буферы/conntrack/somaxconn — **tier-aware** (масштаб от RAM).
 `XANMOD_PROBE=1` — проверить, что репозиторий+ключ+сборка ядра резолвятся на этой ОС, **без установки** (для CI и быстрой проверки совместимости).
 
 ---
@@ -154,6 +163,20 @@ sudo REMNAWAVE_URL="https://panel.example.com" REMNAWAVE_TOKEN="ey..." \
      REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
 # токен из панели: Remnawave → Settings → API Tokens. Хранится в /etc/node-accelerator/fleet.env (0600).
 ```
+
+> ⚠️ **Blast-radius токена.** API-токен Remnawave — полноправный; лежащий на каждой ноде
+> `fleet.env`, при компрометации одной ноды отдаёт доступ к панели. Заведите под fleet-sync
+> **отдельный** токен (легко отозвать), а лучше — режим **без токена на ноде**:
+>
+> ```bash
+> # панель кроном публикует список нод (JSON /api/nodes или «адрес на строку»)
+> # за basic-auth / IP-allowlist, ноды тянут его без всяких токенов:
+> sudo REMNAWAVE_NODES_URL="https://user:pass@panel.example.com/fleet/nodes.json" \
+>      REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
+> ```
+>
+> Свежесть синка видна в `na-diagnose` (`fleet_sync_age_s` в `--json`): протухший
+> токен/сменившийся API больше не прячутся за fail-safe last-known-good.
 
 ### Защита от distributed connect-and-hold (ctguard)
 

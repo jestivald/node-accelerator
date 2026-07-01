@@ -29,13 +29,15 @@ emit_json() {
     local kern xanmod virt cc qd ctmax ctcnt ctpct uln minsnd mtuprobe collapsed
     local fw ab4 ab6 susp bl4 bl6 fl4 fl6 crowd ctg syndeg safety rebootn
     local u1 n1 s1 i1 w1 q1 sq1 st1 u2 n2 s2 i2 w2 q2 sq2 st2 dt steal out rtx rtxpct
+    local nav host up load1 mempct wi wanrx wantx ip6def udperr
+    local rnst rnrc rnse fsa bla certd nowsec cf cend cends cd
     kern="$(uname -r)"; uname -r | grep -qi xanmod && xanmod=true || xanmod=false
     virt="$(detect_virt)"
     cc="$(val net.ipv4.tcp_congestion_control)"; qd="$(val net.core.default_qdisc)"
     ctmax="$(val net.netfilter.nf_conntrack_max)"; ctmax="${ctmax:-0}"
     ctcnt="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
     ctpct=0; [[ "${ctmax:-0}" -gt 0 ]] && ctpct=$(( ctcnt * 100 / ctmax ))
-    uln="$(ulimit -n 2>/dev/null || echo 0)"
+    uln="$(ulimit -n 2>/dev/null || echo 0)"; [[ "$uln" =~ ^[0-9]+$ ]] || uln=0   # RLIMIT=infinity → "unlimited" сломал бы JSON-число
     minsnd="$(val net.ipv4.tcp_min_snd_mss)"; minsnd="${minsnd:-0}"
     mtuprobe="$(val net.ipv4.tcp_mtu_probing)"; mtuprobe="${mtuprobe:-0}"
     collapsed="$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
@@ -70,13 +72,61 @@ emit_json() {
       || { [[ -f "$STATE_DIR/na-fw-safety.pid" ]] && kill -0 "$(cat "$STATE_DIR/na-fw-safety.pid" 2>/dev/null)" 2>/dev/null; }; } \
       && safety=true || safety=false
     rebootn=false; grep -q '^reboot_needed=1' "$STATE_DIR/optimize.installed" 2>/dev/null && rebootn=true
+
+    # ── na-panel extras: identity, нагрузка, WAN-счётчики, стек ноды, свежесть, серты ──
+    nowsec="$(date +%s)"
+    nav="${NA_VERSION:-?}"
+    host="$(hostname 2>/dev/null || echo '?')"
+    up="$(awk '{printf "%d",$1}' /proc/uptime 2>/dev/null)"; up="${up:-0}"
+    load1="$(awk '{print $1+0}' /proc/loadavg 2>/dev/null)"; load1="${load1:-0}"
+    mempct="$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t>0)printf "%d",(t-a)*100/t; else print 0}' /proc/meminfo 2>/dev/null)"; mempct="${mempct:-0}"
+    wi="$(default_iface)"; wi="${wi:-}"
+    wanrx=0; wantx=0
+    if [[ -n "$wi" ]]; then
+        wanrx="$(cat "/sys/class/net/$wi/statistics/rx_bytes" 2>/dev/null || echo 0)"
+        wantx="$(cat "/sys/class/net/$wi/statistics/tx_bytes" 2>/dev/null || echo 0)"
+    fi
+    [[ "$wanrx" =~ ^[0-9]+$ ]] || wanrx=0; [[ "$wantx" =~ ^[0-9]+$ ]] || wantx=0
+    ip -6 route show default 2>/dev/null | grep -q . && ip6def=true || ip6def=false
+    udperr="$(awk '/^Udp:/{if(!h){for(i=2;i<=NF;i++)n[i]=$i;h=1;next} for(i=2;i<=NF;i++) if(n[i]=="RcvbufErrors") print $i}' /proc/net/snmp 2>/dev/null)"
+    udperr="${udperr:-0}"; [[ "$udperr" =~ ^[0-9]+$ ]] || udperr=0
+    # remnanode (Remnawave node-контейнер) — статус/рестарты/SPAWN_ERROR за час. Read-only.
+    rnst="no-docker"; rnrc=0; rnse=0
+    if command -v docker >/dev/null 2>&1; then
+        rnst="$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo absent)"; [[ -n "$rnst" ]] || rnst=absent
+        rnrc="$(docker inspect -f '{{.RestartCount}}' remnanode 2>/dev/null || echo 0)"; [[ "$rnrc" =~ ^[0-9]+$ ]] || rnrc=0
+        if [[ "$rnst" != "absent" ]]; then
+            rnse="$(docker logs --since 1h remnanode 2>&1 | grep -c 'SPAWN_ERROR' || true)"; [[ "$rnse" =~ ^[0-9]+$ ]] || rnse=0
+        fi
+    fi
+    # свежесть последнего УСПЕШНОГО синка (−1 = штампа нет / модуль не активен)
+    fsa=-1; bla=-1
+    [[ -f "$STATE_DIR/fleet-sync.last" ]] && { cf="$(cat "$STATE_DIR/fleet-sync.last" 2>/dev/null)"; [[ "$cf" =~ ^[0-9]+$ ]] && fsa=$(( nowsec - cf )); }
+    [[ -f "$STATE_DIR/blocklist.last" ]] && { cf="$(cat "$STATE_DIR/blocklist.last" 2>/dev/null)"; [[ "$cf" =~ ^[0-9]+$ ]] && bla=$(( nowsec - cf )); }
+    # ближайший к истечению серт (−1 = нет openssl / сертов не нашли). NA_CERT_PATHS —
+    # доп.пути через пробел; используются только в [ -f ] и openssl (без eval).
+    certd=-1
+    if command -v openssl >/dev/null 2>&1; then
+        for cf in /etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*/fullchain.cer ${NA_CERT_PATHS:-}; do
+            [[ -f "$cf" ]] || continue
+            cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
+            cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
+            cd=$(( (cends - nowsec) / 86400 ))
+            { [[ "$certd" -lt 0 ]] || [[ "$cd" -lt "$certd" ]]; } && certd="$cd"
+        done
+    fi
+
     printf '{'
     printf '"kernel":"%s","xanmod":%s,"virt":"%s","cpu_steal_pct":%s,"tcp_retrans_pct":%s,' "$kern" "$xanmod" "$virt" "$steal" "$rtxpct"
     printf '"congestion_control":"%s","qdisc":"%s","conntrack_max":%s,"conntrack_count":%s,"conntrack_pct":%s,' "${cc:-}" "${qd:-}" "$ctmax" "$ctcnt" "$ctpct"
     printf '"ulimit_n":%s,"min_snd_mss":%s,"mtu_probing":%s,"mss_collapsed_sockets":%s,' "${uln:-0}" "$minsnd" "$mtuprobe" "${collapsed:-0}"
     printf '"firewall":%s,"autoban_v4":%s,"autoban_v6":%s,"suspect":%s,"blocklist_v4":%s,"blocklist_v6":%s,' "$fw" "$ab4" "$ab6" "$susp" "$bl4" "$bl6"
     printf '"fleet_v4":%s,"fleet_v6":%s,"crowdsec":%s,"ctguard":"%s","synproxy_degraded":%s,' "$fl4" "$fl6" "$crowd" "$ctg" "$syndeg"
-    printf '"safety_armed":%s,"reboot_needed":%s}\n' "$safety" "$rebootn"
+    printf '"safety_armed":%s,"reboot_needed":%s,' "$safety" "$rebootn"
+    printf '"na_version":"%s","hostname":"%s","uptime_s":%s,"load1":%s,"mem_used_pct":%s,' "$nav" "$host" "$up" "$load1" "$mempct"
+    printf '"wan_iface":"%s","wan_rx_bytes":%s,"wan_tx_bytes":%s,"ipv6_default":%s,"udp_rcvbuf_errors":%s,' "$wi" "$wanrx" "$wantx" "$ip6def" "$udperr"
+    printf '"remnanode_status":"%s","remnanode_restarts":%s,"remnanode_spawn_errors_1h":%s,' "$rnst" "$rnrc" "$rnse"
+    printf '"fleet_sync_age_s":%s,"blocklist_age_s":%s,"cert_min_days":%s}\n' "$fsa" "$bla" "$certd"
 }
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
 
@@ -214,6 +264,7 @@ title "Система"
 VIRT="$(detect_virt)"
 CORES="$(nproc 2>/dev/null || echo '?')"
 MEM="$(free -h 2>/dev/null | awk '/Mem:/{print $2}')"
+info "Хост:   $(hostname 2>/dev/null || echo '?')   node-accelerator v${NA_VERSION:-?}"
 info "OS:     ${PRETTY_NAME:-$(. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME")}"
 info "Kernel: $(uname -r)   Arch: $(arch)"
 info "Virt:   $VIRT   CPU: ${CORES} ядер   RAM: ${MEM:-?}"
@@ -389,8 +440,10 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     AB4=$(nft list set inet na_filter autoban_v4 2>/dev/null | grep -c 'timeout\|expires')
     AB6=$(nft list set inet na_filter autoban_v6 2>/dev/null | grep -c 'timeout\|expires')
     info "autoban: v4=$AB4  v6=$AB6"
-    WLN=$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-    [[ "$WLN" -gt 0 ]] && pass "whitelist_v4: $WLN адрес(ов)" || wrn "whitelist пуст — твой IP не защищён от автобана!"
+    WLN=$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l | tr -d ' ')
+    WL6N=$(nft list set inet na_filter whitelist_v6 2>/dev/null | grep -c ':')
+    if [[ "$WLN" -gt 0 || "$WL6N" -gt 0 ]]; then pass "whitelist: v4=$WLN v6=$WL6N адрес(ов)"
+    else wrn "whitelist пуст — твой IP не защищён от автобана!"; fi
     # датчик: насколько близко самый «жирный» источник к CONN_LIMIT (виден ли per-IP потолок)
     CLIM=$(nft list chain inet na_filter input 2>/dev/null | grep -oE 'ct count over [0-9]+' | head -1 | grep -oE '[0-9]+')
     if [[ -n "$CLIM" ]]; then
@@ -410,11 +463,32 @@ if nft list table inet na_filter >/dev/null 2>&1; then
         BL4=$(nft list set inet na_filter blocklist_v4 2>/dev/null | grep -coE '[0-9.]+')
         [[ "$BL4" -gt 0 ]] && pass "threat-блоклисты: v4=$BL4 записей (na-blocklist-update)" \
             || wrn "blocklist_v4 пуст — фиды не подтянулись? journalctl -t na-blocklist"
+        if [[ -f "$STATE_DIR/blocklist.last" ]]; then
+            _bls="$(cat "$STATE_DIR/blocklist.last" 2>/dev/null)"
+            [[ "$_bls" =~ ^[0-9]+$ ]] && info "последнее обновление блоклистов: $(( ($(date +%s) - _bls)/3600 ))ч назад"
+        fi
     fi
     if nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1; then
         FL4=$(nft list set inet na_filter na_fleet_v4 2>/dev/null | grep -coE '[0-9.]+')
         [[ "$FL4" -gt 0 ]] && pass "fleet-sync: $FL4 нод флота в whitelist" \
             || wrn "na_fleet пуст — панель/токен? journalctl -t na-fleet-sync"
+        # свежесть: fail-safe last-known-good нем — протухший токен/сменившийся API
+        # панели молча заморозил бы сет. Ругаемся, если синка не было > 3× интервала.
+        if [[ -f "$STATE_DIR/fleet-sync.last" ]]; then
+            _fls="$(cat "$STATE_DIR/fleet-sync.last" 2>/dev/null)"
+            if [[ "$_fls" =~ ^[0-9]+$ ]]; then
+                _age=$(( $(date +%s) - _fls ))
+                _iv="$(awk -F= '/^FLEET_SYNC_INTERVAL=/{gsub(/[":]/,"",$2);print $2}' "$CONF_DIR/protect.conf" 2>/dev/null)"
+                _ivs="$(systime_to_s "${_iv:-5min}")"; [[ "$_ivs" -ge 60 ]] || _ivs=300
+                if [[ "$_age" -gt $((_ivs*3)) ]]; then
+                    wrn "последний успешный fleet-sync $((_age/60)) мин назад (> 3× интервала) — токен протух/панель сменила API? journalctl -t na-fleet-sync"
+                else
+                    info "последний fleet-sync: $((_age/60)) мин назад (свежо)"
+                fi
+            fi
+        else
+            info "штампа fleet-sync ещё нет (первый синк не завершился успешно)"
+        fi
     fi
 else
     wrn "na_filter не активна — защита не стоит (запусти 🛡 protect)"
@@ -455,9 +529,65 @@ ss -tulnH 2>/dev/null | awk '{print $1, $5}' | sort -u | sed 's/^/  /' | head -2
 title "Сеть"
 EXTIP="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)"
 [[ -n "$EXTIP" ]] && info "Внешний IPv4: $EXTIP"
+# IPv6 default-route: на нодах где v6 включён осознанно (напр. CDN-origin) его пропажа
+# после смены сети/провайдера тихо ломает v6-клиентов. Показываем факт, без warn
+# (v4-only ноды — легитимный кейс).
+if ip -6 route show default 2>/dev/null | grep -q .; then
+    info "IPv6 default-route: есть ($(ip -6 route show default 2>/dev/null | awk '{print $3; exit}'))"
+else
+    info "IPv6 default-route: нет (v4-only нода)"
+fi
+# UDP RcvbufErrors — переполнение приёмного буфера UDP (QUIC/Hysteria2/TUIC): пакеты
+# отброшены до приложения. Кумулятивно с загрузки; растущее — сигнал поднять буферы/PPS.
+UDPERR="$(awk '/^Udp:/{if(!h){for(i=2;i<=NF;i++)n[i]=$i;h=1;next} for(i=2;i<=NF;i++) if(n[i]=="RcvbufErrors") print $i}' /proc/net/snmp 2>/dev/null)"
+if [[ -n "$UDPERR" && "$UDPERR" -gt 0 ]] 2>/dev/null; then
+    wrn "UDP RcvbufErrors = $UDPERR (с загрузки) — переполнение UDP-буфера для QUIC/Hysteria2; следи за ростом"
+else
+    info "UDP RcvbufErrors = ${UDPERR:-0} (приёмный буфер QUIC/UDP не переполняется)"
+fi
 if command -v ping >/dev/null; then
     RTT="$(ping -c2 -W2 1.1.1.1 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5" ms"}')"
     [[ -n "$RTT" ]] && info "RTT до 1.1.1.1: avg $RTT" || info "ICMP-тест не прошёл (возможно ICMP режется аптайм-провайдером)"
+fi
+
+# ─── Стек ноды (remnanode) и сертификаты ─────────────────────────────────────
+title "Стек ноды и сертификаты"
+if command -v docker >/dev/null 2>&1; then
+    RN_ST="$(docker inspect -f '{{.State.Status}}' remnanode 2>/dev/null || echo absent)"
+    if [[ "$RN_ST" == "running" ]]; then
+        RN_RC="$(docker inspect -f '{{.RestartCount}}' remnanode 2>/dev/null || echo 0)"
+        RN_SE="$(docker logs --since 1h remnanode 2>&1 | grep -c 'SPAWN_ERROR' || true)"
+        if [[ "${RN_SE:-0}" -gt 0 ]]; then
+            bad "remnanode: running, но $RN_SE SPAWN_ERROR за час — xray не стартует (сверь node-address в панели: коллизия IP?)"
+        elif [[ "${RN_RC:-0}" -gt 3 ]]; then
+            wrn "remnanode: running, но RestartCount=$RN_RC — контейнер флапает (docker logs remnanode)"
+        else
+            pass "remnanode: running (рестартов $RN_RC, SPAWN_ERROR за час нет)"
+        fi
+    elif [[ "$RN_ST" == "absent" ]]; then
+        info "remnanode: контейнера нет (нода без Remnawave node-агента? или иное имя)"
+    else
+        bad "remnanode: статус '$RN_ST' (не running) — node-агент лежит"
+    fi
+else
+    info "docker не установлен — сенсор remnanode пропущен"
+fi
+# сертификаты: ближайший к истечению (Let's Encrypt / acme.sh / NA_CERT_PATHS)
+if command -v openssl >/dev/null 2>&1; then
+    CERT_MIN=-1; CERT_MIN_F=""
+    for cf in /etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*/fullchain.cer ${NA_CERT_PATHS:-}; do
+        [[ -f "$cf" ]] || continue
+        cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
+        cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
+        cdays=$(( (cends - $(date +%s)) / 86400 ))
+        { [[ "$CERT_MIN" -lt 0 ]] || [[ "$cdays" -lt "$CERT_MIN" ]]; } && { CERT_MIN="$cdays"; CERT_MIN_F="$cf"; }
+    done
+    if [[ "$CERT_MIN" -lt 0 ]]; then info "TLS-сертификатов в стандартных путях не найдено (задай NA_CERT_PATHS, если selfsteal-серт лежит иначе)"
+    elif [[ "$CERT_MIN" -lt 7 ]];  then bad  "TLS-серт истекает через ${CERT_MIN} дн ($CERT_MIN_F) — renewal сломан?"
+    elif [[ "$CERT_MIN" -lt 14 ]]; then wrn  "TLS-серт истекает через ${CERT_MIN} дн ($CERT_MIN_F) — проверь авто-renew"
+    else pass "ближайший TLS-серт: ${CERT_MIN} дн до истечения ($CERT_MIN_F)"; fi
+else
+    info "openssl не установлен — проверка сроков сертификатов пропущена"
 fi
 
 # ─── Здоровье: давление, диск, инциденты ─────────────────────────────────────

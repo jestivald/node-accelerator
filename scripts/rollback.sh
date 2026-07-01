@@ -79,6 +79,7 @@ rollback_protect() {
     rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
     # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)
     rm -f "$STATE_DIR/protect.installed" "$CONF_DIR/protect.conf" "$CONF_DIR/ctguard.conf" "$CONF_DIR/fleet.env"
+    rm -f "$STATE_DIR/fleet-sync.last" "$STATE_DIR/blocklist.last"
     [[ -f "$CONF_DIR/custom-blocklist.txt" ]] && info "оставлен $CONF_DIR/custom-blocklist.txt (данные оператора)"
     ok "na_filter/na_ctguard удалены, сервисы и таймеры сняты"
 
@@ -89,6 +90,9 @@ rollback_protect() {
         nft delete table ip crowdsec 2>/dev/null || true
         nft delete table ip6 crowdsec6 2>/dev/null || true
         rm -f /etc/crowdsec/parsers/s02-enrich/na-whitelist.yaml /etc/crowdsec/acquis.d/na-sshd.yaml
+        # пиннингованный APT-репо CrowdSec (создаёт setup_crowdsec_repo в protect.sh)
+        rm -f /etc/apt/sources.list.d/crowdsec.list /etc/apt/keyrings/crowdsec-archive-keyring.gpg
+        apt-get update -qq 2>/dev/null || true
         ok "CrowdSec удалён"
     else
         info "CrowdSec оставлен работать (NA_PURGE_CROWDSEC=1 чтобы удалить)."

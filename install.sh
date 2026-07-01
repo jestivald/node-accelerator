@@ -13,7 +13,8 @@
 # curl-bash:
 #   curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/install.sh | sudo bash -s all
 #   # прод: пиньте тег (компрометация ветки main тогда не утечёт сразу на весь флот):
-#   export NA_REF=v2.1; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+#   export NA_REF=v3.6; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+#   # + подписи модулей: NA_REQUIRE_SIG=1 NA_MINISIGN_PUBKEY=<ключ из README>
 #
 # После optimize/protect/all на ноде остаётся read-only команда `na-diagnose --json`
 # (стабильный JSON для мониторинга/панели — без повторного curl|bash). Снимается rollback'ом.
@@ -42,7 +43,13 @@ verify_sig() {  # verify_sig <файл> <url-без-расширения>
         minisign -V -P "$NA_MINISIGN_PUBKEY" -m "$file" >/dev/null 2>&1
     elif [[ -n "$NA_SIG_FINGERPRINT" ]] && command -v gpg >/dev/null 2>&1; then
         curl -fsSL "$url.asc" -o "$file.asc" 2>/dev/null || { echo "[x] нет .asc для $(basename "$file")"; return 1; }
-        gpg --verify "$file.asc" "$file" 2>&1 | grep -q "${NA_SIG_FINGERPRINT// /}"
+        # Судим по МАШИННОМУ статусу (--status-fd), а НЕ по человекочитаемому выводу:
+        # `gpg --verify | grep <fpr>` матчил бы 'using RSA key <fpr>' — эта строка
+        # печатается из пакета подписи ДАЖЕ для BAD-подписи, а exit-код терялся в пайпе
+        # (валидная .asc настоящего ключа рядом с подменённым файлом проходила бы как ок).
+        # VALIDSIG эмитится ТОЛЬКО для криптографически валидной подписи и несёт полный fpr.
+        gpg --status-fd=1 --verify "$file.asc" "$file" 2>/dev/null \
+          | grep -Eq "^\[GNUPG:\] VALIDSIG ${NA_SIG_FINGERPRINT// /}( |\$)"
     else
         echo "[x] NA_REQUIRE_SIG=1, но нет minisign+NA_MINISIGN_PUBKEY или gpg+NA_SIG_FINGERPRINT"; return 1
     fi
@@ -104,9 +111,9 @@ run_rollback() { bash "$SCRIPTS/rollback.sh" "${1:-all}"; }
 
 show_menu() {
     clear 2>/dev/null || true
-    cat <<'BANNER'
+    cat <<BANNER
 ┌────────────────────────────────────────────────────┐
-│            ⚡ node-accelerator ⚡                    │
+│            ⚡ node-accelerator v${NA_VERSION:-?} ⚡                │
 │   Оптимизация · Диагностика · Защита VPN-ноды       │
 ├────────────────────────────────────────────────────┤
 │                                                      │

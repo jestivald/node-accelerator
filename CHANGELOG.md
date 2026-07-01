@@ -1,5 +1,82 @@
 # Changelog
 
+## v3.6 — 2026-07-01
+
+Наблюдаемость стека ноды + supply-chain-хардинг. Все новые сенсоры **read-only**;
+поведение защиты/тюнинга по умолчанию **не меняется**. Впервые репозиторий получает
+**теги/релизы** (v2.0…v3.6) и **подписи модулей** — `NA_REF=<тег>` из README теперь
+рабочий, а не пример.
+
+### 🔐 protect.sh — CrowdSec из пиннингованного APT-репозитория
+- Вместо `curl https://install.crowdsec.net | bash` — их **packagecloud APT-репо** с
+  проверкой **полного отпечатка** ключа (`6A89E3C2303A901A889971D3376ED5326E93CD0C`;
+  64-битный keyid подделать дёшево — как уже сделано для XanMod). Suite нет для этой ОС
+  → фоллбэк на `noble`/`bookworm`; репо совсем не поднялся → официальный установщик как
+  **last-resort** (громко, `warn`). `CROWDSEC_PROBE=1` — проверить резолв репо/ключа/
+  пакетов без установки (CI/ops).
+
+### 🩺 diagnose.sh — сенсоры стека ноды (в отчёте и `--json`)
+- **remnanode**: статус контейнера, `RestartCount`, число `SPAWN_ERROR` за час
+  (ловит коллизию node-address в панели: два node-record на один IP → xray не стартует).
+- **TLS-сертификаты**: ближайший к истечению (Let's Encrypt/acme.sh/`NA_CERT_PATHS`),
+  warn <14 дн, fail <7 дн.
+- **Свежесть fleet-sync / blocklist**: `na-fleet-sync`/`na-blocklist-update` штампуют
+  время УСПЕШНОГО обновления; diagnose ругается, если fleet-sync не проходил > 3× интервала
+  (протухший токен панели / сменившийся API больше не молчат за fail-safe last-known-good).
+- **IPv6 default-route** (пропажа тихо ломает v6-клиентов) и **UDP RcvbufErrors**
+  (переполнение приёмного буфера QUIC/Hysteria2/TUIC).
+- `--json` дополнен для флот-панели: `na_version`, `hostname`, `uptime_s`, `load1`,
+  `mem_used_pct`, `wan_iface`/`wan_rx_bytes`/`wan_tx_bytes`, `ipv6_default`,
+  `udp_rcvbuf_errors`, `remnanode_status`/`_restarts`/`_spawn_errors_1h`,
+  `fleet_sync_age_s`, `blocklist_age_s`, `cert_min_days` (трафик/нагрузка без второго SSH).
+- **Фикс:** датчик whitelist считал только v4 — на нодах с чисто-v6 whitelist давал ложное
+  «whitelist пуст». Теперь v4+v6.
+
+### 🌐 optimize.sh
+- **`QDISC=fq|fq_codel|cake`** (opt-in) — cake как альтернатива `fq` на bufferbloat-аплинках
+  дешёвых VPS (BBR пейсит внутренне). Дефолт `fq` не меняется; персистится.
+- **LRO off** в NIC-тюнинге (GRO оставляем): LRO ломает форвардинг-путь на bare-metal.
+- XanMod-репо теперь по **https** (был http).
+
+### 🛡 fleet-sync без API-токена на ноде (`REMNAWAVE_NODES_URL`)
+- Альтернатива Bearer-токену панели на каждой ноде (blast-radius): статический источник
+  адресов — JSON вида `/api/nodes` **или** plain-text «адрес на строку». Панель публикует
+  его кроном за basic-auth/allowlist, ноды тянут без токена. `REMNAWAVE_URL`+`TOKEN`
+  по-прежнему поддерживаются.
+
+### 🧰 lib/common.sh
+- **`NA_VERSION`** — единый источник версии; пишется в installed-маркеры и во все `--json`
+  (флот-панель видит version-drift по нодам).
+- **Авто-ремонт dpkg** в `apt_install`: при сбое — `dpkg --configure -a` + `apt-get -f install`
+  + ретрай (прерванный прошлый прогон/битый dpkg — частый кейс на чужих нодах).
+
+### 🐞 Фиксы корректности (по итогам ревью)
+- **[security] `install.sh` — обход проверки GPG-подписи.** `NA_REQUIRE_SIG=1` в
+  gpg-режиме судил валидность по человекочитаемому выводу (`gpg --verify | grep <fpr>`):
+  строка `using RSA key <fpr>` печатается из пакета подписи **даже для BAD-подписи**, а
+  exit-код терялся в пайпе — подменённый модуль с валидной `.asc` настоящего ключа прошёл
+  бы как ок. Теперь по машинному `--status-fd` + `VALIDSIG` (эмитится только для валидной).
+  minisign-режим не затронут (он всегда судил по exit-коду).
+- **[monitoring] `detect_virt` возвращал `none\nnone` на bare-metal** (`systemd-detect-virt`
+  сам печатает `none` и выходит с кодом 1 → `|| echo none` дублировал) → перевод строки
+  внутри `"virt"` ломал `diagnose --json` на дедиках. Берём вывод как есть.
+- **[forensics] Team Cymru ASN-обогащение было мёртвым:** guard матчил только строку-
+  заголовок, все data-строки (начинаются с голого номера ASN) отбрасывались → `top_asn`/
+  гео всегда пустые. Теперь ASN/страна реально заполняются.
+- **[footgun] `DRY_RUN=1` в оптимизаторе** молча выполнял реальные мутации (ядро/свап/
+  sysctl), пропуская лишь установку CLI. Теперь честно отказывает до любых изменений.
+- Мелочи: `ulimit=unlimited` больше не ломает JSON-число; `--ip` conntrack-счётчик
+  считает по литералу (точки IPv4 не как regex).
+
+### 📦 Релизы, подписи, CI
+- **Теги+GitHub Releases** для всей истории (v2.0…v3.6). `NA_REF=v3.6` в примерах — рабочий.
+- **Подписи модулей** (`.minisig`) в дереве; `NA_REQUIRE_SIG=1` + `NA_MINISIGN_PUBKEY`
+  теперь реально применимы (публичный ключ — в README). `RELEASING.md` — чеклист релиза.
+- CI: матрица +`ubuntu:26.04`; `CROWDSEC_PROBE`; проверка, что `na-report --proxyware --json`
+  — одна строка; `na_version` присутствует в `--json`.
+- Дрейф доков: шапка `protect.sh` показывала старые дефолты (`SYN_RATE=100`/`CONN_LIMIT=600`)
+  — поправлено на актуальные (200/2048).
+
 ## v3.5 — 2026-06-27
 
 Мелкий тюнинг-апдейт: одна новая ручка + уточнение по SYNPROXY. Поведение по умолчанию НЕ меняется.

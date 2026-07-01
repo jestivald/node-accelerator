@@ -113,7 +113,11 @@ enrich_asn() {
     query+=$'end\n'
     out="$(printf '%s' "$query" | whois -h whois.cymru.com 2>/dev/null)" || return 0
     while IFS= read -r line; do
-        [[ "$line" == AS*\|* ]] || continue
+        # Строки данных Cymru начинаются с ГОЛОГО номера ASN ("15169  | 1.2.3.4 | …"),
+        # НЕ с "AS". Старый guard `== AS*\|*` матчил только строку-ЗАГОЛОВОК → все данные
+        # отбрасывались, ASN/гео всегда пустые. Берём data-строки (≥2 разделителя),
+        # исключая заголовок (AS…) и служебную "Bulk mode…".
+        [[ "$line" == *\|*\|* && "$line" != AS*\|* && "$line" != Bulk* ]] || continue
         asn="$(echo "$line"  | awk -F'|' '{gsub(/ /,"",$1); print $1}')"
         ip="$(echo "$line"   | awk -F'|' '{gsub(/ /,"",$2); print $2}')"
         cc="$(echo "$line"   | awk -F'|' '{gsub(/ /,"",$4); print $4}')"
@@ -177,7 +181,7 @@ emit_json() {
     )"
 
     printf '{'
-    printf '"window_hours":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "$HOURS" "$NOW" "$total" "$rate"
+    printf '"na_version":"%s","window_hours":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "${NA_VERSION:-?}" "$HOURS" "$NOW" "$total" "$rate"
     printf '"drops_by_reason":{"portscan":%s,"synflood":%s,"ssh-flood":%s,"badflags":%s,"crowdsec":%s},' \
         "$portscan" "$synflood" "$sshflood" "$badflags" "$crowd"
     printf '"timeline":[%s],' "$tl"
@@ -211,7 +215,7 @@ focus_ip() {
     [[ -n "${ASN[$ip]:-}" ]] && status_line OK "ASN: ${ASN[$ip]} ${ANAME[$ip]:-} (${CC[$ip]:-?})" || info "ASN: н/д (нужен whois)"
     # активные conntrack-сессии (если есть conntrack-tools)
     if command -v conntrack >/dev/null 2>&1; then
-        cc="$(conntrack -L 2>/dev/null | grep -c -- "$ip")"
+        cc="$(conntrack -L 2>/dev/null | grep -Fc -- "$ip")"   # -F: точки IPv4 как литералы, не regex-«любой символ»
         [[ "${cc:-0}" -gt 0 ]] && status_line WARN "активных conntrack-сессий: $cc" || info "активных conntrack-сессий: 0"
     fi
     info "Причины (за ${HOURS}ч):"
@@ -408,7 +412,7 @@ proxyware_json() {
     files="$(pw_files)"; dock="$(pw_docker)"; c2="$(pw_c2conn)"; lst="$(pw_listeners)"
     if [[ -n "$proc$svc$cron$files$dock$c2" ]]; then verdict="suspect"; else verdict="clean"; fi
     printf '{'
-    printf '"verdict":"%s","generated_at":%s,' "$verdict" "$NOW"
+    printf '"na_version":"%s","verdict":"%s","generated_at":%s,' "${NA_VERSION:-?}" "$verdict" "$NOW"
     printf '"hits":{"processes":%s,"services":%s,"cron":%s,"files":%s,"docker":%s},' \
         "$(printf '%s\n' "$proc"  | _json_arr)" \
         "$(printf '%s\n' "$svc"   | _json_arr)" \

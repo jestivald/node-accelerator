@@ -36,6 +36,7 @@ jobs:
           - "debian:trixie"
           - "ubuntu:22.04"   # jammy → подменяется на bookworm
           - "ubuntu:24.04"   # noble
+          - "ubuntu:26.04"   # свежий LTS: XanMod/CrowdSec-suite резолвятся через фоллбэки
     container:
       image: ${{ matrix.image }}
       # protect.sh DRY_RUN вызывает 'nft -c', который валидирует ruleset через netlink
@@ -51,7 +52,7 @@ jobs:
           # Запрещаем запуск сервисов из postinst (в контейнере нет systemd как PID1)
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
           apt-get install -y -qq --no-install-recommends \
-            bash curl gnupg nftables iproute2 gawk procps kmod coreutils irqbalance ethtool
+            bash curl gnupg nftables iproute2 gawk procps kmod coreutils irqbalance ethtool jq
       - name: Syntax (bash -n)
         run: bash -n install.sh scripts/*.sh scripts/lib/*.sh
       - name: protect.sh DRY_RUN (дефолты — генерация + nft -c)
@@ -81,6 +82,22 @@ jobs:
           bash scripts/na-report.sh --ip 127.0.0.1 >/dev/null 2>&1 || true
           bash scripts/na-report.sh --port 443 >/dev/null 2>&1 || true
           echo "ok: na-report --json/--ip/--port отработали"
+      - name: JSON-валидность (jq) + na_version + --proxyware одна строка
+        run: |
+          bash scripts/diagnose.sh --json | jq -e . >/dev/null || { echo "diagnose --json не парсится jq"; exit 1; }
+          bash scripts/diagnose.sh --json | grep -q '"na_version":"' || { echo "diagnose --json без na_version"; exit 1; }
+          bash scripts/na-report.sh --json | jq -e . >/dev/null || { echo "na-report --json не парсится jq"; exit 1; }
+          P="$(bash scripts/na-report.sh --proxyware --json)"
+          [ "$(printf '%s\n' "$P" | wc -l)" -eq 1 ] || { echo "--proxyware --json должен быть ОДНОЙ строкой"; exit 1; }
+          printf '%s' "$P" | jq -e . >/dev/null || { echo "--proxyware --json не парсится jq"; exit 1; }
+          echo "ok: все --json валидны, na_version присутствует"
+      - name: protect.sh DRY_RUN (fleet-sync через REMNAWAVE_NODES_URL, без токена)
+        run: |
+          DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 FLEET_SYNC=1 \
+            REMNAWAVE_NODES_URL=https://panel.example.com/fleet/nodes.json \
+            bash scripts/protect.sh
+      - name: CrowdSec-репозиторий резолвится (CROWDSEC_PROBE, без установки)
+        run: CROWDSEC_PROBE=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
       - name: install.sh persist → CLI na-diagnose + na-report создаются и отдают JSON
         run: |
           bash install.sh persist

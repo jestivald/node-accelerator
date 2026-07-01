@@ -3,6 +3,11 @@
 # Namespace: всё наше живёт под префиксом "na-" / "na_" чтобы не конфликтовать
 # с другими тулкитами и с CrowdSec/Docker.
 
+# Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
+# в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
+# shellcheck disable=SC2034
+NA_VERSION="3.6"
+
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -61,8 +66,12 @@ arch() { uname -m; }
 # Тип виртуализации. "none" = железо/полноценная VM где можно ставить своё ядро.
 # Контейнеры (openvz/lxc/docker) делят ядро хоста — кастомное ядро туда не поставить.
 detect_virt() {
+    # systemd-detect-virt на железе САМ печатает "none" И выходит с кодом 1 → наивный
+    # `|| echo none` дописал бы ВТОРОЙ "none" (перевод строки внутри значения ломает
+    # `diagnose --json` на bare-metal-дедиках). Берём вывод как есть, пустое → none.
+    local v
     if command -v systemd-detect-virt >/dev/null 2>&1; then
-        systemd-detect-virt 2>/dev/null || echo none
+        v="$(systemd-detect-virt 2>/dev/null || true)"; echo "${v:-none}"
     else
         echo unknown
     fi
@@ -103,8 +112,16 @@ backup_file() { [[ -f "$1" ]] && cp -a "$1" "$2/"; return 0; }
 
 apt_install() {
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq --no-install-recommends "$@" >/dev/null
+    apt-get update -qq 2>/dev/null || true
+    if ! apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1; then
+        # Прерванный прошлый прогон / битый dpkg — частый кейс на чужих нодах:
+        # dpkg --configure -a + `apt-get -f install` чинят состояние, затем один ретрай.
+        warn "apt install $*: первая попытка не прошла — чиню dpkg и повторяю"
+        dpkg --configure -a >/dev/null 2>&1 || true
+        apt-get install -y -qq -f >/dev/null 2>&1 || true
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y -qq --no-install-recommends "$@" >/dev/null
+    fi
 }
 
 confirm() {
@@ -115,6 +132,22 @@ confirm() {
 
 # Основной интерфейс по default route.
 default_iface() { ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
+
+# systemd-интервал ("5min"/"12h"/"90s"/"2d"/"300") → секунды. Для расчёта возраста
+# последнего успешного синка (fleet/blocklist) в диагностике.
+systime_to_s() {
+    local v="$1" n u
+    n="$(printf '%s' "$v" | grep -oE '^[0-9]+')" || true
+    [[ -n "$n" ]] || { echo 0; return; }
+    u="${v#"$n"}"
+    case "$u" in
+        ""|s|sec) echo "$n";;
+        m|min)    echo $((n*60));;
+        h|hr)     echo $((n*3600));;
+        d|day)    echo $((n*86400));;
+        *)        echo "$n";;
+    esac
+}
 
 # SSH-порт: сперва из активной сессии sshd, потом из конфига.
 detect_ssh_port() {
