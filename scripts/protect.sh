@@ -96,7 +96,7 @@ NA_CTG_COARSE_MULT="${NA_CTG_COARSE_MULT:-3}"     # дамп conntrack толь�
 NA_CTG_BANTIME="${NA_CTG_BANTIME:-15m}"
 NA_CTG_INTERVAL="${NA_CTG_INTERVAL:-20s}"
 
-if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" && "$DRY_RUN" != "1" ]]; then
+if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" && "$DRY_RUN" != "1" && "${CROWDSEC_PROBE:-0}" != "1" ]]; then
     title "Параметры защиты"
     read -rp "SSH порт                         [$SSH_PORT]: "  _v && SSH_PORT="${_v:-$SSH_PORT}"
     read -rp "TCP порты сервиса (через ,)       [$TCP_PORTS]: " _v && TCP_PORTS="${_v:-$TCP_PORTS}"
