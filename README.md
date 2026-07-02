@@ -29,11 +29,12 @@
 `nftables`-движок в **своей** таблице `inet na_filter` (не `flush ruleset` — сосуществует с CrowdSec и Docker):
 
 - **Режим файрвола `FW_MODE`** — `strict` (дефолт): блокируются все порты, кроме явно
-  разрешённых (Remnawave node — порты известны заранее); `open`: вся защита работает, но
-  не перечисленные порты **не** блокируются (**3x-ui** — inbound-порты создаются из панели
-  динамически); `skip`: nftables не трогается вообще (только CrowdSec) + печатается
-  инструкция, как закрыть порты вручную. Интерактивный прогон спрашивает; найден 3x-ui —
-  предлагается `open`.
+  разрешённых (Remnawave node — порты известны заранее); `open`: не перечисленные порты
+  **не** блокируются (**3x-ui** — inbound-порты создаются из панели динамически), при этом
+  им достаются те же per-IP флуд-лимиты, что и перечисленным (conn-limit / SYN-rate /
+  UDP-rate: drop сверх лимита, не бан), остальная защита — как в strict; `skip`: nftables
+  не трогается вообще (только CrowdSec) + печатается инструкция, как закрыть порты вручную.
+  Интерактивный прогон спрашивает; найден 3x-ui — предлагается `open`.
 - **AntiScan** — SYN на несервисный порт → автобан. С **ban-once** (дефолт): 1-й быстрый
   скан → `suspect` (наблюдение), 2-й в окне → бан. Снимает ложные баны CGNAT-операторов.
   (В `FW_MODE=open` не ставится: «закрытых» портов нет — банил бы легитимные inbound'ы.)
@@ -93,11 +94,11 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v3.6
+export NA_REF=v3.7
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 # максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
-export NA_REF=v3.6 NA_REQUIRE_SIG=1 \
+export NA_REF=v3.7 NA_REQUIRE_SIG=1 \
        NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
@@ -110,7 +111,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 
 | Переменная | По умолч. | Что |
 |---|---|---|
-| `FW_MODE` | `strict` | `strict` — блок всех портов, кроме разрешённых (Remnawave node); `open` — защита без блокировки прочих портов (3x-ui: динамические inbound'ы; анти-скан автобан и node-port правила не ставятся); `skip` — nftables не трогать (только CrowdSec) + инструкция по ручной блокировке. Интерактивно спрашивается; найден 3x-ui — предлагается `open` |
+| `FW_MODE` | `strict` | `strict` — блок всех портов, кроме разрешённых (Remnawave node); `open` — прочие порты не блокируются, но получают per-IP флуд-лимиты как перечисленные (3x-ui: динамические inbound'ы; анти-скан автобан и node-port правила не ставятся); `skip` — nftables не трогать (только CrowdSec) + инструкция по ручной блокировке. Интерактивно спрашивается; найден 3x-ui — предлагается `open` |
 | `SSH_PORT` | авто-детект | порт SSH |
 | `TCP_PORTS` / `UDP_PORTS` | `443,2087` | сервисные порты |
 | `NODE_PORT` | `2222` | порт node-agent |

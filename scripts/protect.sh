@@ -428,6 +428,8 @@ fi
 # стал бы кошмаром при отладке.
 if [[ "$FW_MODE" == "open" ]]; then
     NODE_RULES=""
+    [[ "$NODE_PORT_WHITELIST_ONLY" == "1" ]] && \
+        info "FW_MODE=open: node-port правила не ставятся — NODE_PORT_WHITELIST_ONLY не действует (на 3x-ui порт ${NODE_PORT} может быть inbound'ом)"
 elif [[ "$NODE_PORT_WHITELIST_ONLY" == "1" ]]; then
     NODE_RULES="        # node-agent: ТОЛЬКО whitelist (принят выше) — остальным drop (контрол-порт не светим)
         tcp dport ${NODE_PORT} ct state new drop"
@@ -552,13 +554,26 @@ WL4_LINE=""; [[ -n "$WL4" ]] && WL4_LINE="elements = { $WL4 }"
 WL6_LINE=""; [[ -n "$WL6" ]] && WL6_LINE="elements = { $WL6 }"
 
 # Финал input-цепочки по режиму: strict = policy drop + catch-all drop (всё не
-# разрешённое блокируется); open = policy accept + catch-all accept (не перечисленные
-# порты открыты — дропы выше по цепочке: баны/флуд-лимиты/bogon/bad-flags — остаются).
+# разрешённое блокируется); open = policy accept + catch-all: не перечисленные порты
+# получают ТЕ ЖЕ per-IP флуд-лимиты, что и перечисленные выше (conn-limit / SYN-rate /
+# UDP-rate; сверх лимита — транзитный drop пакета, НЕ бан IP), затем accept. Без этого
+# динамические inbound'ы 3x-ui — ради которых open и существует — оставались бы совсем
+# без анти-флуда. Прочие протоколы (ICMP отработан выше, GRE/ESP и т.п.) — accept.
 FW_POLICY=drop
 FW_CATCHALL="counter drop"
 if [[ "$FW_MODE" == "open" ]]; then
     FW_POLICY=accept
-    FW_CATCHALL="# FW_MODE=open: не перечисленные порты НЕ блокируются (динамические inbound'ы 3x-ui)
+    FW_CATCHALL="# FW_MODE=open: не перечисленные порты НЕ блокируются (динамические inbound'ы 3x-ui),
+        # но per-IP лимиты им — те же, что перечисленным портам (drop сверх лимита ≠ бан)
+        meta l4proto tcp ct state new meter occ4 { ip saddr ct count over ${CONN_LIMIT} } drop
+        meta l4proto tcp ct state new meter occ6 { ip6 saddr ct count over ${CONN_LIMIT} } drop
+        meta l4proto tcp ct state new meter osyn4 { ip saddr limit rate ${SYN_RATE}/second burst ${SYN_BURST} packets } accept
+        meta l4proto tcp ct state new meter osyn6 { ip6 saddr limit rate ${SYN_RATE}/second burst ${SYN_BURST} packets } accept
+        meta l4proto tcp ct state new limit rate 5/second log prefix \"[na synflood] \" level info
+        meta l4proto tcp ct state new drop
+        meta l4proto udp meter oudp4 { ip saddr limit rate ${UDP_RATE}/second burst ${UDP_BURST} packets } accept
+        meta l4proto udp meter oudp6 { ip6 saddr limit rate ${UDP_RATE}/second burst ${UDP_BURST} packets } accept
+        meta l4proto udp counter drop
         counter accept"
 fi
 

@@ -74,6 +74,7 @@ grep -q 'hook input priority filter; policy drop;' "$NFTF" || { echo "[x] strict
 grep -q 'ANTI-SCAN' "$NFTF" || { echo "[x] strict: нет анти-скан правил"; fail=1; }
 grep -q 'dport 2222' "$NFTF" || { echo "[x] strict: нет node-port правил"; fail=1; }
 grep -q '^fw_mode=strict$' "$T/state/protect.installed" || { echo "[x] strict: fw_mode=strict не в маркере"; fail=1; }
+grep -qE 'meter (osyn|occ|oudp)' "$NFTF" && { echo "[x] strict: generic open-лимитеры не должны ставиться (ruleset должен быть идентичен прежнему)"; fail=1; }
 
 # Сброс окружения между прогонами режимов
 reset_t() {
@@ -94,6 +95,9 @@ if [ "$rc" -ne 0 ]; then echo "[x] FW_MODE=open: apply упал (exit $rc)"; tai
 grep -qiE 'unbound variable|bad substitution' "$LOG2" && { echo "[x] open: unbound-переменная:"; grep -iE 'unbound variable|bad substitution' "$LOG2"; fail=1; }
 grep -q 'hook input priority filter; policy accept;' "$NFTF" || { echo "[x] open: нет policy accept на input"; fail=1; }
 grep -q 'counter accept' "$NFTF" || { echo "[x] open: нет catch-all accept"; fail=1; }
+grep -q 'meter osyn4' "$NFTF" || { echo "[x] open: нет generic per-IP SYN-rate для неперечисленных портов"; fail=1; }
+grep -q 'meter occ4'  "$NFTF" || { echo "[x] open: нет generic per-IP conn-limit для неперечисленных портов"; fail=1; }
+grep -q 'meter oudp4' "$NFTF" || { echo "[x] open: нет generic per-IP UDP-rate для неперечисленных портов"; fail=1; }
 grep -q 'ANTI-SCAN' "$NFTF" && { echo "[x] open: анти-скан автобан не должен ставиться"; fail=1; }
 grep -q 'dport 2222' "$NFTF" && { echo "[x] open: node-port правила не должны ставиться"; fail=1; }
 grep -q 'ssh-flood' "$NFTF" || { echo "[x] open: SSH-защита должна оставаться"; fail=1; }
