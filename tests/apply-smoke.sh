@@ -68,9 +68,61 @@ done
 for f in conf/protect.conf conf/ctguard.conf conf/fleet.env sbin/na-fleet-sync sbin/na-blocklist-update sbin/na-ctguard; do
     [ -e "$T/$f" ] || { echo "[x] не создан артефакт: $f"; fail=1; }
 done
+# strict (дефолт): policy drop, анти-скан и node-port правила на месте, fw_mode в маркере
+NFTF="$T/conf/na_filter.nft"
+grep -q 'hook input priority filter; policy drop;' "$NFTF" || { echo "[x] strict: нет policy drop на input"; fail=1; }
+grep -q 'ANTI-SCAN' "$NFTF" || { echo "[x] strict: нет анти-скан правил"; fail=1; }
+grep -q 'dport 2222' "$NFTF" || { echo "[x] strict: нет node-port правил"; fail=1; }
+grep -q '^fw_mode=strict$' "$T/state/protect.installed" || { echo "[x] strict: fw_mode=strict не в маркере"; fail=1; }
+
+# Сброс окружения между прогонами режимов
+reset_t() {
+    rm -rf "$T/sys" "$T/sbin" "$T/modload" "$T/conf" "$T/state"
+    mkdir -p "$T/sys" "$T/sbin" "$T/modload" "$T/conf" "$T/state"
+}
+
+# ── FW_MODE=open: policy accept, без анти-скана/node-port, остальная защита на месте ──
+reset_t
+LOG2="$T/apply-open.log"
+set +e
+FW_MODE=open ENABLE_BANONCE=1 ENABLE_CROWDSEC=0 \
+  REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$LOG2" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then echo "[x] FW_MODE=open: apply упал (exit $rc)"; tail -25 "$LOG2"; fail=1; fi
+grep -qiE 'unbound variable|bad substitution' "$LOG2" && { echo "[x] open: unbound-переменная:"; grep -iE 'unbound variable|bad substitution' "$LOG2"; fail=1; }
+grep -q 'hook input priority filter; policy accept;' "$NFTF" || { echo "[x] open: нет policy accept на input"; fail=1; }
+grep -q 'counter accept' "$NFTF" || { echo "[x] open: нет catch-all accept"; fail=1; }
+grep -q 'ANTI-SCAN' "$NFTF" && { echo "[x] open: анти-скан автобан не должен ставиться"; fail=1; }
+grep -q 'dport 2222' "$NFTF" && { echo "[x] open: node-port правила не должны ставиться"; fail=1; }
+grep -q 'ssh-flood' "$NFTF" || { echo "[x] open: SSH-защита должна оставаться"; fail=1; }
+grep -q 'bogon_v4' "$NFTF" || { echo "[x] open: анти-спуф должен оставаться"; fail=1; }
+grep -q '^fw_mode=open$' "$T/state/protect.installed" || { echo "[x] open: fw_mode=open не в маркере"; fail=1; }
+
+# ── FW_MODE=skip: файрвол не генерится, fleet/blocklists пропущены, ctguard работает ──
+reset_t
+LOG3="$T/apply-skip.log"
+set +e
+FW_MODE=skip ENABLE_BLOCKLISTS=1 ENABLE_CTGUARD=1 NA_CTG_ENFORCE=0 \
+  FLEET_SYNC=1 REMNAWAVE_URL=https://panel.example.com REMNAWAVE_TOKEN=tok \
+  ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$LOG3" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then echo "[x] FW_MODE=skip: прогон упал (exit $rc)"; tail -25 "$LOG3"; fail=1; fi
+grep -qiE 'unbound variable|bad substitution' "$LOG3" && { echo "[x] skip: unbound-переменная:"; grep -iE 'unbound variable|bad substitution' "$LOG3"; fail=1; }
+[ ! -e "$NFTF" ] || { echo "[x] skip: na_filter.nft не должен создаваться"; fail=1; }
+[ ! -e "$T/sys/na-firewall.service" ] || { echo "[x] skip: na-firewall.service не должен создаваться"; fail=1; }
+[ ! -e "$T/sbin/na-fleet-sync" ] || { echo "[x] skip: fleet-sync должен быть пропущен"; fail=1; }
+[ ! -e "$T/sbin/na-blocklist-update" ] || { echo "[x] skip: блоклисты должны быть пропущены"; fail=1; }
+[ -e "$T/sbin/na-ctguard" ] || { echo "[x] skip: ctguard независим от na_filter — должен ставиться"; fail=1; }
+grep -qF 'Как закрыть порты самому' "$LOG3" || { echo "[x] skip: не напечатана инструкция по ручной блокировке"; fail=1; }
+grep -qF 'Готово' "$LOG3" || { echo "[x] skip: прогон не дошёл до конца"; fail=1; }
+grep -q '^fw_mode=skip$' "$T/state/protect.installed" || { echo "[x] skip: fw_mode=skip не в маркере"; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
-    echo "=== ХВОСТ ЛОГА ==="; tail -25 "$LOG"
+    echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
     echo "APPLY-SMOKE: FAIL"; exit 1
 fi
-echo "APPLY-SMOKE: OK (полный apply-path protect.sh чист под set -u, все модули и артефакты на месте)"
+echo "APPLY-SMOKE: OK (apply-path protect.sh чист под set -u в режимах strict/open/skip, модули и артефакты на месте)"

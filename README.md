@@ -28,8 +28,15 @@
 ### 🛡 Защита (`scripts/protect.sh`)
 `nftables`-движок в **своей** таблице `inet na_filter` (не `flush ruleset` — сосуществует с CrowdSec и Docker):
 
+- **Режим файрвола `FW_MODE`** — `strict` (дефолт): блокируются все порты, кроме явно
+  разрешённых (Remnawave node — порты известны заранее); `open`: вся защита работает, но
+  не перечисленные порты **не** блокируются (**3x-ui** — inbound-порты создаются из панели
+  динамически); `skip`: nftables не трогается вообще (только CrowdSec) + печатается
+  инструкция, как закрыть порты вручную. Интерактивный прогон спрашивает; найден 3x-ui —
+  предлагается `open`.
 - **AntiScan** — SYN на несервисный порт → автобан. С **ban-once** (дефолт): 1-й быстрый
   скан → `suspect` (наблюдение), 2-й в окне → бан. Снимает ложные баны CGNAT-операторов.
+  (В `FW_MODE=open` не ставится: «закрытых» портов нет — банил бы легитимные inbound'ы.)
 - **flag-drop** — XMAS, NULL, SYN+FIN, SYN+RST, FIN+RST и прочие скан-пакеты.
 - **anti-spoofing** — bogon/RFC1918/CGNAT источники на WAN (v4 **и** v6 bogon).
 - **SYN-flood / UDP-flood** — **per-IP** rate-limit (масштабируется по числу клиентов, а не глобальный потолок).
@@ -71,10 +78,13 @@ sudo bash install.sh protect      # 🛡 nftables + CrowdSec
 sudo bash install.sh diagnose     # 🩺 read-only
 sudo bash install.sh all          # всё подряд
 
-# неинтерактивно
+# неинтерактивно (Remnawave node: strict — блок всех портов, кроме перечисленных)
 sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 NODE_PORT=2222 \
      WHITELIST="1.2.3.4,2001:db8::1" REMNAWAVE_NONINTERACTIVE=1 \
      bash scripts/protect.sh
+
+# 3x-ui (inbound-порты создаются динамически — защита без блокировки прочих портов)
+sudo FW_MODE=open REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
 ```
 
 ```bash
@@ -100,6 +110,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 
 | Переменная | По умолч. | Что |
 |---|---|---|
+| `FW_MODE` | `strict` | `strict` — блок всех портов, кроме разрешённых (Remnawave node); `open` — защита без блокировки прочих портов (3x-ui: динамические inbound'ы; анти-скан автобан и node-port правила не ставятся); `skip` — nftables не трогать (только CrowdSec) + инструкция по ручной блокировке. Интерактивно спрашивается; найден 3x-ui — предлагается `open` |
 | `SSH_PORT` | авто-детект | порт SSH |
 | `TCP_PORTS` / `UDP_PORTS` | `443,2087` | сервисные порты |
 | `NODE_PORT` | `2222` | порт node-agent |

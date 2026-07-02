@@ -69,6 +69,17 @@ jobs:
           if SYN_RATE='x; rm' DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
             echo "валидация НЕ сработала на кривом SYN_RATE"; exit 1
           else echo "ok: кривой ENV отвергнут"; fi
+      - name: protect.sh DRY_RUN (FW_MODE=open — 3x-ui-режим, policy accept → nft -c)
+        run: DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 FW_MODE=open bash scripts/protect.sh
+      - name: protect.sh DRY_RUN (FW_MODE=skip — файрвол пропущен, инструкция напечатана)
+        run: |
+          OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 FW_MODE=skip bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'Как закрыть порты самому' || { echo "skip: инструкция по ручной блокировке не напечатана"; exit 1; }
+      - name: protect.sh — отказ на кривом FW_MODE
+        run: |
+          if FW_MODE=firewall DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
+            echo "валидация НЕ сработала на кривом FW_MODE"; exit 1
+          else echo "ok: кривой FW_MODE отвергнут"; fi
       - name: diagnose.sh (read-only, не должен падать жёстко)
         run: bash scripts/diagnose.sh || true
       - name: diagnose.sh --json (machine-readable smoke)
