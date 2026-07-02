@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="3.7"
+NA_VERSION="3.8"
 
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -164,6 +164,57 @@ ssh_client_ip() {
     [[ -z "$ip" ]] && { ip="${SSH_CLIENT:-}"; ip="${ip%% *}"; }
     # отфильтруем мусор/локалхост
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$ip" == *:* ]] && [[ "$ip" != "127.0.0.1" && "$ip" != "::1" ]] && echo "$ip"
+}
+
+# ─── Порт node-agent (Remnawave node) ────────────────────────────────────────
+# Фактический порт node-агента этой ноды. Источники по приоритету (выигрывает первый,
+# где нашлось; несколько контейнеров внутри источника → объединяем):
+#   1. env работающих контейнеров образа remnawave/node* (NODE_PORT= / APP_PORT=);
+#   2. .env compose-каталога контейнера (label working_dir), затем NA_REMNANODE_ENV
+#      (по умолчанию /opt/remnanode/.env) — ловит и временно остановленный контейнер;
+#   3. ss: listening-порт процесса rw-node (бинарь node-агента 2.x).
+# echo: порт(ы) через запятую; пусто = определить не удалось. Read-only, best-effort.
+detect_node_port() {
+    local out="" p c d f cands=""
+    _np_add() {
+        # 10#: ведущий ноль из чужого .env не должен читаться как октал (арифм. ошибка)
+        [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1>=1 && 10#$1<=65535 )) || return 0
+        [[ ",$out," == *",$1,"* ]] || out+="${out:+,}$1"
+    }
+    # docker-пайпы под `|| true`: protect живёт под set -e/pipefail — лежащий docker-демон
+    # не должен убивать детект раньше фолбэков на .env/ss
+    if command -v docker >/dev/null 2>&1; then
+        cands="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+                 | awk '$2 ~ /remnawave\/node(:|$)/{print $1}' || true)"
+        # каноничное имя на случай кастом-образа/форка
+        [[ -z "$cands" ]] && docker inspect remnanode >/dev/null 2>&1 && cands="remnanode"
+        for c in $cands; do
+            p="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null \
+                 | awk -F= '$1=="NODE_PORT"||$1=="APP_PORT"{print $2; exit}' || true)"
+            _np_add "${p:-}"
+        done
+        if [[ -z "$out" ]]; then
+            for c in $cands; do
+                d="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$c" 2>/dev/null || true)"
+                [[ -n "$d" && -f "$d/.env" ]] || continue
+                p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$d/.env" 2>/dev/null | head -1)"
+                _np_add "${p:-}"
+            done
+        fi
+    fi
+    if [[ -z "$out" ]]; then
+        f="${NA_REMNANODE_ENV:-/opt/remnanode/.env}"
+        if [[ -f "$f" ]]; then
+            p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$f" 2>/dev/null | head -1)"
+            _np_add "${p:-}"
+        fi
+    fi
+    if [[ -z "$out" ]]; then
+        while read -r p; do _np_add "$p"; done < <(
+            ss -Htlnp 2>/dev/null | awk '/"rw-node"/{n=split($4,a,":"); print a[n]}' | sort -u)
+    fi
+    unset -f _np_add
+    [[ -n "$out" ]] && echo "$out"
 }
 
 STATE_DIR=/var/lib/node-accelerator

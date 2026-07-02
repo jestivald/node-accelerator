@@ -30,7 +30,7 @@ emit_json() {
     local fw fwm ab4 ab6 susp bl4 bl6 fl4 fl6 crowd ctg syndeg safety rebootn
     local u1 n1 s1 i1 w1 q1 sq1 st1 u2 n2 s2 i2 w2 q2 sq2 st2 dt steal out rtx rtxpct
     local nav host up load1 mempct wi wanrx wantx ip6def udperr
-    local rnst rnrc rnse fsa bla certd nowsec cf cend cends cd
+    local rnst rnrc rnse fsa bla certd nowsec cf cend cends cd npd npfw
     kern="$(uname -r)"; uname -r | grep -qi xanmod && xanmod=true || xanmod=false
     virt="$(detect_virt)"
     cc="$(val net.ipv4.tcp_congestion_control)"; qd="$(val net.core.default_qdisc)"
@@ -102,6 +102,10 @@ emit_json() {
             rnse="$(docker logs --since 1h remnanode 2>&1 | grep -c 'SPAWN_ERROR' || true)"; [[ "$rnse" =~ ^[0-9]+$ ]] || rnse=0
         fi
     fi
+    # порт node-агента: факт (детект с ноды) vs заложенный в файрвол — рассинхрон
+    # (миграция агента 2222→3000 при strict) панель видит как «нода недоступна»
+    npd="$(detect_node_port || true)"
+    npfw="$(awk -F= '/^node_port=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"; npfw="${npfw:-}"
     # свежесть последнего УСПЕШНОГО синка (−1 = штампа нет / модуль не активен)
     fsa=-1; bla=-1
     [[ -f "$STATE_DIR/fleet-sync.last" ]] && { cf="$(cat "$STATE_DIR/fleet-sync.last" 2>/dev/null)"; [[ "$cf" =~ ^[0-9]+$ ]] && fsa=$(( nowsec - cf )); }
@@ -129,6 +133,7 @@ emit_json() {
     printf '"na_version":"%s","hostname":"%s","uptime_s":%s,"load1":%s,"mem_used_pct":%s,' "$nav" "$host" "$up" "$load1" "$mempct"
     printf '"wan_iface":"%s","wan_rx_bytes":%s,"wan_tx_bytes":%s,"ipv6_default":%s,"udp_rcvbuf_errors":%s,' "$wi" "$wanrx" "$wantx" "$ip6def" "$udperr"
     printf '"remnanode_status":"%s","remnanode_restarts":%s,"remnanode_spawn_errors_1h":%s,' "$rnst" "$rnrc" "$rnse"
+    printf '"node_port_detected":"%s","node_port_fw":"%s",' "$npd" "$npfw"
     printf '"fleet_sync_age_s":%s,"blocklist_age_s":%s,"cert_min_days":%s}\n' "$fsa" "$bla" "$certd"
 }
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
@@ -581,6 +586,31 @@ if command -v docker >/dev/null 2>&1; then
     fi
 else
     info "docker не установлен — сенсор remnanode пропущен"
+fi
+# порт node-агента vs файрвол: рассинхрон (агент мигрировал 2222→3000, а strict-файрвол
+# в правилах держит старый порт) = панель молча теряет ноду. Сверяем ФАКТ (детект с ноды:
+# env контейнера → .env → ss) с тем, что заложено в правила (маркер protect).
+NP_DET="$(detect_node_port || true)"
+if [[ -n "$NP_DET" && -f "$STATE_DIR/protect.installed" ]]; then
+    NP_FW="$(awk -F= '/^node_port=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
+    NP_FWM="$(awk -F= '/^fw_mode=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
+    NP_TCPP="$(awk -F= '/^tcp_ports=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
+    if [[ "${NP_FWM:-strict}" == "strict" ]] && nft list table inet na_filter >/dev/null 2>&1; then
+        NP_MISS=""
+        for _np in ${NP_DET//,/ }; do
+            [[ ",${NP_FW:-},${NP_TCPP:-}," == *",$_np,"* ]] || NP_MISS+="${NP_MISS:+,}$_np"
+        done
+        if [[ -n "$NP_MISS" ]]; then
+            bad "node-agent слушает :$NP_MISS, а файрвол держит node-port :${NP_FW:-?} — панель, скорее всего, ОТРЕЗАНА. Пожарно: nft add element inet na_filter whitelist_v4 '{ <IP панели> }'; правильно: ре-ран protect (NODE_PORT=auto подхватит)"
+        else
+            pass "node-agent порт(ы) $NP_DET согласованы с файрволом (node_port=${NP_FW:-?})"
+        fi
+        unset _np
+    else
+        info "node-agent порт(ы): $NP_DET (fw_mode=${NP_FWM:-?} — сверка с файрволом делается в strict)"
+    fi
+elif [[ -n "$NP_DET" ]]; then
+    info "node-agent порт(ы): $NP_DET (protect ещё не гонялся — сверять не с чем)"
 fi
 # сертификаты: ближайший к истечению (Let's Encrypt / acme.sh / NA_CERT_PATHS)
 if command -v openssl >/dev/null 2>&1; then
