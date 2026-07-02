@@ -12,7 +12,13 @@
 # Откат: scripts/rollback.sh protect
 #
 # ENV (всё опционально):
-#   SSH_PORT, TCP_PORTS=443,2087, UDP_PORTS=443,2087, NODE_PORT=2222
+#   SSH_PORT, TCP_PORTS=443,2087, UDP_PORTS=443,2087
+#   NODE_PORT=auto                     порт(ы) node-agent через запятую; auto = детект с
+#                                      ноды (env контейнера remnawave/node → .env → ss),
+#                                      не нашлось → оба известных дефолта 2222,3000
+#   NODE_PORT_AUTOWL=auto              при whitelist-only пускать текущих established-пиров
+#                                      node-порта отдельным сетом na_nodeport_wl_* (анти-
+#                                      самоотстрел панели); auto|0|1
 #   WHITELIST="1.2.3.4,5.6.7.0/24"     IP/CIDR панели/мониторинга (v4 и v6)
 #   SYN_RATE=200  SYN_BURST=400        per-IP лимит новых TCP-конн./сек на сервисный порт
 #   UDP_RATE=200  UDP_BURST=400        per-IP лимит UDP пакетов/сек
@@ -43,7 +49,14 @@ load_conf "$CONF_DIR/protect.conf"
 SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}"
 TCP_PORTS="${TCP_PORTS:-443,2087}"
 UDP_PORTS="${UDP_PORTS:-443,2087}"
-NODE_PORT="${NODE_PORT:-2222}"
+# Порт(ы) node-agent. 'auto' (дефолт) = взять с самой ноды: env работающего контейнера
+# remnawave/node → .env compose-каталога → ss (процесс rw-node). Remnawave node 2.x
+# слушает :3000, старые гайды ставили :2222 — захардкоженный дефолт при несовпадении
+# МОЛЧА отрезал панель от ноды (strict: не перечисленный порт падает в catch-all drop).
+# Детект не нашёл ничего и прошлых прогонов не было → правила на ОБА дефолта (2222,3000).
+NODE_PORT="${NODE_PORT:-auto}"
+NODE_PORT_FALLBACK="2222,3000"
+NODE_PORT_LAST="${NODE_PORT_LAST:-}"    # кэш последнего удачного детекта (persist)
 WHITELIST="${WHITELIST:-}"
 SYN_RATE="${SYN_RATE:-200}";  SYN_BURST="${SYN_BURST:-400}"
 UDP_RATE="${UDP_RATE:-200}";  UDP_BURST="${UDP_BURST:-400}"
@@ -84,6 +97,13 @@ SUSPECT_TIME="${SUSPECT_TIME:-30m}"        # окно наблюдения за 
 # whitelist-only, если оператор задал WHITELIST (значит, знает свой доверенный набор);
 # если WHITELIST пуст — оставляем мягкий лимит, чтобы не отрезать неизвестную панель.
 NODE_PORT_WHITELIST_ONLY="${NODE_PORT_WHITELIST_ONLY:-auto}"
+# Анти-самоотстрел панели: при whitelist-only текущие established-пиры node-порта
+# (= панель, даже если её IP забыли в WHITELIST) пускаются отдельным сетом
+# na_nodeport_wl_* (ТОЛЬКО этот порт, не общий whitelist) и персистятся. 'auto' =
+# включено, когда whitelist-only ВЫВЕЛСЯ сам из заданного WHITELIST; при явном
+# NODE_PORT_WHITELIST_ONLY=1 уважаем строгий intent (только warn). 1=форс, 0=выкл.
+NODE_PORT_AUTOWL="${NODE_PORT_AUTOWL:-auto}"
+NODE_PORT_PEERS="${NODE_PORT_PEERS:-}"   # персист авто-подхваченных пиров (IP через ,)
 # Статич-блоклисты (Spamhaus DROP + FireHOL L1 [+ Tor]) — opt-in, обновляются таймером.
 ENABLE_BLOCKLISTS="${ENABLE_BLOCKLISTS:-0}"
 BLOCK_TOR="${BLOCK_TOR:-0}"
@@ -141,7 +161,7 @@ if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" && "$DRY_RUN" != "1" && "${CROW
         read -rp "TCP порты сервиса (через ,)       [$TCP_PORTS]: " _v && TCP_PORTS="${_v:-$TCP_PORTS}"
         read -rp "UDP порты сервиса (через ,)       [$UDP_PORTS]: " _v && UDP_PORTS="${_v:-$UDP_PORTS}"
         # node-agent порт — понятие Remnawave; в open-режиме его правила не ставятся
-        [[ "$FW_MODE" == "strict" ]] && read -rp "Порт node-agent                  [$NODE_PORT]: " _v && NODE_PORT="${_v:-$NODE_PORT}"
+        [[ "$FW_MODE" == "strict" ]] && read -rp "Порт node-agent (auto = детект)  [$NODE_PORT]: " _v && NODE_PORT="${_v:-$NODE_PORT}"
     fi
     read -rp "Whitelist IP/CIDR (панель, твои)  [пусто]: "     _v && WHITELIST="${_v:-$WHITELIST}"
 fi
@@ -157,9 +177,11 @@ validate_port_list() {
     for p in ${v//,/ }; do _is_port "$p" || { err "$name: '$p' вне 1..65535"; return 1; }; done
 }
 _is_port "$SSH_PORT"  || { err "SSH_PORT '$SSH_PORT' невалиден"; exit 1; }
-_is_port "$NODE_PORT" || { err "NODE_PORT '$NODE_PORT' невалиден"; exit 1; }
+[[ "$NODE_PORT" == "auto" ]] || validate_port_list "$NODE_PORT" NODE_PORT || exit 1
 validate_port_list "$TCP_PORTS" TCP_PORTS || exit 1
 validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
+# кэш прошлого детекта приходит из conf — битый молча сбрасываем (уйдёт в nft-ruleset)
+validate_port_list "$NODE_PORT_LAST" NODE_PORT_LAST 2>/dev/null || NODE_PORT_LAST=""
 
 # Числовые/duration параметры тоже валидируем: они разворачиваются в nft-ruleset и
 # (SAFETY_DELAY) в sh-таймер. Тулкит параметризуется неинтерактивно из панели/оркестратора,
@@ -186,6 +208,7 @@ for _k in ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY ENABLE_BANONCE \
     [[ "${!_k}" =~ ^[01]$ ]] || { err "$_k='${!_k}' — ожидается 0 или 1"; exit 1; }
 done
 [[ "$NODE_PORT_WHITELIST_ONLY" =~ ^(auto|0|1)$ ]] || { err "NODE_PORT_WHITELIST_ONLY должно быть auto|0|1"; exit 1; }
+[[ "$NODE_PORT_AUTOWL" =~ ^(auto|0|1)$ ]] || { err "NODE_PORT_AUTOWL должно быть auto|0|1"; exit 1; }
 [[ "$FLEET_SYNC" =~ ^(auto|0|1)$ ]] || { err "FLEET_SYNC должно быть auto|0|1"; exit 1; }
 [[ "$FW_MODE" =~ ^(strict|open|skip)$ ]] || { err "FW_MODE='$FW_MODE' — ожидается strict|open|skip"; exit 1; }
 if [[ -n "$REMNAWAVE_URL" && ! "$REMNAWAVE_URL" =~ ^https?://[A-Za-z0-9._~:/?#=%@-]+$ ]]; then
@@ -198,7 +221,11 @@ unset _k
 
 # Резолв NODE_PORT_WHITELIST_ONLY=auto: whitelist-only только если оператор задал
 # WHITELIST (знает доверенный набор). Пустой WHITELIST → мягкий лимит (не отрезаем панель).
+# NPWL_SRC помнит, откуда взялось решение: авто-вывод из WHITELIST vs явный intent
+# оператора — от этого зависит дефолт авто-допуска пиров (NODE_PORT_AUTOWL=auto).
+NPWL_SRC="explicit"
 if [[ "$NODE_PORT_WHITELIST_ONLY" == "auto" ]]; then
+    NPWL_SRC="auto"
     [[ -n "$WHITELIST" ]] && NODE_PORT_WHITELIST_ONLY=1 || NODE_PORT_WHITELIST_ONLY=0
 fi
 
@@ -386,7 +413,41 @@ fi
 [[ "$FW_MODE" == "skip" && "$ENABLE_BLOCKLISTS" == "1" ]] && info "FW_MODE=skip: блоклисты живут в сетах na_filter — пропущены"
 
 # ═══ ФАЙРВОЛ (nftables) — весь блок до CrowdSec пропускается при FW_MODE=skip ═══
+NP_EFF="$NODE_PORT"   # skip-режим: детект не гоняем, в маркер значение уходит как есть
 if [[ "$FW_MODE" != "skip" ]]; then
+
+# ─── Резолв NODE_PORT: auto → фактический порт node-агента ───────────────────
+# Правило надёжности: панель никогда не должна МОЛЧА терять ноду из-за порта.
+#   auto + детект ок     → детект (кэш в NODE_PORT_LAST на случай остановленного агента);
+#   auto + агент молчит  → прошлый детект, иначе оба известных дефолта (2222,3000);
+#   явный порт ≠ детекту → правила на ОБА + громкий warn (кейс миграции агента 2222→3000:
+#                          сохранённый conf держал 2222, strict ронял :3000 в catch-all drop).
+NP_DETECTED="$(detect_node_port || true)"
+if [[ "$NODE_PORT" == "auto" ]]; then
+    if [[ -n "$NP_DETECTED" ]]; then
+        NP_EFF="$NP_DETECTED"
+        ok "node-agent: автодетект порта → $NP_EFF"
+    elif [[ -n "$NODE_PORT_LAST" ]]; then
+        NP_EFF="$NODE_PORT_LAST"
+        warn "node-agent сейчас не детектится (контейнер остановлен?) — беру прошлый детект: $NP_EFF"
+    else
+        NP_EFF="$NODE_PORT_FALLBACK"
+        warn "node-agent не найден — правила на оба известных дефолта ($NP_EFF); закрепить: NODE_PORT=<порт>"
+    fi
+else
+    NP_EFF="$NODE_PORT"
+    if [[ -n "$NP_DETECTED" ]]; then
+        for _p in ${NP_DETECTED//,/ }; do
+            if [[ ",$NP_EFF," != *",$_p,"* ]]; then
+                NP_EFF+=",$_p"
+                warn "node-agent фактически слушает :$_p (задан NODE_PORT=$NODE_PORT) — открываю ОБА, чтобы не отрезать панель; сверь и закрепи NODE_PORT"
+            fi
+        done
+        unset _p
+    fi
+fi
+[[ -n "$NP_DETECTED" ]] && NODE_PORT_LAST="$NP_DETECTED"
+NP_NFT="${NP_EFF//,/, }"
 
 # ─── Сборка per-port правил ──────────────────────────────────────────────────
 TCP_RULES=""
@@ -426,19 +487,89 @@ fi
 # FW_MODE=open: блок не ставим вовсе — node-agent это понятие Remnawave, а на 3x-ui
 # NODE_PORT может оказаться чьим-то inbound'ом: скрытый drop/лимит именно на нём
 # стал бы кошмаром при отладке.
+#
+# Анти-самоотстрел панели (whitelist-only): IP панели узнаётся ПО ФАКТУ — established-
+# пиры node-порта (ss + conntrack: панель могла оказаться между keepalive-коннектами,
+# «0 established в моменте» — норма) идут в отдельный сет na_nodeport_wl_* (допуск
+# ТОЛЬКО к node-порту, НЕ общий whitelist) и персистятся в NODE_PORT_PEERS.
+harvest_node_port_peers() {   # stdout: IP через запятую (v4/v6, без портов/скобок)
+    local filt="" p
+    for p in ${NP_EFF//,/ }; do filt="${filt:+$filt or }sport = :$p"; done
+    [[ -n "$filt" ]] || return 0
+    {
+        ss -Hnt state established "( $filt )" 2>/dev/null | awk '{print $NF}' \
+            | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//'
+        if command -v conntrack >/dev/null 2>&1; then
+            for p in ${NP_EFF//,/ }; do
+                conntrack -L -p tcp --dport "$p" --state ESTABLISHED 2>/dev/null \
+                    | awk '{for(i=1;i<=NF;i++) if($i ~ /^src=/){print substr($i,5); break}}'
+            done
+        fi
+    } | sed -E 's/^::ffff:([0-9.]+)$/\1/' \
+      | awk 'NF && $0!="127.0.0.1" && $0!="::1"' | sort -u | paste -sd, -
+}
+NPWL4=""; NPWL6=""
+add_npwl() {   # как add_wl, но в сет только-node-порта; битые значения warn+skip (не fatal)
+    local x
+    for x in ${1//,/ }; do
+        [[ -z "$x" ]] && continue
+        if [[ "$x" == *:* ]]; then
+            [[ "$x" =~ ^[0-9a-fA-F:]+$ ]] || { warn "node-port peers: '$x' не IPv6 — пропущен"; continue; }
+            [[ ",$NPWL6," == *",$x,"* ]] || NPWL6+="${NPWL6:+,}$x"
+        elif [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            [[ ",$NPWL4," == *",$x,"* ]] || NPWL4+="${NPWL4:+,}$x"
+        else warn "node-port peers: '$x' не IP — пропущен"; fi
+    done
+}
+NP_SETS=""
 if [[ "$FW_MODE" == "open" ]]; then
     NODE_RULES=""
     [[ "$NODE_PORT_WHITELIST_ONLY" == "1" ]] && \
-        info "FW_MODE=open: node-port правила не ставятся — NODE_PORT_WHITELIST_ONLY не действует (на 3x-ui порт ${NODE_PORT} может быть inbound'ом)"
+        info "FW_MODE=open: node-port правила не ставятся — NODE_PORT_WHITELIST_ONLY не действует (на 3x-ui порт(ы) ${NP_EFF} могут быть inbound'ом)"
 elif [[ "$NODE_PORT_WHITELIST_ONLY" == "1" ]]; then
-    NODE_RULES="        # node-agent: ТОЛЬКО whitelist (принят выше) — остальным drop (контрол-порт не светим)
-        tcp dport ${NODE_PORT} ct state new drop"
-    info "node-agent порт ${NODE_PORT}: whitelist-only (WHITELIST задан)"
+    # авто-допуск пиров: auto = вкл, когда whitelist-only ВЫВЕЛСЯ из WHITELIST;
+    # явный NODE_PORT_WHITELIST_ONLY=1 — уважаем строгий intent (warn вместо допуска)
+    NP_AUTOWL_ON=0
+    case "$NODE_PORT_AUTOWL" in
+        1) NP_AUTOWL_ON=1;;
+        auto) [[ "$NPWL_SRC" == "auto" ]] && NP_AUTOWL_ON=1;;
+    esac
+    NP_FRESH="$(harvest_node_port_peers || true)"
+    if [[ "$NP_AUTOWL_ON" == "1" ]]; then
+        add_npwl "$NODE_PORT_PEERS"
+        add_npwl "$NP_FRESH"
+        NODE_PORT_PEERS="$NPWL4${NPWL4:+${NPWL6:+,}}$NPWL6"
+        # cap: десятки «пиров» = это не контрол-порт панели (порт перепутан с сервисным?)
+        _npc=0; for _p in ${NODE_PORT_PEERS//,/ }; do _npc=$((_npc+1)); done
+        if (( _npc > 16 )); then
+            warn "node-port peers: $_npc адресов — не похоже на контрол-порт панели; авто-допуск пропущен, проверь NODE_PORT"
+            NPWL4=""; NPWL6=""; NODE_PORT_PEERS=""
+        fi
+        unset _npc _p
+    fi
+    NP_WL4_LINE=""; [[ -n "$NPWL4" ]] && NP_WL4_LINE="elements = { ${NPWL4//,/, } }"
+    NP_WL6_LINE=""; [[ -n "$NPWL6" ]] && NP_WL6_LINE="elements = { ${NPWL6//,/, } }"
+    NP_SETS="    set na_nodeport_wl_v4 { type ipv4_addr; $NP_WL4_LINE }
+    set na_nodeport_wl_v6 { type ipv6_addr; $NP_WL6_LINE }"
+    NODE_RULES="        # node-agent: ТОЛЬКО whitelist (общий — принят выше) + пиры панели из
+        # @na_nodeport_wl_* (допуск лишь к этому порту) — остальным drop (контрол-порт не светим).
+        # Пожарно пустить панель без ре-рана: nft add element inet na_filter na_nodeport_wl_v4 '{ <IP> }'
+        tcp dport { ${NP_NFT} } ip  saddr @na_nodeport_wl_v4 accept
+        tcp dport { ${NP_NFT} } ip6 saddr @na_nodeport_wl_v6 accept
+        tcp dport { ${NP_NFT} } ct state new drop"
+    info "node-agent порт(ы) ${NP_EFF}: whitelist-only (WHITELIST задан)"
+    if [[ "$NP_AUTOWL_ON" == "1" && -n "$NODE_PORT_PEERS" ]]; then
+        ok "node-agent: авто-допуск established-пиров (панель): $NODE_PORT_PEERS (сет na_nodeport_wl_*; выкл: NODE_PORT_AUTOWL=0)"
+    elif [[ "$NP_AUTOWL_ON" != "1" && -n "$NP_FRESH" ]]; then
+        warn "node-port сейчас держат коннект: $NP_FRESH — если среди них панель, добавь её в WHITELIST (или авто-допуск: NODE_PORT_AUTOWL=1)"
+    elif [[ -z "$NP_FRESH" && -z "$NODE_PORT_PEERS" ]]; then
+        warn "established-пиров node-порта не вижу — УБЕДИСЬ, что IP панели в WHITELIST, иначе нода отвалится от панели"
+    fi
 else
     NODE_RULES="        # node-agent: whitelist (выше) + мягкий per-IP лимит для неизвестных
-        tcp dport ${NODE_PORT} ct state new meter na4 { ip saddr limit rate 30/second burst 60 packets } accept
-        tcp dport ${NODE_PORT} ct state new meter na6 { ip6 saddr limit rate 30/second burst 60 packets } accept
-        tcp dport ${NODE_PORT} ct state new drop"
+        tcp dport { ${NP_NFT} } ct state new meter na4 { ip saddr limit rate 30/second burst 60 packets } accept
+        tcp dport { ${NP_NFT} } ct state new meter na6 { ip6 saddr limit rate 30/second burst 60 packets } accept
+        tcp dport { ${NP_NFT} } ct state new drop"
 fi
 
 # portscan → autoban (включается флагом). При ENABLE_BANONCE=1 — двухступенчато:
@@ -605,6 +736,7 @@ table inet na_filter {
 $SUSPECT_SETS
 $BLOCKLIST_SETS
 $FLEET_SETS
+$NP_SETS
 
     # bogon/martian источники (RFC1918, CGNAT, loopback, link-local, TEST-NET, multicast)
     set bogon_v4 {
@@ -1238,7 +1370,7 @@ fw_mode=$FW_MODE
 ssh_port=$SSH_PORT
 tcp_ports=$TCP_PORTS
 udp_ports=$UDP_PORTS
-node_port=$NODE_PORT
+node_port=$NP_EFF
 crowdsec=$ENABLE_CROWDSEC
 nft_file=${NFT_FILE:-}
 EOF
@@ -1255,7 +1387,7 @@ save_conf "$CONF_DIR/protect.conf" \
     PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST \
     ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY \
     ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \
-    NODE_PORT_WHITELIST_ONLY SAFETY_DELAY \
+    NODE_PORT_WHITELIST_ONLY NODE_PORT_LAST NODE_PORT_AUTOWL NODE_PORT_PEERS SAFETY_DELAY \
     ENABLE_CTGUARD NA_CTG_ENFORCE NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR \
     NA_CTG_COARSE_MULT NA_CTG_BANTIME NA_CTG_INTERVAL
 

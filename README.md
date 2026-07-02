@@ -43,7 +43,14 @@
 - **SYN-flood / UDP-flood** — **per-IP** rate-limit (масштабируется по числу клиентов, а не глобальный потолок).
 - **connect-flood SSH** — >6 новых/мин с IP → бан (с ban-once).
 - **per-IP connlimit** (`ct count`) — кап одновременных коннектов с одного адреса.
-- **node-agent порт** — whitelist-only при заданном `WHITELIST` (контрол-порт не светится в мир).
+- **node-agent порт** — **автодетект с ноды** (`NODE_PORT=auto`, дефолт: env контейнера
+  `remnawave/node` → `.env` compose → `ss`; не нашлось — правила на оба известных дефолта
+  `2222,3000`); whitelist-only при заданном `WHITELIST` (контрол-порт не светится в мир).
+  Явный `NODE_PORT`, расходящийся с фактом, открывает **оба** порта + громкий warn — панель
+  не теряет ноду молча при миграции агента `2222→3000`. При whitelist-only established-пиры
+  порта (= панель) пускаются отдельным сетом `na_nodeport_wl_*` — анти-самоотстрел, если IP
+  панели забыли в `WHITELIST` (`NODE_PORT_AUTOWL`); пожарный допуск без ре-рана:
+  `nft add element inet na_filter na_nodeport_wl_v4 '{ <IP панели> }'`.
 - **conntrack phantom-eviction** *(opt-in)* — защита от **distributed connect-and-hold**
   по живым сокетам (`conntrack ≫ ss`), CGNAT-safe, observe-режим по умолчанию.
 - **SYNPROXY** *(opt-in, done-right)* — `notrack` только host-local (`fib daddr type local`,
@@ -60,7 +67,7 @@
 - **Персист конфига** — ре-ран без ENV не сбрасывает поднятые под ноду ручки.
 
 ### 🩺 Диагностика (`scripts/diagnose.sh`)
-Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. Плюс сенсоры **стека ноды**: контейнер `remnanode` (статус/рестарты/`SPAWN_ERROR` за час — ловит коллизию node-address в панели), **сроки TLS-сертификатов** (LE/acme.sh; свои пути — `NA_CERT_PATHS="глоб1 глоб2"`), **свежесть fleet-sync/blocklist**, IPv6 default-route, UDP `RcvbufErrors` (QUIC/Hysteria2). После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели — теперь с `na_version`, `hostname`, `uptime_s`, `load1`, `mem_used_pct`, WAN rx/tx-байтами; `--retrans [--window N]` — разбор причин TCP-retransmits).
+Read-only отчёт: ядро/BBR, sysctl, лимиты, conntrack, NIC/RPS, swap/THP/governor, firewall, CrowdSec, порты, RTT — с итогом ✔/▲/✘ и рекомендациями. Плюс сенсоры **стека ноды**: контейнер `remnanode` (статус/рестарты/`SPAWN_ERROR` за час — ловит коллизию node-address в панели), **рассинхрон порта node-агента с файрволом** (агент слушает `:3000`, а strict-правила держат `:2222` → «нода недоступна» для панели; в отчёте — с командой пожарного фикса, в `--json` — `node_port_detected`/`node_port_fw`), **сроки TLS-сертификатов** (LE/acme.sh; свои пути — `NA_CERT_PATHS="глоб1 глоб2"`), **свежесть fleet-sync/blocklist**, IPv6 default-route, UDP `RcvbufErrors` (QUIC/Hysteria2). После установки доступна как команда **`na-diagnose`** (`--json` для мониторинга/панели — теперь с `na_version`, `hostname`, `uptime_s`, `load1`, `mem_used_pct`, WAN rx/tx-байтами; `--retrans [--window N]` — разбор причин TCP-retransmits).
 
 ### 🔥 Форензика атак (`scripts/na-report.sh`)
 Read-only: кто/откуда/чем/когда — из журнала ядра, nft-сетов и CrowdSec. **`na-report`** (человекочитаемо) или **`na-report --json`**: `drops_by_reason`, `timeline`, `top_ips` с вердиктом, `top_asn` (ASN/гео — best-effort через Team Cymru whois). Флаги: `--hours N`, `--top N`, `--ip <addr>`.
@@ -79,8 +86,9 @@ sudo bash install.sh protect      # 🛡 nftables + CrowdSec
 sudo bash install.sh diagnose     # 🩺 read-only
 sudo bash install.sh all          # всё подряд
 
-# неинтерактивно (Remnawave node: strict — блок всех портов, кроме перечисленных)
-sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 NODE_PORT=2222 \
+# неинтерактивно (Remnawave node: strict — блок всех портов, кроме перечисленных;
+# порт node-агента детектится с ноды сам, NODE_PORT= нужен только чтобы закрепить вручную)
+sudo SSH_PORT=22 TCP_PORTS=443,2087 UDP_PORTS=443 \
      WHITELIST="1.2.3.4,2001:db8::1" REMNAWAVE_NONINTERACTIVE=1 \
      bash scripts/protect.sh
 
@@ -94,11 +102,11 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v3.7
+export NA_REF=v3.8
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 # максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
-export NA_REF=v3.7 NA_REQUIRE_SIG=1 \
+export NA_REF=v3.8 NA_REQUIRE_SIG=1 \
        NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
@@ -114,7 +122,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `FW_MODE` | `strict` | `strict` — блок всех портов, кроме разрешённых (Remnawave node); `open` — прочие порты не блокируются, но получают per-IP флуд-лимиты как перечисленные (3x-ui: динамические inbound'ы; анти-скан автобан и node-port правила не ставятся); `skip` — nftables не трогать (только CrowdSec) + инструкция по ручной блокировке. Интерактивно спрашивается; найден 3x-ui — предлагается `open` |
 | `SSH_PORT` | авто-детект | порт SSH |
 | `TCP_PORTS` / `UDP_PORTS` | `443,2087` | сервисные порты |
-| `NODE_PORT` | `2222` | порт node-agent |
+| `NODE_PORT` | `auto` | порт(ы) node-agent через запятую. `auto` — детект с ноды (env контейнера `remnawave/node` → `.env` → `ss`; агент молчит → прошлый детект, иначе оба дефолта `2222,3000`). Явный порт ≠ факту → правила на оба + warn |
 | `WHITELIST` | _пусто_ | IP/CIDR (v4+v6) панели/мониторинга — никогда не банятся |
 | `SYN_RATE`/`SYN_BURST` | `200`/`400` | **per-IP** новых TCP-конн./сек на порт |
 | `UDP_RATE`/`UDP_BURST` | `200`/`400` | **per-IP** UDP пакетов/сек |
@@ -132,6 +140,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `ENABLE_BANONCE` | `1` | двухступенчатый автобан (suspect→confirmed), анти-CGNAT-FP |
 | `SUSPECT_TIME` | `30m` | окно наблюдения за «подозреваемым» (ban-once) |
 | `NODE_PORT_WHITELIST_ONLY` | `auto` | `auto` (whitelist-only если задан `WHITELIST`) / `0` / `1` |
+| `NODE_PORT_AUTOWL` | `auto` | при whitelist-only пускать текущих established-пиров node-порта (= панель) сетом `na_nodeport_wl_*` — анти-самоотстрел. `auto` — вкл, когда wl-only вывелся из `WHITELIST` (явный `NODE_PORT_WHITELIST_ONLY=1` — только warn) / `1` форс / `0` выкл. Пиры персистятся (`NODE_PORT_PEERS`) |
 | `ENABLE_BLOCKLISTS` | `0` | статич-блоклисты Spamhaus DROP + FireHOL L1 |
 | `BLOCK_TOR` | `0` | добавить Tor exit-nodes в блоклист |
 | `BLOCKLIST_REFRESH` | `12h` | интервал обновления блоклистов |

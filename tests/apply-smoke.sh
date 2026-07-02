@@ -24,11 +24,24 @@ sed -e "s#/etc/systemd/system/#$T/sys/#g" \
     "$P" > "$P.tmp" && mv "$P.tmp" "$P"
 
 # Стаб-бинари (no-op) в PATH.
-for c in systemctl modprobe nft systemd-run sysctl ss conntrack; do
+for c in systemctl modprobe nft systemd-run sysctl conntrack; do
     printf '#!/bin/sh\nexit 0\n' > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
 # curl падает → сетевые fetch (crowdsec/blocklist/fleet) деградируют мягко, не висят.
 printf '#!/bin/sh\nexit 1\n' > "$T/bin/curl"; chmod +x "$T/bin/curl"
+# docker падает → детект node-порта детерминированно идёт по .env/ss-веткам
+# (на CI-раннере/маке живой docker дал бы недетерминизм).
+printf '#!/bin/sh\nexit 1\n' > "$T/bin/docker"; chmod +x "$T/bin/docker"
+# ss: harvest established-пиров node-порта видит «панель» 198.51.100.7 (TEST-NET-2),
+# остальные вызовы (детект listening и т.п.) — пусто.
+cat > "$T/bin/ss" <<'SS'
+#!/bin/sh
+case "$*" in
+    *established*) echo 'ESTAB 0 0 10.0.0.5:3000 198.51.100.7:41234';;
+esac
+exit 0
+SS
+chmod +x "$T/bin/ss"
 # cscli намеренно НЕ стабим → CrowdSec-тело пропускается (его хардкод-пути не трогаем).
 
 # Глушим root/os/iface-детекты и переносим CONF_DIR/STATE_DIR.
@@ -72,7 +85,13 @@ done
 NFTF="$T/conf/na_filter.nft"
 grep -q 'hook input priority filter; policy drop;' "$NFTF" || { echo "[x] strict: нет policy drop на input"; fail=1; }
 grep -q 'ANTI-SCAN' "$NFTF" || { echo "[x] strict: нет анти-скан правил"; fail=1; }
-grep -q 'dport 2222' "$NFTF" || { echo "[x] strict: нет node-port правил"; fail=1; }
+# NODE_PORT не задан, детект пуст (docker/ss стабы) → фолбэк на ОБА известных дефолта
+grep -q 'tcp dport { 2222, 3000 } ct state new drop' "$NFTF" || { echo "[x] strict: нет node-port правил на фолбэк 2222,3000"; fail=1; }
+grep -q 'set na_nodeport_wl_v4' "$NFTF" || { echo "[x] strict: нет сета na_nodeport_wl_v4 (пожарный допуск панели)"; fail=1; }
+grep -q '^node_port=2222,3000$' "$T/state/protect.installed" || { echo "[x] strict: node_port=2222,3000 не в маркере"; fail=1; }
+# wl-only задан ЯВНО → авто-допуск пиров выключен: warn с их списком, элементов в сете нет
+grep -q '198.51.100.7' "$NFTF" && { echo "[x] strict: пир НЕ должен попадать в сет при явном NODE_PORT_WHITELIST_ONLY=1"; fail=1; }
+grep -qF 'node-port сейчас держат коннект: 198.51.100.7' "$LOG" || { echo "[x] strict: нет warn со списком established-пиров node-порта"; fail=1; }
 grep -q '^fw_mode=strict$' "$T/state/protect.installed" || { echo "[x] strict: fw_mode=strict не в маркере"; fail=1; }
 grep -qE 'meter (osyn|occ|oudp)' "$NFTF" && { echo "[x] strict: generic open-лимитеры не должны ставиться (ruleset должен быть идентичен прежнему)"; fail=1; }
 
@@ -99,7 +118,7 @@ grep -q 'meter osyn4' "$NFTF" || { echo "[x] open: нет generic per-IP SYN-rat
 grep -q 'meter occ4'  "$NFTF" || { echo "[x] open: нет generic per-IP conn-limit для неперечисленных портов"; fail=1; }
 grep -q 'meter oudp4' "$NFTF" || { echo "[x] open: нет generic per-IP UDP-rate для неперечисленных портов"; fail=1; }
 grep -q 'ANTI-SCAN' "$NFTF" && { echo "[x] open: анти-скан автобан не должен ставиться"; fail=1; }
-grep -q 'dport 2222' "$NFTF" && { echo "[x] open: node-port правила не должны ставиться"; fail=1; }
+grep -qE 'tcp dport \{ 2222|na_nodeport_wl' "$NFTF" && { echo "[x] open: node-port правила/сеты не должны ставиться"; fail=1; }
 grep -q 'ssh-flood' "$NFTF" || { echo "[x] open: SSH-защита должна оставаться"; fail=1; }
 grep -q 'bogon_v4' "$NFTF" || { echo "[x] open: анти-спуф должен оставаться"; fail=1; }
 grep -q '^fw_mode=open$' "$T/state/protect.installed" || { echo "[x] open: fw_mode=open не в маркере"; fail=1; }
@@ -125,8 +144,45 @@ grep -qF 'Как закрыть порты самому' "$LOG3" || { echo "[x] 
 grep -qF 'Готово' "$LOG3" || { echo "[x] skip: прогон не дошёл до конца"; fail=1; }
 grep -q '^fw_mode=skip$' "$T/state/protect.installed" || { echo "[x] skip: fw_mode=skip не в маркере"; fail=1; }
 
+# ── NODE_PORT=auto: детект из .env node-агента + авто-допуск пиров панели ──────
+# WHITELIST задан, wl-only НЕ задан явно → авто-вывод → NODE_PORT_AUTOWL=auto включается.
+reset_t
+printf 'NODE_PORT=3000\n' > "$T/remnanode.env"
+LOG4="$T/apply-autodetect.log"
+set +e
+NA_REMNANODE_ENV="$T/remnanode.env" WHITELIST="1.2.3.4" ENABLE_CROWDSEC=0 \
+  REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$LOG4" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then echo "[x] autodetect: apply упал (exit $rc)"; tail -25 "$LOG4"; fail=1; fi
+grep -qiE 'unbound variable|bad substitution' "$LOG4" && { echo "[x] autodetect: unbound-переменная:"; grep -iE 'unbound variable|bad substitution' "$LOG4"; fail=1; }
+grep -qF 'автодетект порта → 3000' "$LOG4" || { echo "[x] autodetect: нет лога про автодетект 3000"; fail=1; }
+grep -q 'tcp dport { 3000 } ct state new drop' "$NFTF" || { echo "[x] autodetect: нет wl-only правил на детект-порт 3000"; fail=1; }
+grep -q 'dport { 2222' "$NFTF" && { echo "[x] autodetect: фолбэк 2222 не должен ставиться при удачном детекте"; fail=1; }
+grep -q '198.51.100.7' "$NFTF" || { echo "[x] autodetect: established-пир панели не попал в na_nodeport_wl (авто-допуск)"; fail=1; }
+grep -q '^node_port=3000$' "$T/state/protect.installed" || { echo "[x] autodetect: node_port=3000 не в маркере"; fail=1; }
+grep -q 'NODE_PORT:=auto' "$T/conf/protect.conf" || { echo "[x] autodetect: intent NODE_PORT=auto не персистится"; fail=1; }
+grep -q 'NODE_PORT_LAST:=3000' "$T/conf/protect.conf" || { echo "[x] autodetect: кэш NODE_PORT_LAST=3000 не персистится"; fail=1; }
+grep -q 'NODE_PORT_PEERS:=198.51.100.7' "$T/conf/protect.conf" || { echo "[x] autodetect: пиры панели не персистятся"; fail=1; }
+
+# ── Явный NODE_PORT=2222, а агент фактически на :3000 → правила на ОБА + warn ──
+reset_t
+LOG5="$T/apply-mismatch.log"
+set +e
+NA_REMNANODE_ENV="$T/remnanode.env" NODE_PORT=2222 ENABLE_CROWDSEC=0 \
+  REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$LOG5" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then echo "[x] mismatch: apply упал (exit $rc)"; tail -25 "$LOG5"; fail=1; fi
+grep -qF 'node-agent фактически слушает :3000' "$LOG5" || { echo "[x] mismatch: нет warn про расхождение явного порта с детектом"; fail=1; }
+grep -q 'tcp dport { 2222, 3000 }' "$NFTF" || { echo "[x] mismatch: правила должны крыть ОБА порта (явный + детект)"; fail=1; }
+grep -q '^node_port=2222,3000$' "$T/state/protect.installed" || { echo "[x] mismatch: node_port=2222,3000 не в маркере"; fail=1; }
+grep -q 'NODE_PORT:=2222}' "$T/conf/protect.conf" || { echo "[x] mismatch: явный intent NODE_PORT=2222 не персистится"; fail=1; }
+
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
     echo "APPLY-SMOKE: FAIL"; exit 1
 fi
-echo "APPLY-SMOKE: OK (apply-path protect.sh чист под set -u в режимах strict/open/skip, модули и артефакты на месте)"
+echo "APPLY-SMOKE: OK (apply-path protect.sh чист под set -u в режимах strict/open/skip + node-port детект/фолбэк/mismatch, модули и артефакты на месте)"

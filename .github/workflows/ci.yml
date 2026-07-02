@@ -80,6 +80,18 @@ jobs:
           if FW_MODE=firewall DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
             echo "валидация НЕ сработала на кривом FW_MODE"; exit 1
           else echo "ok: кривой FW_MODE отвергнут"; fi
+      - name: protect.sh DRY_RUN (NODE_PORT=auto — детект порта node-агента из .env → nft -c)
+        run: |
+          mkdir -p /opt/remnanode && printf 'NODE_PORT=3000\n' > /opt/remnanode/.env
+          OUT="$(DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 WHITELIST=203.0.113.7 bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'автодетект порта → 3000' || { echo "детект NODE_PORT из /opt/remnanode/.env не сработал"; exit 1; }
+          rm -rf /opt/remnanode
+      - name: protect.sh DRY_RUN (NODE_PORT списком) + отказ на кривом NODE_PORT
+        run: |
+          DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 NODE_PORT=2222,3000 bash scripts/protect.sh
+          if NODE_PORT=abc DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
+            echo "валидация НЕ сработала на кривом NODE_PORT"; exit 1
+          else echo "ok: кривой NODE_PORT отвергнут"; fi
       - name: diagnose.sh (read-only, не должен падать жёстко)
         run: bash scripts/diagnose.sh || true
       - name: diagnose.sh --json (machine-readable smoke)
