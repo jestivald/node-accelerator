@@ -146,6 +146,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `BLOCKLIST_REFRESH` | `12h` | интервал обновления блоклистов |
 | `REMNAWAVE_URL` / `REMNAWAVE_TOKEN` | _пусто_ | панель для fleet auto-sync (токен → `fleet.env` 0600) |
 | `REMNAWAVE_NODES_URL` | _пусто_ | fleet-sync **без токена на ноде**: URL статического списка нод (JSON вида `/api/nodes` или plain-text «адрес на строку») |
+| `CADDY_AUTH_API_TOKEN` | _пусто_ | Caddy Security / Tiny Auth перед панелью → `X-Api-Key` на запросы fleet-sync. Алиас: `REMNAWAVE_CADDY_TOKEN` |
 | `FLEET_SYNC` | `auto` | `auto` (вкл при URL+TOKEN) / `1` / `0` |
 | `FLEET_SYNC_INTERVAL` | `5min` | интервал синка нод флота |
 | `ENABLE_CTGUARD` | `0` | conntrack phantom-eviction (анти connect-and-hold) |
@@ -181,8 +182,10 @@ journalctl -t na-fleet-sync -t na-blocklist -t na-ctguard   # логи моду�
 
 ```bash
 sudo REMNAWAVE_URL="https://panel.example.com" REMNAWAVE_TOKEN="ey..." \
+     CADDY_AUTH_API_TOKEN="your-caddy-api-key" \
      REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
 # токен из панели: Remnawave → Settings → API Tokens. Хранится в /etc/node-accelerator/fleet.env (0600).
+# CADDY_AUTH_API_TOKEN — если панель за Caddy Security / Tiny Auth (заголовок X-Api-Key).
 ```
 
 > ⚠️ **Blast-radius токена.** API-токен Remnawave — полноправный; лежащий на каждой ноде

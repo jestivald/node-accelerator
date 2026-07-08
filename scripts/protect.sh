@@ -117,6 +117,9 @@ BLOCKLIST_REFRESH="${BLOCKLIST_REFRESH:-12h}"
 REMNAWAVE_URL="${REMNAWAVE_URL:-}"
 REMNAWAVE_TOKEN="${REMNAWAVE_TOKEN:-}"
 REMNAWAVE_NODES_URL="${REMNAWAVE_NODES_URL:-}"
+# Caddy Security / Tiny Auth перед панелью → заголовок X-Api-Key (как subscription-page).
+# REMNAWAVE_CADDY_TOKEN — алиас (bedolaga-бот); приоритет у CADDY_AUTH_API_TOKEN.
+CADDY_AUTH_API_TOKEN="${CADDY_AUTH_API_TOKEN:-${REMNAWAVE_CADDY_TOKEN:-}}"
 FLEET_SYNC="${FLEET_SYNC:-auto}"
 FLEET_SYNC_INTERVAL="${FLEET_SYNC_INTERVAL:-5min}"
 # conntrack phantom-eviction (защита от distributed connect-and-hold) — opt-in,
@@ -973,9 +976,10 @@ if [[ "$FLEET_ON" == "1" ]]; then
     if [[ -n "$REMNAWAVE_NODES_URL" ]] || [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]]; then
         umask 077; mkdir -p "$CONF_DIR"
         {
-            [[ -z "$REMNAWAVE_URL"       ]] || printf 'REMNAWAVE_URL=%s\n' "$REMNAWAVE_URL"
-            [[ -z "$REMNAWAVE_TOKEN"     ]] || printf 'REMNAWAVE_TOKEN=%s\n' "$REMNAWAVE_TOKEN"
-            [[ -z "$REMNAWAVE_NODES_URL" ]] || printf 'REMNAWAVE_NODES_URL=%s\n' "$REMNAWAVE_NODES_URL"
+            [[ -z "$REMNAWAVE_URL"            ]] || printf 'REMNAWAVE_URL=%s\n' "$REMNAWAVE_URL"
+            [[ -z "$REMNAWAVE_TOKEN"          ]] || printf 'REMNAWAVE_TOKEN=%s\n' "$REMNAWAVE_TOKEN"
+            [[ -z "$REMNAWAVE_NODES_URL"      ]] || printf 'REMNAWAVE_NODES_URL=%s\n' "$REMNAWAVE_NODES_URL"
+            [[ -z "$CADDY_AUTH_API_TOKEN"     ]] || printf 'CADDY_AUTH_API_TOKEN=%s\n' "$CADDY_AUTH_API_TOKEN"
         } > "$CONF_DIR/fleet.env"
         chmod 0600 "$CONF_DIR/fleet.env"; chown root:root "$CONF_DIR/fleet.env" 2>/dev/null || true
         if [[ -n "$REMNAWAVE_NODES_URL" ]]; then
@@ -993,7 +997,8 @@ if [[ "$FLEET_ON" == "1" ]]; then
 #   1) REMNAWAVE_NODES_URL — статический список БЕЗ токена панели на ноде: JSON того же
 #      вида, что /api/nodes, ИЛИ plain-text «адрес на строку» (# — комментарий).
 #   2) REMNAWAVE_URL + REMNAWAVE_TOKEN — GET /api/nodes по Bearer. Токен уходит ТОЛЬКО
-#      на заданный оператором URL.
+#      на заданный оператором URL. CADDY_AUTH_API_TOKEN (опц.) → X-Api-Key для Caddy
+#      Security / Tiny Auth перед панелью.
 # Fail-safe: источник недоступен / кривой ответ / 0 валидных IP → текущий whitelist нод
 # НЕ трогаем (last-known-good). Применение отдельной nft-транзакцией: битые данные не
 # ломают na_filter. Успех отмечается в /var/lib/node-accelerator/fleet-sync.last —
@@ -1006,19 +1011,23 @@ STAMP=/var/lib/node-accelerator/fleet-sync.last
 # shellcheck disable=SC1090
 . "$ENVF"
 URL="${REMNAWAVE_URL:-}"; TOKEN="${REMNAWAVE_TOKEN:-}"; NURL="${REMNAWAVE_NODES_URL:-}"
+CADDY="${CADDY_AUTH_API_TOKEN:-}"
 { [ -n "$NURL" ] || { [ -n "$URL" ] && [ -n "$TOKEN" ]; }; } || { logger -t "$TAG" "источник не задан — выкл"; exit 0; }
 command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
 nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет na_fleet нет (protect без fleet) — выкл"; exit 0; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+CURL_CADDY=()
+[ -n "$CADDY" ] && CURL_CADDY=(-H "X-Api-Key: $CADDY")
 if [ -n "$NURL" ]; then
     SRC="$NURL"
-    HTTP="$(curl -fsSL --max-redirs 3 --max-time 15 -o "$TMP/r" -w '%{http_code}' "$NURL" 2>/dev/null || true)"
+    HTTP="$(curl -fsSL --max-redirs 3 --max-time 15 -o "$TMP/r" -w '%{http_code}' \
+            "${CURL_CADDY[@]}" "$NURL" 2>/dev/null || true)"
 else
     command -v jq >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен для /api/nodes)"; exit 1; }
     URL="${URL%/}"; SRC="$URL/api/nodes"
     HTTP="$(curl -fsS --max-time 15 -o "$TMP/r" -w '%{http_code}' \
             -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
-            "$SRC" 2>/dev/null || true)"
+            "${CURL_CADDY[@]}" "$SRC" 2>/dev/null || true)"
 fi
 [ "$HTTP" = "200" ] && [ -s "$TMP/r" ] || { logger -t "$TAG" "источник недоступен (HTTP=$HTTP) — last-known-good"; exit 0; }
 : > "$TMP/addr"
