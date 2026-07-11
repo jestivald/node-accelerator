@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.9 — 2026-07-08
+## v3.9 — 2026-07-11
 
 ### 🛡 fleet-sync — Caddy auth перед панелью (`CADDY_AUTH_API_TOKEN`)
 - **`CADDY_AUTH_API_TOKEN`** (алиас **`REMNAWAVE_CADDY_TOKEN`**) — при обращении к
