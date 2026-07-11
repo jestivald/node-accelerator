@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.9 — 2026-07-11
+
+### 🛡 fleet-sync — Caddy auth перед панелью (`CADDY_AUTH_API_TOKEN`)
+- **`CADDY_AUTH_API_TOKEN`** (алиас **`REMNAWAVE_CADDY_TOKEN`**) — при обращении к
+  Remnawave-панели (`/api/nodes` или `REMNAWAVE_NODES_URL`) добавляется заголовок
+  `X-Api-Key`, как в [subscription-page](https://github.com/remnawave/subscription-page)
+  и bedolaga-боте. Токен сохраняется в `fleet.env` (0600) вместе с остальными
+  fleet-параметрами.
+
 ## v3.8 — 2026-07-02
 
 Порт node-агента: **автодетект вместо захардкоженного дефолта** + защита от «панель

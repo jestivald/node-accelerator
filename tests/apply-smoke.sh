@@ -181,8 +181,24 @@ grep -q 'tcp dport { 2222, 3000 }' "$NFTF" || { echo "[x] mismatch: правил
 grep -q '^node_port=2222,3000$' "$T/state/protect.installed" || { echo "[x] mismatch: node_port=2222,3000 не в маркере"; fail=1; }
 grep -q 'NODE_PORT:=2222}' "$T/conf/protect.conf" || { echo "[x] mismatch: явный intent NODE_PORT=2222 не персистится"; fail=1; }
 
+# ── CADDY_AUTH_API_TOKEN → fleet.env + X-Api-Key в na-fleet-sync ─────────────
+reset_t
+LOG6="$T/apply-caddy.log"
+set +e
+FLEET_SYNC=1 REMNAWAVE_URL=https://panel.example.com REMNAWAVE_TOKEN=tok \
+  CADDY_AUTH_API_TOKEN=caddy-secret ENABLE_CROWDSEC=0 \
+  REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$LOG6" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then echo "[x] caddy: apply упал (exit $rc)"; tail -25 "$LOG6"; fail=1; fi
+grep -qF 'CADDY_AUTH_API_TOKEN=caddy-secret' "$T/conf/fleet.env" \
+  || { echo "[x] caddy: токен не сохранён в fleet.env"; fail=1; }
+grep -qF 'X-Api-Key: $CADDY' "$T/sbin/na-fleet-sync" \
+  || { echo "[x] caddy: na-fleet-sync не шлёт X-Api-Key"; fail=1; }
+
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
     echo "APPLY-SMOKE: FAIL"; exit 1
 fi
-echo "APPLY-SMOKE: OK (apply-path protect.sh чист под set -u в режимах strict/open/skip + node-port детект/фолбэк/mismatch, модули и артефакты на месте)"
+echo "APPLY-SMOKE: OK (apply-path protect.sh чист под set -u в режимах strict/open/skip + node-port детект/фолбэк/mismatch/caddy-auth, модули и артефакты на месте)"
