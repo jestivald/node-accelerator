@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.9.1 — 2026-07-21
+
+### 🛡 fleet-sync — `X-Api-Key` больше не утекает на редиректе
+- `na-fleet-sync` с `REMNAWAVE_NODES_URL` тянул список нод через `curl -fsSL` (следовал
+  редиректам, `--max-redirs 3`). curl срезает `Authorization` на кросс-хост редиректе,
+  но **кастомный `X-Api-Key` (Caddy-токен) — НЕТ**: редирект с панельного URL мог увести
+  токен на посторонний хост. Теперь при заданном `CADDY_AUTH_API_TOKEN` /
+  `REMNAWAVE_CADDY_TOKEN` редиректы для списка нод **не следуются** (оператор задаёт
+  финальный `https`-URL сам), плюс `--proto-redir '=https'` запрещает даунгрейд фетча на
+  cleartext `http`. Ветка `/api/nodes` (`Authorization: Bearer`) редиректы и так не
+  следовала — не затронута. Дефолты без токена не меняются.
+
 ## v3.9 — 2026-07-11
 
 ### 🛡 fleet-sync — Caddy auth перед панелью (`CADDY_AUTH_API_TOKEN`)

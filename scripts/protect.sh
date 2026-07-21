@@ -1018,9 +1018,15 @@ nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1 || { logger -t "$TAG" "�
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 CURL_CADDY=()
 [ -n "$CADDY" ] && CURL_CADDY=(-H "X-Api-Key: $CADDY")
+# curl срезает Authorization на кросс-хост редиректе, но кастомный X-Api-Key — НЕТ:
+# с -L токен Caddy утёк бы на хост-цель редиректа. При заданном токене редиректы НЕ
+# следуем (оператор задаёт финальный https-URL сам). Без токена -L оставляем, но
+# --proto-redir '=https' не даёт редиректу увести фетч списка нод на cleartext http.
+FS_REDIR=(-L --max-redirs 3)
+[ -n "$CADDY" ] && FS_REDIR=(--max-redirs 0)
 if [ -n "$NURL" ]; then
     SRC="$NURL"
-    HTTP="$(curl -fsSL --max-redirs 3 --max-time 15 -o "$TMP/r" -w '%{http_code}' \
+    HTTP="$(curl -fsS "${FS_REDIR[@]}" --proto-redir '=https' --max-time 15 -o "$TMP/r" -w '%{http_code}' \
             "${CURL_CADDY[@]}" "$NURL" 2>/dev/null || true)"
 else
     command -v jq >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен для /api/nodes)"; exit 1; }
