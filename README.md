@@ -60,10 +60,18 @@
 - **Remnawave fleet auto-sync** *(opt-in)* — ноды флота сами держат IP друг друга в whitelist (с панели).
 - **ICMP rate-limit** (пинг жив, флуд режется).
 - **CrowdSec + `crowdsec-firewall-bouncer-nftables`** — поведенческий IPS + community-блоклист.
-  Ставится из **пиннингованного APT-репо** (полный отпечаток ключа сверяется; фоллбэк на
-  официальный установщик — только если репо недоступен, с громким warn). `CROWDSEC_PROBE=1` —
-  проверить резолв репо/пакетов на этой ОС без установки.
+  Ставится из **пиннингованного APT-репо**: ключ проверяется по полному отпечатку и в
+  keyring кладётся **ровно он** (а не всё, что приехало в ответе). Suite берётся канонический
+  `any/any` — он же работает на Debian 13 (trixie), где у CrowdSec **нет** своего suite, а
+  родной пакет дистрибутива устарел; дальше фоллбэки на `<os>/<codename>` и `bookworm`/`noble`.
+  Не поднялся вообще — официальный установщик (`curl|bash`, громкий warn), а `CROWDSEC_STRICT=1`
+  запрещает и это. `CROWDSEC_PROBE=1` — проверить резолв репо/пакетов на этой ОС без установки.
 - Полный **IPv6-паритет**, **rate-limit на логи**, **авто-whitelist твоего SSH-IP** + **сейфти-таймер** от самоблокировки.
+- **Анти-локаут по SSH-порту**: порт берётся из `sshd -T` и socket-юнита (Ubuntu 24.04+
+  слушает `ssh.socket`, где `Port` из `sshd_config` игнорируется), а порт **текущей
+  SSH-сессии** добавляется в правила всегда — ошибка детекта не может отрезать твой доступ.
+  Сработавший сейфти-таймер снимает и таблицу, **и автозагрузку правил** — локаут не
+  возвращается после ребута.
 - **Персист конфига** — ре-ран без ENV не сбрасывает поднятые под ноду ручки.
 
 ### 🩺 Диагностика (`scripts/diagnose.sh`)
@@ -102,11 +110,11 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v3.9.1
+export NA_REF=v3.9.2
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 # максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
-export NA_REF=v3.9.1 NA_REQUIRE_SIG=1 \
+export NA_REF=v3.9.2 NA_REQUIRE_SIG=1 \
        NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
@@ -120,7 +128,7 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | Переменная | По умолч. | Что |
 |---|---|---|
 | `FW_MODE` | `strict` | `strict` — блок всех портов, кроме разрешённых (Remnawave node); `open` — прочие порты не блокируются, но получают per-IP флуд-лимиты как перечисленные (3x-ui: динамические inbound'ы; анти-скан автобан и node-port правила не ставятся); `skip` — nftables не трогать (только CrowdSec) + инструкция по ручной блокировке. Интерактивно спрашивается; найден 3x-ui — предлагается `open` |
-| `SSH_PORT` | авто-детект | порт SSH |
+| `SSH_PORT` | авто-детект | порт(ы) SSH через запятую. Детект: активный `ssh.socket`/`sshd.socket` → `sshd -T` (учитывает `sshd_config.d/*`) → `ss` → `sshd_config`. Порт текущей SSH-сессии добавляется к правилам автоматически + warn |
 | `TCP_PORTS` / `UDP_PORTS` | `443,2087` | сервисные порты |
 | `NODE_PORT` | `auto` | порт(ы) node-agent через запятую. `auto` — детект с ноды (env контейнера `remnawave/node` → `.env` → `ss`; агент молчит → прошлый детект, иначе оба дефолта `2222,3000`). Явный порт ≠ факту → правила на оба + warn |
 | `WHITELIST` | _пусто_ | IP/CIDR (v4+v6) панели/мониторинга — никогда не банятся |
@@ -133,9 +141,12 @@ curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF
 | `ENABLE_PORTSCAN_BAN` | `1` | автобан за скан закрытых портов |
 | `PORTSCAN_RATE`/`PORTSCAN_BURST` | `15`/`30` | порог скана (SYN на закрытые порты/мин, per-IP) до бана — ниже порога просто дроп, без бана |
 | `ENABLE_CROWDSEC` | `1` | ставить CrowdSec + bouncer |
+| `CROWDSEC_STRICT` | `0` | `1` — только пиннингованный APT-репо; не поднялся → CrowdSec пропускается (без `curl\|bash`-фоллбэка) |
 | `ENABLE_SYNPROXY` | `0` | nft synproxy на сервисные порты (advanced). На VPN-relay избыточен — syncookies + per-IP ct-лимиты уже дают анти-спуф; включать под подтверждённый спуф-SYN-флуд |
 | `CROWDSEC_ENROLL_KEY` | _пусто_ | enroll в CrowdSec Console |
-| `SAFETY_DELAY` | `300` | сек до авто-сброса правил, если не подтвердить SSH |
+| `SAFETY_DELAY` | `300` | сек до авто-сброса правил, если не подтвердить SSH. Сброс снимает и таблицу, и автозагрузку (`na-firewall.service`) — иначе локаут вернулся бы ребутом |
+| `FLEET_SYNC_INTERVAL` | `5min` | интервал fleet-sync (персистится; `na-diagnose` считает свежесть по нему, а не по дефолту) |
+| `NA_NO_LOCK` | `0` | `1` — не брать flock (по умолчанию параллельный второй прогон отказывается стартовать) |
 | `DRY_RUN` | `0` | `1` — только сгенерировать + `nft -c`, не применять |
 | `ENABLE_BANONCE` | `1` | двухступенчатый автобан (suspect→confirmed), анти-CGNAT-FP |
 | `SUSPECT_TIME` | `30m` | окно наблюдения за «подозреваемым» (ban-once) |
@@ -223,6 +234,10 @@ sudo bash install.sh rollback all        # protect + optimize
 sudo bash install.sh rollback protect    # снять firewall (CrowdSec остаётся; NA_PURGE_CROWDSEC=1 чтобы удалить)
 sudo bash install.sh rollback optimize   # снять тюнинг (XanMod остаётся; NA_REMOVE_XANMOD=1 + загрузка со стока чтобы удалить)
 ```
+
+`rollback optimize` убирает и то, что раньше оставалось жить: строки `pam_limits` в
+`common-session*` и `/swapfile` вместе с записью в `/etc/fstab` — **swap снимается только
+если его создали мы** (метка `swapfile.created`) и только если он не занят.
 
 Бэкапы оригиналов — в `/var/backups/node-accelerator/<timestamp>/`.
 

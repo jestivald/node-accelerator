@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="3.9.1"
+NA_VERSION="3.9.2"
 
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -149,12 +149,70 @@ systime_to_s() {
     esac
 }
 
-# SSH-порт: сперва из активной сессии sshd, потом из конфига.
+# SSH-порт. Источники по убыванию достоверности (выигрывает первый сработавший):
+#   1. активный socket-юнит ssh.socket/sshd.socket — на Ubuntu 24.04+ сокет держит
+#      systemd, а Port из sshd_config ИГНОРИРУЕТСЯ; в ss владельцем значится "systemd",
+#      поэтому старая ss-эвристика (/sshd|"ssh"/) молча отдавала 22 — strict-файрвол
+#      открывал не тот порт, а «проверь SSH в новом окне» этого не ловит (IP админа
+#      целиком в whitelist: у него работает, у всех остальных — локаут);
+#   2. `sshd -T` — раскрывает Include /etc/ssh/sshd_config.d/*.conf (сток bookworm/noble,
+#      cloud-init пишет порт именно в drop-in), т.е. надёжнее чтения одного файла;
+#   3. ss по слушателю; 4. сам sshd_config; 5. 22.
 detect_ssh_port() {
-    local p
-    p="$(ss -tnlp 2>/dev/null | awk '/sshd|"ssh"/{n=split($4,a,":"); print a[n]; exit}')"
+    local p="" u sshd_bin=""
+    for u in ssh.socket sshd.socket; do
+        systemctl is-active --quiet "$u" 2>/dev/null || continue
+        p="$(systemctl show "$u" -p ListenStream --value 2>/dev/null \
+             | awk -F: 'NF{print $NF}' | grep -xE '[0-9]+' | head -1)"
+        [[ -n "$p" ]] && break
+    done
+    if [[ -z "$p" ]]; then
+        command -v sshd >/dev/null 2>&1 && sshd_bin=sshd
+        [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]] && sshd_bin=/usr/sbin/sshd
+        [[ -n "$sshd_bin" ]] && p="$("$sshd_bin" -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+    fi
+    [[ -z "$p" ]] && p="$(ss -tnlp 2>/dev/null | awk '/sshd|"ssh"|ssh\.socket/{n=split($4,a,":"); print a[n]; exit}')"
     [[ -z "$p" ]] && p="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+    [[ "$p" =~ ^[0-9]+$ ]] || p=""
     echo "${p:-22}"
+}
+
+# Порт ЭТОГО сервера в текущей SSH-сессии. SSH_CONNECTION="<c-ip> <c-port> <s-ip> <s-port>" —
+# сессия уже прошла через sshd, так что 4-е поле это ground truth, а не эвристика.
+# Пусто, если запущено не по SSH (консоль/cron). Нужен, чтобы файрвол не отрезал порт,
+# на котором ты прямо сейчас сидишь (протухший protect.conf / сменили порт / ошибка детекта).
+ssh_session_port() {
+    local p="${SSH_CONNECTION:-}"
+    p="$(printf '%s' "$p" | awk '{print $4}')"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p>=1 && p<=65535 )) && echo "$p"
+}
+
+# import_pinned_key <файл-с-ключом> <полный-fpr> <keyring-на-выходе>
+# Кладёт в keyring РОВНО пиненый ключ. Почему не `gpg --dearmor` всего ответа: apt по
+# signed-by=<keyring> доверяет КАЖДОМУ ключу файла, а проверка «наш отпечаток среди
+# импортированных» пропускает лишние ключи, приехавшие тем же блобом. Это не теория:
+# фолбэк за ключом XanMod ходит на keyserver по 64-битному keyid, а коллизию keyid
+# сделать дёшево — чужой ключ лёг бы в тот же keyring и apt начал бы ему доверять.
+import_pinned_key() {
+    local src="$1" fp="$2" out="$3" home rc=1 got
+    command -v gpg >/dev/null 2>&1 || { warn "нет gpg — не могу проверить отпечаток ключа"; return 1; }
+    home="$(mktemp -d)" || return 1
+    chmod 700 "$home"
+    if GNUPGHOME="$home" gpg --batch --quiet --import "$src" >/dev/null 2>&1; then
+        if GNUPGHOME="$home" gpg --batch --yes --export "$fp" > "$out" 2>/dev/null && [[ -s "$out" ]]; then
+            # контроль: в получившемся keyring ровно один ПЕРВИЧНЫЙ ключ и это наш fpr
+            got="$(gpg --show-keys --with-colons "$out" 2>/dev/null \
+                   | awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p{print $10;p=0}')"
+            [[ "$got" == "$fp" ]] && rc=0
+        fi
+    fi
+    # gpg 2.x поднимает agent/dirmngr под временный GNUPGHOME — гасим, чтобы на ноде
+    # не оставался процесс, смотрящий в удалённый каталог
+    gpgconf --homedir "$home" --kill all >/dev/null 2>&1 || true
+    rm -rf "$home"
+    [[ $rc -eq 0 ]] || { rm -f "$out"; return 1; }
+    chmod 0644 "$out"
+    return 0
 }
 
 # IP клиента, с которого мы сейчас подключены по SSH (для авто-whitelist от самоблокировки).

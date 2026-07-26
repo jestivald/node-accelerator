@@ -106,6 +106,13 @@ emit_json() {
     # (миграция агента 2222→3000 при strict) панель видит как «нода недоступна»
     npd="$(detect_node_port || true)"
     npfw="$(awk -F= '/^node_port=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"; npfw="${npfw:-}"
+    # сейфти УЖЕ срабатывал (−1 = не срабатывал): значение ≥0 = таблица снята и
+    # автозагрузка выключена, т.е. защиты СЕЙЧАС нет до повторного прогона protect
+    sfa=-1
+    [[ -f "$STATE_DIR/safety-fired.last" ]] && { cf="$(cat "$STATE_DIR/safety-fired.last" 2>/dev/null)"; [[ "$cf" =~ ^[0-9]+$ ]] && sfa=$(( nowsec - cf )); }
+    # переживут ли правила ребут (na-firewall.service в автозагрузке)
+    fwboot=0
+    systemctl is-enabled --quiet na-firewall.service 2>/dev/null && fwboot=1
     # свежесть последнего УСПЕШНОГО синка (−1 = штампа нет / модуль не активен)
     fsa=-1; bla=-1
     [[ -f "$STATE_DIR/fleet-sync.last" ]] && { cf="$(cat "$STATE_DIR/fleet-sync.last" 2>/dev/null)"; [[ "$cf" =~ ^[0-9]+$ ]] && fsa=$(( nowsec - cf )); }
@@ -129,7 +136,7 @@ emit_json() {
     printf '"ulimit_n":%s,"min_snd_mss":%s,"mtu_probing":%s,"mss_collapsed_sockets":%s,' "${uln:-0}" "$minsnd" "$mtuprobe" "${collapsed:-0}"
     printf '"firewall":%s,"fw_mode":"%s","autoban_v4":%s,"autoban_v6":%s,"suspect":%s,"blocklist_v4":%s,"blocklist_v6":%s,' "$fw" "$fwm" "$ab4" "$ab6" "$susp" "$bl4" "$bl6"
     printf '"fleet_v4":%s,"fleet_v6":%s,"crowdsec":%s,"ctguard":"%s","synproxy_degraded":%s,' "$fl4" "$fl6" "$crowd" "$ctg" "$syndeg"
-    printf '"safety_armed":%s,"reboot_needed":%s,' "$safety" "$rebootn"
+    printf '"safety_armed":%s,"safety_fired_age_s":%s,"fw_boot_enabled":%s,"reboot_needed":%s,' "$safety" "$sfa" "$fwboot" "$rebootn"
     printf '"na_version":"%s","hostname":"%s","uptime_s":%s,"load1":%s,"mem_used_pct":%s,' "$nav" "$host" "$up" "$load1" "$mempct"
     printf '"wan_iface":"%s","wan_rx_bytes":%s,"wan_tx_bytes":%s,"ipv6_default":%s,"udp_rcvbuf_errors":%s,' "$wi" "$wanrx" "$wantx" "$ip6def" "$udperr"
     printf '"remnanode_status":"%s","remnanode_restarts":%s,"remnanode_spawn_errors_1h":%s,' "$rnst" "$rnrc" "$rnse"
@@ -491,7 +498,12 @@ if nft list table inet na_filter >/dev/null 2>&1; then
             _fls="$(cat "$STATE_DIR/fleet-sync.last" 2>/dev/null)"
             if [[ "$_fls" =~ ^[0-9]+$ ]]; then
                 _age=$(( $(date +%s) - _fls ))
-                _iv="$(awk -F= '/^FLEET_SYNC_INTERVAL=/{gsub(/[":]/,"",$2);print $2}' "$CONF_DIR/protect.conf" 2>/dev/null)"
+                # интервал: сперва из самого таймера (ground truth), затем из protect.conf.
+                # ВАЖНО: conf пишется идиомой `: "${KEY:=value}"`, поэтому наивный
+                # парс `^FLEET_SYNC_INTERVAL=` не матчил НИКОГДА — интервал молча
+                # считался 5min и всякий более редкий синк выглядел «протухшим».
+                _iv="$(awk -F= '/^OnUnitActiveSec=/{print $2; exit}' /etc/systemd/system/na-fleet-sync.timer 2>/dev/null)"
+                [[ -n "$_iv" ]] || _iv="$(sed -nE 's/.*\{FLEET_SYNC_INTERVAL:=([^}]*)\}.*/\1/p' "$CONF_DIR/protect.conf" 2>/dev/null | tail -1)"
                 _ivs="$(systime_to_s "${_iv:-5min}")"; [[ "$_ivs" -ge 60 ]] || _ivs=300
                 if [[ "$_age" -gt $((_ivs*3)) ]]; then
                     wrn "последний успешный fleet-sync $((_age/60)) мин назад (> 3× интервала) — токен протух/панель сменила API? journalctl -t na-fleet-sync"
@@ -526,10 +538,29 @@ if systemctl is-active --quiet na-fw-safety.timer 2>/dev/null \
    || { [[ -f /tmp/na-fw-safety.pid ]] && kill -0 "$(cat /tmp/na-fw-safety.pid 2>/dev/null)" 2>/dev/null; }; then
     bad "ВЗВЕДЁН сейфти-таймер na-fw-safety — na_filter СКОРО САМОУДАЛИТСЯ! Сними после проверки доступа: systemctl stop na-fw-safety.timer"
 fi
+# Сейфти УЖЕ сработал: таблица снята И автозагрузка правил выключена (иначе локаут-руллсет
+# вернулся бы после ребута уже без подстраховки). Значит защиты сейчас нет — это не шум.
+if [[ -f "$STATE_DIR/safety-fired.last" ]]; then
+    _sfd="$(cat "$STATE_DIR/safety-fired.last" 2>/dev/null)"
+    if [[ "$_sfd" =~ ^[0-9]+$ ]]; then
+        bad "СЕЙФТИ СРАБАТЫВАЛ $(( ($(date +%s) - _sfd)/60 )) мин назад: na_filter снята, автозагрузка выключена — защиты НЕТ. Проверь SSH_PORT/WHITELIST и прогони protect заново."
+    else
+        bad "СЕЙФТИ СРАБАТЫВАЛ: защиты нет до повторного прогона protect"
+    fi
+fi
+# Таблица есть, а автозагрузки нет → после ребута нода останется без правил.
+if nft list table inet na_filter >/dev/null 2>&1 \
+   && [[ -f /etc/systemd/system/na-firewall.service ]] \
+   && ! systemctl is-enabled --quiet na-firewall.service 2>/dev/null; then
+    wrn "na_filter активна, но na-firewall.service ВЫКЛЮЧЕН — после ребута правила не поднимутся. Лечится повторным прогоном protect."
+fi
 if command -v cscli >/dev/null 2>&1; then
     systemctl is-active --quiet crowdsec && pass "CrowdSec агент активен" || wrn "CrowdSec установлен, но не active"
     systemctl is-active --quiet crowdsec-firewall-bouncer && pass "firewall-bouncer активен" || wrn "bouncer не active"
-    DEC=$(cscli decisions list -o raw 2>/dev/null | grep -vc '^$' || echo 0)
+    # grep -vc печатает 0 И возвращает rc=1, когда совпадений нет → наивный `|| echo 0`
+    # дописывал ВТОРОЙ ноль и строка выходила битой. Берём значение, потом валидируем.
+    DEC="$(cscli decisions list -o raw 2>/dev/null | grep -vc '^$')"
+    [[ "$DEC" =~ ^[0-9]+$ ]] || DEC=0
     info "CrowdSec decisions (активные баны): $DEC"
     nft list table ip crowdsec >/dev/null 2>&1 && info "таблица bouncer'а ip crowdsec присутствует (priority -10, раньше na_filter)"
 else

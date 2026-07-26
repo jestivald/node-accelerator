@@ -23,11 +23,30 @@ rollback_optimize() {
     rm -f /etc/systemd/journald.conf.d/na-size.conf
     sed -i '/# === node-accelerator ===/,/# === \/node-accelerator ===/d' /etc/security/limits.conf 2>/dev/null || true
 
+    # pam_limits: строку дописывал optimize (её нет в стоке Debian/Ubuntu common-session)
+    for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
+        [[ -f "$pam" ]] || continue
+        sed -i '/^session required pam_limits.so$/d' "$pam" 2>/dev/null || true
+    done
+
     for svc in na-rps na-nic-tune na-cpu-perf na-thp-off na-zram na-mss-clamp; do
         systemctl disable --now "$svc.service" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$svc.service"
     done
     rm -f /usr/local/sbin/na-rps-setup /usr/local/sbin/na-zram-setup
+
+    # /swapfile снимаем ТОЛЬКО если его создали мы (метка swapfile.created) — чужой swap
+    # трогать нельзя, а снятие живого swap'а на нагруженной ноде это прямой путь к OOM.
+    if [[ -f "$STATE_DIR/swapfile.created" ]]; then
+        if swapoff /swapfile 2>/dev/null; then
+            rm -f /swapfile
+            sed -i '\#^/swapfile[[:space:]]#d' /etc/fstab 2>/dev/null || true
+            rm -f "$STATE_DIR/swapfile.created"
+            ok "/swapfile снят и удалён (запись из fstab убрана)"
+        else
+            warn "/swapfile занят — не снял. Вручную: swapoff /swapfile && rm -f /swapfile (и строка в /etc/fstab)"
+        fi
+    fi
     # MSS-clamp: снять свою таблицу
     nft delete table inet na_mss 2>/dev/null || true
     rm -f "$CONF_DIR/na_mss.nft"
@@ -75,7 +94,12 @@ rollback_protect() {
     nft delete table inet na_ctguard 2>/dev/null || true
     rm -f "$CONF_DIR/na_filter.nft"
     rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
-          /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard
+          /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard \
+          /usr/local/sbin/na-fw-safety-revert
+    rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock"
+    # nftables.service мы включали (boot-persist), но выключать не будем: он лишь грузит
+    # /etc/nftables.conf, который тулкит никогда не писал — трогать чужой конфиг нельзя.
+    systemctl is-enabled --quiet nftables 2>/dev/null && info "nftables.service оставлен включённым (грузит ваш /etc/nftables.conf, наших правил там нет)"
     rm -f /etc/modules-load.d/na-synproxy.conf "$STATE_DIR/.synproxy-degraded"
     # конфиги: persisted protect.conf, ctguard.conf, токен панели fleet.env (custom-blocklist.txt — данные оператора, оставляем)
     rm -f "$STATE_DIR/protect.installed" "$CONF_DIR/protect.conf" "$CONF_DIR/ctguard.conf" "$CONF_DIR/fleet.env"

@@ -27,6 +27,12 @@ trap 'tput cnorm 2>/dev/null || true; exit 130' INT
 require_root
 detect_os
 
+# Один прогон optimize за раз: параллельные запуски дерутся за apt-lock и sysctl-файлы.
+if [[ "${NA_NO_LOCK:-0}" != "1" ]] && command -v flock >/dev/null 2>&1 && mkdir -p "$STATE_DIR" 2>/dev/null; then
+    exec 9>"$STATE_DIR/optimize.lock"
+    flock -n 9 || { err "уже идёт другой прогон optimize.sh (лок $STATE_DIR/optimize.lock) — не мешаю"; exit 1; }
+fi
+
 # Подхватываем сохранённый конфиг оптимизатора (ENV по-прежнему переопределяет).
 load_conf "$CONF_DIR/optimize.conf"
 
@@ -85,22 +91,26 @@ XANMOD_FP="D38D7D1DA1349567ADED882D86F7D09EE734E623"
 # Импорт ключа: 1) напрямую с XanMod; 2) при блокировке (CF-403 типичен для Hetzner/GCP)
 # — с Ubuntu keyserver. Что бы ни сработало — сверяем полный отпечаток.
 xanmod_import_key() {
-    local keyring="$1"
+    local keyring="$1" tmpkey
     mkdir -p /etc/apt/keyrings
-    if ! curl -fsSL --connect-timeout 5 --max-time 20 https://dl.xanmod.org/archive.key \
-            | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
+    tmpkey="$(mktemp)" || return 1
+    if ! curl -fsSL --connect-timeout 5 --max-time 20 https://dl.xanmod.org/archive.key -o "$tmpkey"; then
         warn "dl.xanmod.org недоступен (обычно CF-403 на хостингах) — пробую Ubuntu keyserver…"
-        curl -fsSL --connect-timeout 5 --max-time 20 \
-                "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_FP: -16}" \
-            | gpg --yes --dearmor -o "$keyring" 2>/dev/null \
-            || { warn "Ключ XanMod недоступен ни напрямую, ни с keyserver"; return 1; }
+        if ! curl -fsSL --connect-timeout 5 --max-time 20 \
+                "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_FP: -16}" -o "$tmpkey"; then
+            warn "Ключ XanMod недоступен ни напрямую, ни с keyserver"; rm -f "$tmpkey"; return 1
+        fi
     fi
-    if ! gpg --show-keys --with-colons "$keyring" 2>/dev/null \
-            | awk -F: '/^fpr:/{print $10}' | grep -qx "$XANMOD_FP"; then
-        warn "Отпечаток ключа XanMod не совпал с $XANMOD_FP — отказываюсь использовать"
-        rm -f "$keyring"; return 1
+    # keyserver ищется ПО 64-битному keyid, а его коллизию сделать дёшево → в ответе
+    # рядом с настоящим ключом может приехать чужой. apt по signed-by= доверяет КАЖДОМУ
+    # ключу keyring'а, поэтому кладём туда ровно наш отпечаток (import_pinned_key),
+    # а не «всё, что прислали».
+    if ! import_pinned_key "$tmpkey" "$XANMOD_FP" "$keyring"; then
+        warn "Ключ XanMod не сошёлся с отпечатком $XANMOD_FP — отказываюсь использовать"
+        rm -f "$tmpkey"; return 1
     fi
-    chmod 0644 "$keyring"
+    rm -f "$tmpkey"
+    return 0
 }
 
 # Готовим репозиторий XanMod (ключ + sources.list + apt update). Идемпотентно;
@@ -117,20 +127,33 @@ setup_xanmod_repo() {
             codename="bookworm"; XANMOD_FLAVOR="lts" ;;
         "") codename="bookworm" ;;   # релиз не определён — берём универсальный LTS-suite
     esac
+    # Для oldstable (bookworm) XanMod оставил в репо ТОЛЬКО LTS-ветку — main/edge/rt
+    # оттуда убраны, и запрос такой сборки просто не нашёл бы пакет.
+    if [[ "$codename" == "bookworm" && "$XANMOD_FLAVOR" != "lts" ]]; then
+        info "Debian bookworm: в репо XanMod осталась только LTS-ветка → беру lts вместо '$XANMOD_FLAVOR'"
+        XANMOD_FLAVOR="lts"
+    fi
 
     xanmod_import_key "$keyring" || return 1
 
+    # Обновляем ТОЛЬКО свой list (как в setup_crowdsec_repo): глобальный apt-get update
+    # возвращает rc≠0 из-за ЛЮБОГО чужого битого источника на боксе — а это типовая
+    # ситуация на съёмных VPS. Без скоупа живой XanMod-репо ложно объявлялся мёртвым,
+    # фоллбэк на bookworm падал так же, и ядро молча не ставилось «репо недоступен».
+    local -a UPDSC=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0)
     echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-    if ! apt-get update -qq 2>/dev/null; then
+    if ! apt-get update -qq "${UPDSC[@]}" 2>/dev/null; then
         if [[ "$codename" != "bookworm" ]]; then
             warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
             codename="bookworm"; XANMOD_FLAVOR="lts"
             echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-            apt-get update -qq 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
+            apt-get update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
         else
             warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
         fi
     fi
+    # общий кэш (чтобы apt-cache/install видели пакеты); чужие битые источники не фатальны
+    apt-get update -qq 2>/dev/null || true
     return 0
 }
 
@@ -542,6 +565,46 @@ fi
 # меньше IO-просадок под анти-OOM. На крупных — обычный /swapfile. SETUP_NO_ZRAM=1 форсит swapfile.
 title "Swap"
 SETUP_NO_ZRAM="${SETUP_NO_ZRAM:-0}"
+
+swap_size_mb() {   # "2G" / "512M" / "2048" → мегабайты (для dd-фоллбэка)
+    local v="${1:-2G}" n u
+    n="${v%[GgMmKk]}"; u="${v#"$n"}"
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo 2048; return; }
+    case "$u" in
+        G|g) echo $((n*1024));;
+        K|k) echo $((n/1024));;
+        *)   echo "$n";;      # M/m или без единицы — уже мегабайты
+    esac
+}
+
+# Создание /swapfile — с полной обработкой ошибок. Под `set -e` падение swapon (btrfs/CoW:
+# «swapfile has holes», запрет свапа у хостера) роняло ВЕСЬ optimize посреди прогона:
+# sysctl/лимиты уже применены, а journald-cap, THP, governor, маркер и save_conf — ещё
+# нет, и бокс оставался в полу-настроенном состоянии, про которое сам тулкит не знал.
+# Swap не стоит того, чтобы бросать тюнинг на полпути — не вышло, предупредили, поехали.
+make_swapfile() {
+    local size="${REMNAWAVE_SWAP_SIZE:-2G}" mb
+    mb="$(swap_size_mb "$size")"
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+        info "/swapfile уже активен — пропускаю"; return 0
+    fi
+    if ! fallocate -l "$size" /swapfile 2>/dev/null; then
+        rm -f /swapfile
+        # dd-фоллбэк уважает запрошенный размер (раньше был хардкод 2048 МБ)
+        dd if=/dev/zero of=/swapfile bs=1M count="$mb" status=none 2>/dev/null || {
+            warn "не смог создать /swapfile (нет места?) — swap пропущен"; rm -f /swapfile; return 1; }
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1 || { warn "mkswap не прошёл — swap пропущен"; rm -f /swapfile; return 1; }
+    if ! swapon /swapfile 2>/dev/null; then
+        warn "swapon не прошёл (btrfs/CoW «swapfile has holes» или запрет хостера) — swap пропущен"
+        rm -f /swapfile; return 1
+    fi
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    # метка «свап наш» — только по ней rollback имеет право его снимать
+    mkdir -p "$STATE_DIR" && date -Is > "$STATE_DIR/swapfile.created"
+    ok "Создан /swapfile $size"
+}
 if swapon --show 2>/dev/null | grep -q .; then
     info "Swap уже есть — пропускаю"
 elif [[ "$TIER" -le 2 && "$SETUP_NO_ZRAM" != "1" ]] && modprobe zram 2>/dev/null; then
@@ -578,20 +641,10 @@ EOF
         ok "zram-swap включён ($(swapon --show=NAME,SIZE --noheadings 2>/dev/null | grep zram | tr '\n' ' '))"
     else
         warn "zram не поднялся — fallback на /swapfile"
-        SWAP_SIZE="${REMNAWAVE_SWAP_SIZE:-2G}"
-        fallocate -l "$SWAP_SIZE" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
-        chmod 600 /swapfile; mkswap /swapfile >/dev/null; swapon /swapfile
-        grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        ok "Создан /swapfile $SWAP_SIZE"
+        make_swapfile || true
     fi
 else
-    SWAP_SIZE="${REMNAWAVE_SWAP_SIZE:-2G}"
-    fallocate -l "$SWAP_SIZE" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile
-    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    ok "Создан /swapfile $SWAP_SIZE"
+    make_swapfile || true
 fi
 
 # ─── 8. journald cap ─────────────────────────────────────────────────────────
