@@ -5,16 +5,21 @@ on:
     branches: [ main ]
   pull_request:
 
+# Токен раннера — только на чтение репозитория (ни один шаг не пишет в GitHub).
+permissions:
+  contents: read
+
 jobs:
   # ── Статический анализ всех скриптов ────────────────────────────────────────
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # SHA-пин: плавающий тег v4 может быть перенесён на другой коммит
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - name: Gate (severity=error — блокирует merge)
-        run: shellcheck -x --severity=error install.sh scripts/*.sh scripts/lib/*.sh
+        run: shellcheck -x --severity=error install.sh scripts/*.sh scripts/lib/*.sh tests/*.sh
       - name: Report (severity=style — информационно, не блокирует)
         continue-on-error: true
         run: shellcheck -x --severity=style install.sh scripts/*.sh scripts/lib/*.sh
@@ -22,6 +27,10 @@ jobs:
         # Ловит unbound-vars в ветках, исполняемых только при реальном применении
         # (модули fleet/blocklists/ctguard, маркер, save_conf) — их не видит DRY_RUN/bash -n.
         run: bash tests/apply-smoke.sh
+      - name: fleet-sync unit (ИСПОЛНЯЕТ сгенерированный хелпер против стабов)
+        # Секреты не в argv, уходят через -H @file, URL в логе без userinfo,
+        # редиректы при токене заблокированы, fail-safe last-known-good работает.
+        run: bash tests/fleet-sync-unit.sh
 
   # ── Smoke-тесты на матрице дистрибутивов ────────────────────────────────────
   # Ловит ровно тот класс регрессий, из-за которых появился этот PR: установка
@@ -46,7 +55,8 @@ jobs:
     steps:
       - name: Install git (нужен checkout) + базовые сертификаты
         run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates
-      - uses: actions/checkout@v4
+      # SHA-пин: плавающий тег v4 может быть перенесён на другой коммит
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - name: Prep container + runtime-зависимости
         run: |
           # Запрещаем запуск сервисов из postinst (в контейнере нет systemd как PID1)
@@ -95,6 +105,19 @@ jobs:
           if NODE_PORT=abc DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh 2>/dev/null; then
             echo "валидация НЕ сработала на кривом NODE_PORT"; exit 1
           else echo "ok: кривой NODE_PORT отвергнут"; fi
+      - name: protect.sh DRY_RUN (порт текущей SSH-сессии не теряется → nft -c)
+        run: |
+          # SSH_CONNECTION = "<c-ip> <c-port> <s-ip> <s-port>": порт сессии — ground truth.
+          # Ошибка детекта/протухший protect.conf не должны отрезать текущий доступ.
+          OUT="$(SSH_CONNECTION='203.0.113.9 55000 10.0.0.5 56777' SSH_PORT=22 \
+                 DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh)"
+          echo "$OUT" | grep -q 'SSH-сессия пришла на :56777' || { echo "порт SSH-сессии не подхвачен"; exit 1; }
+          # в DRY_RUN ruleset генерится во временный файл (/tmp/na_filter.XXXXXX.nft),
+          # а не в $CONF_DIR — берём самый свежий
+          F="$(ls -t /tmp/na_filter.*.nft 2>/dev/null | head -1)"
+          [ -n "$F" ] || { echo "не найден сгенерированный ruleset"; exit 1; }
+          grep -q 'tcp dport { 22, 56777 }' "$F" || { echo "в ruleset ($F) нет обоих SSH-портов"; exit 1; }
+          echo "ok: порт сессии добавлен в ruleset ($F)"
       - name: diagnose.sh (read-only, не должен падать жёстко)
         run: bash scripts/diagnose.sh || true
       - name: diagnose.sh --json (machine-readable smoke)

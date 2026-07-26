@@ -194,8 +194,41 @@ set -e
 if [ "$rc" -ne 0 ]; then echo "[x] caddy: apply упал (exit $rc)"; tail -25 "$LOG6"; fail=1; fi
 grep -qF 'CADDY_AUTH_API_TOKEN=caddy-secret' "$T/conf/fleet.env" \
   || { echo "[x] caddy: токен не сохранён в fleet.env"; fail=1; }
-grep -qF 'X-Api-Key: $CADDY' "$T/sbin/na-fleet-sync" \
+grep -qF 'X-Api-Key: %s' "$T/sbin/na-fleet-sync" \
   || { echo "[x] caddy: na-fleet-sync не шлёт X-Api-Key"; fail=1; }
+# секрет должен уходить файлом заголовков, а не в argv (виден в /proc/<pid>/cmdline)
+grep -qF -- '-H @"$HDRF"' "$T/sbin/na-fleet-sync" \
+  || { echo "[x] caddy: заголовки с секретом не передаются через файл (-H @…)"; fail=1; }
+grep -qF 'redact_url "$SRC"' "$T/sbin/na-fleet-sync" \
+  || { echo "[x] caddy: URL уходит в лог без зачистки userinfo"; fail=1; }
+# поведенческая проверка того же хелпера — отдельным тестом
+bash "$REPO_ROOT/tests/fleet-sync-unit.sh" >/dev/null 2>&1 \
+  || { echo "[x] fleet-sync-unit.sh не прошёл (детали: bash tests/fleet-sync-unit.sh)"; fail=1; }
+
+# ── Сейфти-откат снимает И автозагрузку правил (иначе локаут вернулся бы ребутом) ──
+grep -qF 'systemctl disable na-firewall.service' "$T/sbin/na-fw-safety-revert" \
+  || { echo "[x] safety: аварийный откат не выключает na-firewall.service"; fail=1; }
+grep -qF 'nft delete table inet na_filter' "$T/sbin/na-fw-safety-revert" \
+  || { echo "[x] safety: аварийный откат не удаляет na_filter"; fail=1; }
+
+# ── Порт текущей SSH-сессии не должен потеряться (ground truth из SSH_CONNECTION) ──
+reset_t
+LOG7="$T/apply-sshport.log"
+set +e
+SSH_CONNECTION='203.0.113.9 55000 10.0.0.5 56777' SSH_PORT=22 ENABLE_CROWDSEC=0 \
+  REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$LOG7" 2>&1
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then echo "[x] ssh-port: apply упал (exit $rc)"; tail -25 "$LOG7"; fail=1; fi
+grep -qF 'SSH-сессия пришла на :56777' "$LOG7" \
+  || { echo "[x] ssh-port: нет warn про расхождение SSH_PORT с портом сессии"; fail=1; }
+grep -q 'tcp dport { 22, 56777 }' "$NFTF" \
+  || { echo "[x] ssh-port: в ruleset должны быть ОБА порта (заданный + порт сессии)"; fail=1; }
+grep -q '^ssh_port=22,56777$' "$T/state/protect.installed" \
+  || { echo "[x] ssh-port: эффективный список портов не в маркере"; fail=1; }
+grep -q 'SSH_PORT:=22}' "$T/conf/protect.conf" \
+  || { echo "[x] ssh-port: в protect.conf должен персиститься intent (22), а не транзитный порт сессии"; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"

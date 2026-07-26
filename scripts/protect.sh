@@ -26,6 +26,8 @@
 #   SSH_RATE=6    SSH_BURST=5          per-IP новых SSH/мин до бана
 #   SSH_BAN_TIME=24h  PORTSCAN_BAN_TIME=1h
 #   ENABLE_PORTSCAN_BAN=1  ENABLE_CROWDSEC=1  ENABLE_SYNPROXY=0
+#   CROWDSEC_STRICT=0                  1 = ставить CrowdSec ТОЛЬКО из пиннингованного
+#                                      APT-репо; не поднялся — пропустить (без curl|bash)
 #   FW_MODE=strict|open|skip           strict: блок всех портов, кроме разрешённых (дефолт);
 #                                      open: защита без блокировки прочих портов (3x-ui);
 #                                      skip: nftables не трогать вообще (только CrowdSec)
@@ -39,6 +41,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 require_root
 detect_os
+
+# Один прогон protect за раз. Параллельные запуски (оркестратор из панели + руками)
+# не рвут nft-транзакцию, но перекрываются сейфти-таймером: таймер прогона A удалит
+# таблицу, которую прогон B уже применил и подтвердил. NA_NO_LOCK=1 — отключить.
+if [[ "${NA_NO_LOCK:-0}" != "1" ]] && command -v flock >/dev/null 2>&1 && mkdir -p "$STATE_DIR" 2>/dev/null; then
+    exec 9>"$STATE_DIR/protect.lock"
+    flock -n 9 || { err "уже идёт другой прогон protect.sh (лок $STATE_DIR/protect.lock) — не мешаю"; exit 1; }
+fi
+
 BACKUP="$(backup_dir)"
 
 # Подхватываем сохранённый конфиг ноды (если есть): ре-ран без ENV не сбрасывает
@@ -73,6 +84,11 @@ PORTSCAN_BAN_TIME="${PORTSCAN_BAN_TIME:-1h}"
 PORTSCAN_RATE="${PORTSCAN_RATE:-15}"; PORTSCAN_BURST="${PORTSCAN_BURST:-30}"  # /minute, per-IP
 ENABLE_PORTSCAN_BAN="${ENABLE_PORTSCAN_BAN:-1}"
 ENABLE_CROWDSEC="${ENABLE_CROWDSEC:-1}"
+# CROWDSEC_STRICT=1 — никакого curl|bash-фоллбэка: не поднялся пиннингованный репо,
+# значит CrowdSec просто не ставим. Фоллбэк форсируется атакующим (достаточно сделать
+# packagecloud недостижимым — egress-фильтр, DNS), а это подмена проверенного по
+# отпечатку APT-репо на неверифицированный код из сети, запускаемый root'ом.
+CROWDSEC_STRICT="${CROWDSEC_STRICT:-0}"
 ENABLE_SYNPROXY="${ENABLE_SYNPROXY:-0}"
 # Режим файрвола:
 #   strict — input policy drop: открыты ТОЛЬКО SSH/сервисные/node-agent порты
@@ -179,7 +195,9 @@ validate_port_list() {
     [[ "$v" =~ ^[0-9,]+$ ]] || { err "$name: '$v' — только цифры и запятые"; return 1; }
     for p in ${v//,/ }; do _is_port "$p" || { err "$name: '$p' вне 1..65535"; return 1; }; done
 }
-_is_port "$SSH_PORT"  || { err "SSH_PORT '$SSH_PORT' невалиден"; exit 1; }
+# SSH_PORT допускает список (sshd на двух портах — типичная миграция порта).
+[[ -n "$SSH_PORT" ]] || { err "SSH_PORT пуст"; exit 1; }
+validate_port_list "$SSH_PORT" SSH_PORT || exit 1
 [[ "$NODE_PORT" == "auto" ]] || validate_port_list "$NODE_PORT" NODE_PORT || exit 1
 validate_port_list "$TCP_PORTS" TCP_PORTS || exit 1
 validate_port_list "$UDP_PORTS" UDP_PORTS || exit 1
@@ -207,7 +225,7 @@ for _k in BLOCKLIST_REFRESH FLEET_SYNC_INTERVAL NA_CTG_INTERVAL; do
 done
 # enum-флаги 0/1 (+auto где уместно)
 for _k in ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY ENABLE_BANONCE \
-          ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD NA_CTG_ENFORCE; do
+          ENABLE_BLOCKLISTS BLOCK_TOR ENABLE_CTGUARD NA_CTG_ENFORCE CROWDSEC_STRICT; do
     [[ "${!_k}" =~ ^[01]$ ]] || { err "$_k='${!_k}' — ожидается 0 или 1"; exit 1; }
 done
 [[ "$NODE_PORT_WHITELIST_ONLY" =~ ^(auto|0|1)$ ]] || { err "NODE_PORT_WHITELIST_ONLY должно быть auto|0|1"; exit 1; }
@@ -220,7 +238,29 @@ fi
 if [[ -n "$REMNAWAVE_NODES_URL" && ! "$REMNAWAVE_NODES_URL" =~ ^https?://[A-Za-z0-9._~:/?#=%@-]+$ ]]; then
     err "REMNAWAVE_NODES_URL='$REMNAWAVE_NODES_URL' — ожидается http(s)://… без спецсимволов"; exit 1
 fi
+# http:// + секрет = токен уходит по проводу открытым текстом. Редирект-даунгрейд мы
+# блокируем (--proto-redir), а вот явно заданную cleartext-схему запретить нельзя
+# (бывают внутренние сети) — но молчать об этом нельзя тем более.
+if [[ -n "$CADDY_AUTH_API_TOKEN" || -n "$REMNAWAVE_TOKEN" ]]; then
+    for _u in "$REMNAWAVE_URL" "$REMNAWAVE_NODES_URL"; do
+        [[ "$_u" == http://* ]] && warn "'$_u' по http:// — токен панели/Caddy уйдёт открытым текстом. Возьми https."
+    done
+    unset _u
+fi
 unset _k
+
+# Порт ТЕКУЩЕЙ SSH-сессии — ground truth (sshd её уже принял, гадать не нужно). Если он
+# не входит в SSH_PORT (ошибка детекта, протухший protect.conf, порт меняли между
+# прогонами), strict уронил бы его в catch-all drop → после срабатывания сейфти вход
+# закрыт. Открываем ОБА + громкий warn — та же логика, что для node-port в v3.8.
+# В маркер уходит эффективный список, в protect.conf — intent оператора (SSH_PORT).
+SSH_EFF="$SSH_PORT"
+SSH_SESSION_PORT="$(ssh_session_port || true)"
+if [[ -n "$SSH_SESSION_PORT" && ",$SSH_EFF," != *",$SSH_SESSION_PORT,"* ]]; then
+    warn "твоя SSH-сессия пришла на :$SSH_SESSION_PORT, а SSH_PORT=$SSH_PORT — открываю ОБА (иначе локаут после сейфти); сверь и закрепи SSH_PORT=$SSH_SESSION_PORT"
+    SSH_EFF="$SSH_EFF,$SSH_SESSION_PORT"
+fi
+SSH_NFT="${SSH_EFF//,/, }"
 
 # Резолв NODE_PORT_WHITELIST_ONLY=auto: whitelist-only только если оператор задал
 # WHITELIST (знает доверенный набор). Пустой WHITELIST → мягкий лимит (не отрезаем панель).
@@ -274,43 +314,49 @@ ok "ok"
 
 # ─── CrowdSec: пиннингованный APT-репозиторий (supply-chain) ─────────────────
 # Вместо curl|bash с install.crowdsec.net — их packagecloud-репо с проверкой ПОЛНОГО
-# отпечатка ключа (64-битный keyid подделать дёшево). Suite нет для этой ОС (свежие
-# релизы Ubuntu/Debian) → фоллбэк на noble/bookworm; совсем не поднялся → официальный
-# установщик как last-resort (громко, warn).
+# отпечатка ключа (64-битный keyid подделать дёшево) и экспортом в keyring РОВНО этого
+# ключа (см. import_pinned_key).
+# Порядок suite-кандидатов:
+#   1. any/any — канон апстрима (их же install.crowdsec.net пишет именно его). Один
+#      набор пакетов на все дистрибутивы, Release всегда есть;
+#   2. <os>/<codename> — нативный suite, если он у них собран;
+#   3. <os>/bookworm|noble — фоллбэк для свежих релизов.
+# Почему any/any первым: под Debian 13 (trixie) suite debian/trixie у CrowdSec ПУСТОЙ —
+# нет Release-файла (upstream issues #3834/#3909), а родной пакет самого Debian 13 —
+# древний 1.4.6, который апстрим сам не рекомендует.
 CROWDSEC_FP="6A89E3C2303A901A889971D3376ED5326E93CD0C"
 setup_crowdsec_repo() {
     local keyring=/etc/apt/keyrings/crowdsec-archive-keyring.gpg
     local list=/etc/apt/sources.list.d/crowdsec.list
-    local os="$OS_ID" codename fb
+    local os="$OS_ID" codename fb tmpkey cand path suite seen="" okrepo=0
     codename="$(os_codename)"; [[ -n "$codename" ]] || codename=bookworm
+    fb=bookworm; [[ "$os" == "ubuntu" ]] && fb=noble
     mkdir -p /etc/apt/keyrings
-    if ! curl -fsSL --connect-timeout 5 --max-time 20 https://packagecloud.io/crowdsec/crowdsec/gpgkey \
-            | gpg --yes --dearmor -o "$keyring" 2>/dev/null; then
-        warn "ключ CrowdSec (packagecloud) недоступен"; rm -f "$keyring"; return 1
+    tmpkey="$(mktemp)" || return 1
+    if ! curl -fsSL --connect-timeout 5 --max-time 20 \
+            https://packagecloud.io/crowdsec/crowdsec/gpgkey -o "$tmpkey"; then
+        warn "ключ CrowdSec (packagecloud) недоступен"; rm -f "$tmpkey"; return 1
     fi
-    if ! gpg --show-keys --with-colons "$keyring" 2>/dev/null \
-            | awk -F: '/^fpr:/{print $10}' | grep -qx "$CROWDSEC_FP"; then
-        warn "отпечаток ключа CrowdSec не совпал с $CROWDSEC_FP — отказываюсь использовать"
-        rm -f "$keyring"; return 1
+    if ! import_pinned_key "$tmpkey" "$CROWDSEC_FP" "$keyring"; then
+        warn "ключ CrowdSec не сошёлся с отпечатком $CROWDSEC_FP — отказываюсь использовать"
+        rm -f "$tmpkey"; return 1
     fi
-    chmod 0644 "$keyring"
+    rm -f "$tmpkey"
     # ВАЖНО: обновляем ТОЛЬКО свой list. Глобальный `apt-get update` вернул бы rc≠0 из-за
     # ЛЮБОГО постороннего битого источника на боксе (протухший сторонний репо — типовой
     # съёмный VPS), и пиннинг ложно самоотключился бы на живом packagecloud. Скоуп через
     # Dir::Etc даёт вердикт именно о нашем репо.
     local -a UPDSC=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0)
-    echo "deb [signed-by=$keyring] https://packagecloud.io/crowdsec/crowdsec/$os $codename main" > "$list"
-    if ! apt-get update -qq "${UPDSC[@]}" 2>/dev/null; then
-        fb=bookworm; [[ "$os" == "ubuntu" ]] && fb=noble
-        if [[ "$codename" != "$fb" ]]; then
-            warn "suite '$codename' в репо CrowdSec не поднялся — пробую '$fb'"
-            echo "deb [signed-by=$keyring] https://packagecloud.io/crowdsec/crowdsec/$os $fb main" > "$list"
-            if ! apt-get update -qq "${UPDSC[@]}" 2>/dev/null; then
-                rm -f "$list"; apt-get update -qq 2>/dev/null || true; return 1
-            fi
-        else
-            rm -f "$list"; apt-get update -qq 2>/dev/null || true; return 1
-        fi
+    for cand in "any any" "$os $codename" "$os $fb"; do
+        path="${cand%% *}"; suite="${cand##* }"
+        [[ ",$seen," == *",$path/$suite,"* ]] && continue
+        seen+="${seen:+,}$path/$suite"
+        echo "deb [signed-by=$keyring] https://packagecloud.io/crowdsec/crowdsec/$path $suite main" > "$list"
+        if apt-get update -qq "${UPDSC[@]}" 2>/dev/null; then okrepo=1; break; fi
+        warn "репо CrowdSec '$path $suite' не поднялся — пробую следующий вариант"
+    done
+    if [[ "$okrepo" != "1" ]]; then
+        rm -f "$list"; apt-get update -qq 2>/dev/null || true; return 1
     fi
     # общий кэш подтянуть (наш list валиден); чужие битые источники тут не фатальны
     apt-get update -qq 2>/dev/null || true
@@ -331,14 +377,34 @@ if [[ "${CROWDSEC_PROBE:-0}" == "1" ]]; then
 fi
 
 # ─── Сейфти-таймер: если потеряем SSH — снести нашу таблицу через N сек ───────
+# Действие сработавшей подстраховки. Снимает и живую таблицу, И автозагрузку правил.
+# Почему второе обязательно: раньше сейфти удалял ТОЛЬКО таблицу, а na-firewall.service
+# оставался enabled — доступ возвращался, оператор видел живой бокс и уходил, а ПЕРВЫЙ
+# ЖЕ ребут применял тот самый локаут-руллсет заново, теперь уже без всякого сейфти.
+write_safety_revert() {
+    cat > /usr/local/sbin/na-fw-safety-revert <<'SREV'
+#!/bin/sh
+# na-fw-safety-revert — аварийный откат файрвола (ставится protect.sh, снимается rollback).
+/usr/sbin/nft delete table inet na_filter 2>/dev/null
+systemctl disable na-firewall.service >/dev/null 2>&1
+mkdir -p /var/lib/node-accelerator 2>/dev/null
+date +%s > /var/lib/node-accelerator/safety-fired.last 2>/dev/null
+rm -f /var/lib/node-accelerator/na-fw-safety.pid 2>/dev/null
+logger -t na-fw-safety "СЕЙФТИ СРАБОТАЛ: na_filter удалена, автозагрузка правил выключена — защиты сейчас НЕТ, нужен повторный прогон protect"
+exit 0
+SREV
+    chmod +x /usr/local/sbin/na-fw-safety-revert
+}
+
 arm_safety() {
     [[ "$DRY_RUN" == "1" ]] && return 0
     title "Подстраховка от блокировки"
-    warn "Если SSH отвалится — таблица na_filter удалится через ${SAFETY_DELAY}s (доступ вернётся)."
+    warn "Если SSH отвалится — через ${SAFETY_DELAY}s na_filter удалится И автозагрузка правил выключится (доступ вернётся, в т.ч. после ребута)."
+    write_safety_revert
     if command -v systemd-run >/dev/null 2>&1; then
         systemctl stop na-fw-safety.timer 2>/dev/null || true
         systemd-run --quiet --unit=na-fw-safety --on-active="${SAFETY_DELAY}s" \
-            /usr/sbin/nft delete table inet na_filter >/dev/null 2>&1 \
+            /usr/local/sbin/na-fw-safety-revert >/dev/null 2>&1 \
             && { ok "safety: systemd-таймер na-fw-safety на ${SAFETY_DELAY}s"; return 0; }
     fi
     # fallback (нет systemd-run): nohup-таймер. Стейт в $STATE_DIR (root-only), НЕ в общей
@@ -347,7 +413,7 @@ arm_safety() {
     mkdir -p "$STATE_DIR"
     local pidf="$STATE_DIR/na-fw-safety.pid" logf="$STATE_DIR/na-fw-safety.log"
     [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; }
-    nohup sh -c 'sleep "$1"; /usr/sbin/nft delete table inet na_filter 2>/dev/null; rm -f "$2"' \
+    nohup sh -c 'sleep "$1"; /usr/local/sbin/na-fw-safety-revert 2>/dev/null; rm -f "$2"' \
         _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 &
     echo $! > "$pidf"
     ok "safety: nohup pid $(cat "$pidf")"
@@ -668,20 +734,20 @@ fi
 # SSH connect-flood: с ban-once (suspect→confirmed) или прямой бан.
 if [[ "$ENABLE_BANONCE" == "1" ]]; then
     SSH_RULES="        # SSH connect-flood (ban-once): перебор → 1-й раз suspect+drop, 2-й в окне → бан ${SSH_BAN_TIME}
-        tcp dport ${SSH_PORT} ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport ${SSH_PORT} ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport ${SSH_PORT} ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
-        tcp dport ${SSH_PORT} ct state new ip saddr @suspect_v4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport ${SSH_PORT} ct state new ip6 saddr @suspect_v6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport ${SSH_PORT} ct state new meta nfproto ipv4 add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} } drop
-        tcp dport ${SSH_PORT} ct state new meta nfproto ipv6 add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} } drop"
+        tcp dport { ${SSH_NFT} } ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport { ${SSH_NFT} } ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport { ${SSH_NFT} } ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
+        tcp dport { ${SSH_NFT} } ct state new ip saddr @suspect_v4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
+        tcp dport { ${SSH_NFT} } ct state new ip6 saddr @suspect_v6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
+        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv4 add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} } drop
+        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv6 add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} } drop"
 else
     SSH_RULES="        # SSH connect-flood: >${SSH_RATE}/мин новых с одного IP → бан ${SSH_BAN_TIME}
-        tcp dport ${SSH_PORT} ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport ${SSH_PORT} ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport ${SSH_PORT} ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
-        tcp dport ${SSH_PORT} ct state new meta nfproto ipv4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport ${SSH_PORT} ct state new meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop"
+        tcp dport { ${SSH_NFT} } ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport { ${SSH_NFT} } ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
+        tcp dport { ${SSH_NFT} } ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
+        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
+        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop"
 fi
 
 WL4_LINE=""; [[ -n "$WL4" ]] && WL4_LINE="elements = { $WL4 }"
@@ -848,6 +914,8 @@ fi
 arm_safety
 nft -f "$NFT_FILE"
 ok "nftables na_filter применён"
+# новый руллсет применён → прошлое срабатывание сейфти больше не актуально
+rm -f "$STATE_DIR/safety-fired.last" 2>/dev/null || true
 
 # boot-persist через свой сервис (не трогаем /etc/nftables.conf и чужие таблицы)
 cat > /etc/systemd/system/na-firewall.service <<EOF
@@ -875,7 +943,7 @@ fi
 systemctl daemon-reload
 systemctl enable na-firewall.service >/dev/null 2>&1 || true
 systemctl enable nftables >/dev/null 2>&1 || true
-ok "na-firewall.service включён (правила переживут reboot)"
+ok "na-firewall.service включён (правила переживут reboot — если не сработает сейфти-таймер: он теперь снимает и автозагрузку)"
 
 fi  # ═══ конец блока файрвола (FW_MODE=skip его пропускает) ═══
 
@@ -886,10 +954,14 @@ if [[ "$ENABLE_CROWDSEC" == "1" ]]; then
         info "Подключаю APT-репозиторий CrowdSec (пиннингованный ключ $CROWDSEC_FP)…"
         if setup_crowdsec_repo; then
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec >/dev/null 2>&1 || warn "crowdsec не установился"
+        elif [[ "$CROWDSEC_STRICT" == "1" ]]; then
+            warn "пиннингованный репо CrowdSec не поднялся, CROWDSEC_STRICT=1 → CrowdSec пропущен (curl|bash-фоллбэк запрещён)"
         else
             # last-resort: официальный установщик. -fsSL (а не -s): при HTTP-ошибке/
-            # редиректе curl падает, а не отдаёт HTML в bash.
-            warn "пиннингованный репо не поднялся — fallback на официальный установщик (curl|bash)"
+            # редиректе curl падает, а не отдаёт HTML в bash. Осознанный компромисс:
+            # достаточно СДЕЛАТЬ packagecloud недостижимым (egress-фильтр/DNS), чтобы
+            # сюда свалиться — кто параноит, ставит CROWDSEC_STRICT=1.
+            warn "пиннингованный репо не поднялся — fallback на официальный установщик (curl|bash; отключается CROWDSEC_STRICT=1)"
             curl -fsSL https://install.crowdsec.net | bash >/dev/null 2>&1 || warn "install.crowdsec.net недоступен"
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq crowdsec >/dev/null 2>&1 || warn "crowdsec не установился"
         fi
@@ -1016,8 +1088,15 @@ CADDY="${CADDY_AUTH_API_TOKEN:-}"
 command -v curl >/dev/null 2>&1 || { logger -t "$TAG" "нет curl"; exit 1; }
 nft list set inet na_filter na_fleet_v4 >/dev/null 2>&1 || { logger -t "$TAG" "сет na_fleet нет (protect без fleet) — выкл"; exit 0; }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-CURL_CADDY=()
-[ -n "$CADDY" ] && CURL_CADDY=(-H "X-Api-Key: $CADDY")
+# Секреты уходят в ФАЙЛ заголовков (внутри 0700-каталога), а не в argv: аргументы
+# процесса видны всей системе через /proc/<pid>/cmdline на всё время запроса.
+HDRF="$TMP/hdr"
+: > "$HDRF"; chmod 600 "$HDRF"
+[ -n "$CADDY" ] && printf 'X-Api-Key: %s\n' "$CADDY" >> "$HDRF"
+# В journald пишем URL без userinfo: README сам предлагает закрывать статический список
+# basic-auth'ом (https://user:pass@host/nodes.json), а лог читает кто угодно с доступом
+# к journalctl — пароль там жил бы вечно и повторялся каждый тик синка.
+redact_url() { printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1***@#'; }
 # curl срезает Authorization на кросс-хост редиректе, но кастомный X-Api-Key — НЕТ:
 # с -L токен Caddy утёк бы на хост-цель редиректа. При заданном токене редиректы НЕ
 # следуем (оператор задаёт финальный https-URL сам). Без токена -L оставляем, но
@@ -1026,14 +1105,17 @@ FS_REDIR=(-L --max-redirs 3)
 [ -n "$CADDY" ] && FS_REDIR=(--max-redirs 0)
 if [ -n "$NURL" ]; then
     SRC="$NURL"
+    CURL_HDR=()
+    [ -s "$HDRF" ] && CURL_HDR=(-H @"$HDRF")
     HTTP="$(curl -fsS "${FS_REDIR[@]}" --proto-redir '=https' --max-time 15 -o "$TMP/r" -w '%{http_code}' \
-            "${CURL_CADDY[@]}" "$NURL" 2>/dev/null || true)"
+            "${CURL_HDR[@]}" "$NURL" 2>/dev/null || true)"
 else
     command -v jq >/dev/null 2>&1 || { logger -t "$TAG" "нет jq (нужен для /api/nodes)"; exit 1; }
     URL="${URL%/}"; SRC="$URL/api/nodes"
+    printf 'Authorization: Bearer %s\n' "$TOKEN" >> "$HDRF"
+    printf 'Accept: application/json\n' >> "$HDRF"
     HTTP="$(curl -fsS --max-time 15 -o "$TMP/r" -w '%{http_code}' \
-            -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" \
-            "${CURL_CADDY[@]}" "$SRC" 2>/dev/null || true)"
+            -H @"$HDRF" "$SRC" 2>/dev/null || true)"
 fi
 [ "$HTTP" = "200" ] && [ -s "$TMP/r" ] || { logger -t "$TAG" "источник недоступен (HTTP=$HTTP) — last-known-good"; exit 0; }
 : > "$TMP/addr"
@@ -1070,7 +1152,7 @@ n4=$(printf '%s' "$V4" | tr ',' '\n' | grep -c . || true)
 n6=$(printf '%s' "$V6" | tr ',' '\n' | grep -c . || true)
 if nft -f "$TMP/upd.nft" 2>/dev/null; then
     mkdir -p /var/lib/node-accelerator && date +%s > "$STAMP"
-    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + ${n6} v6 (из $SRC)"
+    logger -t "$TAG" "whitelist нод обновлён: ${n4} v4 + ${n6} v6 (из $(redact_url "$SRC"))"
 else
     logger -t "$TAG" "nft apply не прошёл — last-known-good сохранён"
 fi
@@ -1382,7 +1464,7 @@ installed_at=$(date -Is)
 na_version=$NA_VERSION
 backup=$BACKUP
 fw_mode=$FW_MODE
-ssh_port=$SSH_PORT
+ssh_port=$SSH_EFF
 tcp_ports=$TCP_PORTS
 udp_ports=$UDP_PORTS
 node_port=$NP_EFF
@@ -1400,8 +1482,9 @@ save_conf "$CONF_DIR/protect.conf" \
     SYN_RATE SYN_BURST UDP_RATE UDP_BURST CONN_LIMIT \
     ICMP_RATE ICMP_BURST SSH_RATE SSH_BURST SSH_BAN_TIME \
     PORTSCAN_BAN_TIME PORTSCAN_RATE PORTSCAN_BURST \
-    ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC ENABLE_SYNPROXY \
+    ENABLE_PORTSCAN_BAN ENABLE_CROWDSEC CROWDSEC_STRICT ENABLE_SYNPROXY \
     ENABLE_BLOCKLISTS BLOCK_TOR BLOCKLIST_REFRESH ENABLE_BANONCE SUSPECT_TIME \
+    FLEET_SYNC FLEET_SYNC_INTERVAL \
     NODE_PORT_WHITELIST_ONLY NODE_PORT_LAST NODE_PORT_AUTOWL NODE_PORT_PEERS SAFETY_DELAY \
     ENABLE_CTGUARD NA_CTG_ENFORCE NA_CTG_PHANTOM_MIN NA_CTG_LIVE_FLOOR \
     NA_CTG_COARSE_MULT NA_CTG_BANTIME NA_CTG_INTERVAL

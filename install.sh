@@ -13,8 +13,11 @@
 # curl-bash:
 #   curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/install.sh | sudo bash -s all
 #   # прод: пиньте тег (компрометация ветки main тогда не утечёт сразу на весь флот):
-#   export NA_REF=v3.9.1; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+#   export NA_REF=v3.9.2; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 #   # + подписи модулей: NA_REQUIRE_SIG=1 NA_MINISIGN_PUBKEY=<ключ из README>
+#
+# ENV: NA_REF=<ветка|тег>  NA_REPO_URL=<база raw-URL, для форка/зеркала>
+#      NA_REQUIRE_SIG=1 + NA_MINISIGN_PUBKEY=<pubkey> | NA_SIG_FINGERPRINT=<gpg-fpr>
 #
 # После optimize/protect/all на ноде остаётся read-only команда `na-diagnose --json`
 # (стабильный JSON для мониторинга/панели — без повторного curl|bash). Снимается rollback'ом.
@@ -30,19 +33,48 @@ NA_REF="${NA_REF:-main}"
 [[ "$NA_REF" =~ ^[A-Za-z0-9._/-]+$ && "$NA_REF" != *..* ]] || { echo "[x] NA_REF '$NA_REF' невалиден"; exit 1; }
 REPO_URL="${NA_REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF}"
 
+# Справка. В curl|bash-режиме $0 = "bash" (файла нет) — `sed по $0` там просто падал
+# с ошибкой вместо вывода помощи, поэтому есть встроенный фоллбэк. Обрабатываем ДО
+# скачивания модулей и require_root: за справкой не должно требоваться ни root, ни сеть.
+usage() {
+    if [[ -f "$0" ]]; then
+        sed -n '2,24p' "$0"
+    else
+        cat <<'U'
+node-accelerator — ⚡ оптимизатор + 🩺 диагностика + 🛡 защита Remnawave/VPN-ноды.
+
+  install.sh                        — меню
+  install.sh optimize               — ⚡ XanMod+BBRv3 + тюнинг
+  install.sh protect                — 🛡 nftables + CrowdSec
+  install.sh diagnose [--json|…]    — 🩺 диагностика (read-only)
+  install.sh all                    — optimize → protect → diagnose
+  install.sh rollback [optimize|protect|all]
+  install.sh persist                — (пере)создать CLI na-diagnose/na-report
+
+  ENV: NA_REF=<ветка|тег>  NA_REPO_URL=<база raw-URL>
+       NA_REQUIRE_SIG=1 + NA_MINISIGN_PUBKEY=<pubkey> | NA_SIG_FINGERPRINT=<gpg-fpr>
+  Документация: https://github.com/jestivald/node-accelerator
+U
+    fi
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+
 # Опц. проверка подписи модулей в curl|bash-режиме (supply-chain hardening). По умолч.
 # выкл. NA_REQUIRE_SIG=1 + minisign-ключ (NA_MINISIGN_PUBKEY) ИЛИ GPG-отпечаток
 # (NA_SIG_FINGERPRINT) → каждый модуль проверяется против .minisig/.asc рядом в репо.
 NA_REQUIRE_SIG="${NA_REQUIRE_SIG:-0}"
 NA_MINISIGN_PUBKEY="${NA_MINISIGN_PUBKEY:-}"
 NA_SIG_FINGERPRINT="${NA_SIG_FINGERPRINT:-}"
+# Скачиваем строго по https и НЕ разрешаем редиректу увести на cleartext http:
+# по умолчанию curl такой даунгрейд-редирект молча выполняет.
+CURL_PROTO=(--proto '=https' --proto-redir '=https')
 verify_sig() {  # verify_sig <файл> <url-без-расширения>
     local file="$1" url="$2"
     if [[ -n "$NA_MINISIGN_PUBKEY" ]] && command -v minisign >/dev/null 2>&1; then
-        curl -fsSL "$url.minisig" -o "$file.minisig" 2>/dev/null || { echo "[x] нет .minisig для $(basename "$file")"; return 1; }
+        curl -fsSL "${CURL_PROTO[@]}" "$url.minisig" -o "$file.minisig" 2>/dev/null || { echo "[x] нет .minisig для $(basename "$file")"; return 1; }
         minisign -V -P "$NA_MINISIGN_PUBKEY" -m "$file" >/dev/null 2>&1
     elif [[ -n "$NA_SIG_FINGERPRINT" ]] && command -v gpg >/dev/null 2>&1; then
-        curl -fsSL "$url.asc" -o "$file.asc" 2>/dev/null || { echo "[x] нет .asc для $(basename "$file")"; return 1; }
+        curl -fsSL "${CURL_PROTO[@]}" "$url.asc" -o "$file.asc" 2>/dev/null || { echo "[x] нет .asc для $(basename "$file")"; return 1; }
         # Судим по МАШИННОМУ статусу (--status-fd), а НЕ по человекочитаемому выводу:
         # `gpg --verify | grep <fpr>` матчил бы 'using RSA key <fpr>' — эта строка
         # печатается из пакета подписи ДАЖЕ для BAD-подписи, а exit-код терялся в пайпе
@@ -60,7 +92,7 @@ if [[ ! -d "$SCRIPTS" ]]; then
     SCRIPTS="$(mktemp -d)/scripts"; mkdir -p "$SCRIPTS/lib"
     echo "[*] Скачиваю модули из $REPO_URL ..."
     for f in lib/common.sh optimize.sh protect.sh diagnose.sh na-report.sh rollback.sh; do
-        curl -fsSL "$REPO_URL/scripts/$f" -o "$SCRIPTS/$f" || { echo "[x] Не скачал $f"; exit 1; }
+        curl -fsSL "${CURL_PROTO[@]}" "$REPO_URL/scripts/$f" -o "$SCRIPTS/$f" || { echo "[x] Не скачал $f"; exit 1; }
         if [[ "$NA_REQUIRE_SIG" == "1" ]]; then
             verify_sig "$SCRIPTS/$f" "$REPO_URL/scripts/$f" \
                 && echo "[+] подпись $f валидна" \
@@ -159,6 +191,6 @@ case "${1:-}" in
     rollback) run_rollback "${2:-all}" ;;
     persist)  persist_toolkit ;;
     "")       show_menu ;;
-    -h|--help) sed -n '2,20p' "$0" ;;
-    *) err "Неизвестная команда: $1"; sed -n '2,20p' "$0"; exit 1 ;;
+    -h|--help) usage ;;
+    *) err "Неизвестная команда: $1"; usage; exit 1 ;;
 esac
