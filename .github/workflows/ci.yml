@@ -112,9 +112,12 @@ jobs:
           OUT="$(SSH_CONNECTION='203.0.113.9 55000 10.0.0.5 56777' SSH_PORT=22 \
                  DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh)"
           echo "$OUT" | grep -q 'SSH-сессия пришла на :56777' || { echo "порт SSH-сессии не подхвачен"; exit 1; }
-          grep -q 'tcp dport { 22, 56777 }' /etc/node-accelerator/na_filter.nft \
-            || { echo "в ruleset нет обоих SSH-портов"; exit 1; }
-          echo "ok: порт сессии добавлен в ruleset"
+          # в DRY_RUN ruleset генерится во временный файл (/tmp/na_filter.XXXXXX.nft),
+          # а не в $CONF_DIR — берём самый свежий
+          F="$(ls -t /tmp/na_filter.*.nft 2>/dev/null | head -1)"
+          [ -n "$F" ] || { echo "не найден сгенерированный ruleset"; exit 1; }
+          grep -q 'tcp dport { 22, 56777 }' "$F" || { echo "в ruleset ($F) нет обоих SSH-портов"; exit 1; }
+          echo "ok: порт сессии добавлен в ruleset ($F)"
       - name: diagnose.sh (read-only, не должен падать жёстко)
         run: bash scripts/diagnose.sh || true
       - name: diagnose.sh --json (machine-readable smoke)
