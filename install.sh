@@ -13,7 +13,7 @@
 # curl-bash:
 #   curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/install.sh | sudo bash -s all
 #   # прод: пиньте тег (компрометация ветки main тогда не утечёт сразу на весь флот):
-#   export NA_REF=v4.1.3; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+#   export NA_REF=v4.2; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 #   # + подписи модулей: NA_REQUIRE_SIG=1 NA_MINISIGN_PUBKEY=<ключ из README>
 #
 # ENV: NA_REF=<ветка|тег>  NA_REPO_URL=<база raw-URL, для форка/зеркала>

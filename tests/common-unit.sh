@@ -172,16 +172,16 @@ cat > "$T/bin2/docker" <<'DK'
 # три контейнера: свой агент (образ по digest, host-сеть), второй тенант (bridge, тот же
 # внутренний порт), агент третьего тенанта (host-сеть, свой порт)
 case "$*" in
-  "ps -a --format {{.Names}}") printf 'remnanode\nreka-remnanode\nremnanode-dbn\nnginx\n' ;;
+  "ps -a --format {{.Names}}") printf 'remnanode\ntenant2-remnanode\nremnanode-t3\nnginx\n' ;;
   "inspect -f {{.Config.Image}} remnanode") echo 'remnawave/node@sha256:0cdf386dd49f' ;;
-  "inspect -f {{.Config.Image}} reka-remnanode") echo 'remnawave/node:3.4.1' ;;
-  "inspect -f {{.Config.Image}} remnanode-dbn") echo 'remnawave/node:latest' ;;
+  "inspect -f {{.Config.Image}} tenant2-remnanode") echo 'remnawave/node:3.4.1' ;;
+  "inspect -f {{.Config.Image}} remnanode-t3") echo 'remnawave/node:latest' ;;
   "inspect -f {{.Config.Image}} nginx") echo 'nginx:alpine' ;;
   "inspect -f {{.HostConfig.NetworkMode}} remnanode") echo host ;;
-  "inspect -f {{.HostConfig.NetworkMode}} reka-remnanode") echo reka-node ;;
-  "inspect -f {{.HostConfig.NetworkMode}} remnanode-dbn") echo host ;;
-  *"{{range .Config.Env}}"*remnanode-dbn) printf 'NODE_PORT=2322\n' ;;
-  *"{{range .Config.Env}}"*reka-remnanode) printf 'NODE_PORT=9999\n' ;;
+  "inspect -f {{.HostConfig.NetworkMode}} tenant2-remnanode") echo tenant2-net ;;
+  "inspect -f {{.HostConfig.NetworkMode}} remnanode-t3") echo host ;;
+  *"{{range .Config.Env}}"*remnanode-t3) printf 'NODE_PORT=2322\n' ;;
+  *"{{range .Config.Env}}"*tenant2-remnanode) printf 'NODE_PORT=9999\n' ;;
   *"{{range .Config.Env}}"*remnanode) printf 'NODE_PORT=2222\n' ;;
   *) exit 1 ;;
 esac
