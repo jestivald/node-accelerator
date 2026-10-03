@@ -270,7 +270,7 @@ if [[ "$ENABLE_XANMOD" == "1" ]]; then
         else
             warn "Архитектура $(arch) — XanMod только под x86_64. Пропускаю ядро."
         fi
-    elif uname -r | grep -q xanmod; then
+    elif [[ "$(uname -r)" == *xanmod* ]]; then
         ok "XanMod уже стоит ($(uname -r)) — обновляю только репозиторий (чтобы шли апдейты ядра)"
         setup_xanmod_repo || warn "репозиторий XanMod не обновлён (само ядро не тронуто)"
     else
@@ -480,7 +480,7 @@ echo "tcp_bbr"      > /etc/modules-load.d/na-bbr.conf
 echo "nf_conntrack" > /etc/modules-load.d/na-conntrack.conf
 sysctl --system >/dev/null 2>&1 || true
 
-if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -qx bbr; then
+if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
     ok "BBR активен (под XanMod это BBRv3)"
 else
     warn "BBR пока не активен — модуль/ядро подхватятся после reboot"
@@ -728,7 +728,7 @@ swap_size_mb() {   # "2G" / "512M" / "2048" → мегабайты (для dd-ф
 make_swapfile() {
     local size="${REMNAWAVE_SWAP_SIZE:-2G}" mb
     mb="$(swap_size_mb "$size")"
-    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+    if [[ $'\n'"$(swapon --show=NAME --noheadings 2>/dev/null)"$'\n' == *$'\n'/swapfile$'\n'* ]]; then
         info "/swapfile уже активен — пропускаю"; return 0
     fi
     if ! fallocate -l "$size" /swapfile 2>/dev/null; then
@@ -748,7 +748,7 @@ make_swapfile() {
     mkdir -p "$STATE_DIR" && date -Is > "$STATE_DIR/swapfile.created"
     ok "Создан /swapfile $size"
 }
-if swapon --show 2>/dev/null | grep -q .; then
+if [[ -n "$(swapon --show 2>/dev/null)" ]]; then
     info "Swap уже есть — пропускаю"
 elif [[ "$TIER" -le 2 && "$SETUP_NO_ZRAM" != "1" ]] && modprobe zram 2>/dev/null; then
     cat > /usr/local/sbin/na-zram-setup <<'ZR'
@@ -756,7 +756,7 @@ elif [[ "$TIER" -le 2 && "$SETUP_NO_ZRAM" != "1" ]] && modprobe zram 2>/dev/null
 # zram-swap ~50% RAM (lz4). Идемпотентно: если наш zram-swap уже активен — выходим.
 set -e
 modprobe zram 2>/dev/null || exit 0
-swapon --show=NAME --noheadings 2>/dev/null | grep -q '/dev/zram' && exit 0
+case "$(swapon --show=NAME --noheadings 2>/dev/null)" in *"/dev/zram"*) exit 0;; esac
 SIZE="$(awk '/^MemTotal:/{printf "%d", $2*1024/2}' /proc/meminfo 2>/dev/null)"
 [ -n "$SIZE" ] || exit 0
 DEV="$(zramctl --find --size "$SIZE" --algorithm lz4 2>/dev/null || zramctl --find --size "$SIZE" 2>/dev/null || true)"
@@ -780,7 +780,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now na-zram.service >/dev/null 2>&1 || true
-    if swapon --show 2>/dev/null | grep -q zram; then
+    if [[ "$(swapon --show 2>/dev/null)" == *zram* ]]; then
         ok "zram-swap включён ($(swapon --show=NAME,SIZE --noheadings 2>/dev/null | grep zram | tr '\n' ' '))"
     else
         warn "zram не поднялся — fallback на /swapfile"
@@ -1065,6 +1065,7 @@ backup=$BACKUP
 nic=${NIC:-none}
 xanmod=$([[ -f "$STATE_DIR/xanmod.pkg" ]] && cat "$STATE_DIR/xanmod.pkg" || echo none)
 reboot_needed=$REBOOT_NEEDED
+boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
 psi=$PSI_MARK
 EOF
 

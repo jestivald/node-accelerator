@@ -48,7 +48,7 @@ mkdir -p "$BIN" "$NFTD" "$SSD" \
          "$T/sys/class/net/eth0/queues/rx-0" "$T/sys/class/net/eth0/statistics" \
          "$T/sys/kernel/mm/transparent_hugepage" \
          "$T/opt/selfsteal/certs/node.example.test" \
-         "$T/proc/net" "$T/proc/sys/net/netfilter" \
+         "$T/proc/net" "$T/proc/sys/net/netfilter" "$T/proc/sys/kernel/random" \
          "$T/root/.acme.sh/retired.example.test"
 
 KREL="6.18.47-x64v3-xanmod1"
@@ -61,12 +61,17 @@ export JSTART
 # без этого тест читал бы живой /proc/pressure раннера и результат зависел бы от того,
 # с каким ядром собран CI.
 cp -R "$REPO_ROOT/scripts" "$T/scripts"
+# /proc/sys/… уводим через метку: иначе правило для /sys/ срабатывало ВНУТРИ уже
+# подставленного $T/proc/sys/… и ломало путь (до v4.1.3 так молча не читались
+# nf_conntrack_count и boot_id песочницы).
 sandbox_paths() {
     sed -i.bak \
         -e "s#/var/lib/node-accelerator#$T/var/lib/node-accelerator#g" \
         -e "s#/etc/node-accelerator#$T/etc/node-accelerator#g" \
+        -e "s#/proc/sys/#@@PROCSYS@@#g" \
         -e "s#/proc/#$T/proc/#g" \
         -e "s#/sys/#$T/sys/#g" \
+        -e "s#@@PROCSYS@@#$T/proc/sys/#g" \
         -e "s#/boot/config-#$T/boot/config-#g" \
         -e "s#/var/log#$T/var/log#g" \
         -e "s#/var/lib/docker#$T/var/lib/docker#g" \
@@ -89,7 +94,9 @@ DIAG="$T/scripts/diagnose.sh"
 printf 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nID=debian\n' > "$T/etc/os-release"
 
 # ── Фикстуры /proc, /sys, /boot ───────────────────────────────────────────────
-printf 'cpu  100 0 50 900 0 0 0 0 0 0\n' > "$T/proc/stat"
+# btime = 2026-09-02 00:00 UTC — загрузка ПОЗЖЕ installed_at старого маркера optimize
+printf 'cpu  100 0 50 900 0 0 0 0 0 0\nbtime 1788307200\n' > "$T/proc/stat"
+printf 'boot-current\n' > "$T/proc/sys/kernel/random/boot_id"
 printf '99999.00 88888.00\n'             > "$T/proc/uptime"
 printf '0.05 0.10 0.15 1/200 1234\n'     > "$T/proc/loadavg"
 printf 'MemTotal:  2048000 kB\nMemAvailable: 1024000 kB\n' > "$T/proc/meminfo"
@@ -222,10 +229,15 @@ DOC
 cat > "$BIN/nft" <<'NFTS'
 #!/bin/sh
 case "$*" in
+  "-t list table inet na_filter") [ -f "$NFTD/terse" ] && cat "$NFTD/terse"; exit 0 ;;
   "list table inet na_filter")   exit 0 ;;
   "list table inet na_ctguard")  exit 1 ;;
   "list table ip crowdsec")      exit 1 ;;
   "list chain inet na_filter input") cat "$NFTD/chain-input"; exit 0 ;;
+  "list meter inet "*)
+      all="$*"; s=${all##* }
+      if [ -f "$NFTD/meter-$s" ]; then cat "$NFTD/meter-$s"; exit 0; fi
+      echo "Error: No such file or directory" >&2; exit 1 ;;
   "list set inet "*)
       # ${*##* } раскрывается по КАЖДОМУ параметру, а не по склейке — берём имя набора
       # через промежуточную переменную
@@ -266,7 +278,14 @@ CS
 cat > "$BIN/journalctl" <<'JC'
 #!/bin/sh
 case "$*" in
-  *--help*)          echo "  -g --grep=PATTERN     Show entries with MESSAGE matching PATTERN"; exit 0 ;;
+  *--help*)
+      echo "  -g --grep=PATTERN     Show entries with MESSAGE matching PATTERN"
+      # NA_TEST_BIG_HELP: справка больше буфера пайпа — `| grep -q` закрыл бы пайп на
+      # первой строке, и следующая запись словила бы SIGPIPE (141 под pipefail)
+      if [ "${NA_TEST_BIG_HELP:-0}" = 1 ]; then
+          i=0; while [ "$i" -lt 6000 ]; do echo "  --filler-option-$i   long help text line to overflow the pipe buffer"; i=$((i+1)); done
+      fi
+      exit 0 ;;
   *short-unix*)      printf '%s.000000 node kernel: Linux version\n' "$JSTART"; exit 0 ;;
   *"na portscan"*)   printf 'a\nb\nc\n'; exit 0 ;;
 esac
@@ -291,6 +310,12 @@ SC
 # `-d` по пустому conf в песочнице → тишина, дубликатов нет.
 cat > "$BIN/logrotate" <<'LR'
 #!/bin/sh
+# NA_TEST_LR_DUP: дубликат в НАЧАЛЕ большого вывода `logrotate -d` — ровно тот случай,
+# когда grep -q закрывал пайп раньше, чем logrotate дописывал (SIGPIPE → «дублей нет»)
+if [ "$1" = "-d" ] && [ "${NA_TEST_LR_DUP:-0}" = 1 ]; then
+    echo "error: na-node-logs:1 duplicate log entry for /var/log/nginx/access.log"
+    i=0; while [ "$i" -lt 6000 ]; do echo "considering log /var/log/filler-$i.log"; i=$((i+1)); done
+fi
 exit 0
 LR
 
@@ -350,6 +375,7 @@ if [ "$1" = "-d" ]; then
     case "$2" in
       *GOOD*)    echo $(( now + 60*86400 )) ;;
       *RETIRED*) echo $(( now + 3*86400 )) ;;
+      2026-09-01T00:00:00+00:00) echo 1788220800 ;;   # installed_at старого маркера optimize
       *) exit 1 ;;
     esac
     exit 0
@@ -491,6 +517,127 @@ printf '/var/log/remnanode/*.log\n' > "$LRSTATE/logrotate.owned"
 env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" > "$T/out7c.txt" 2>/dev/null || true
 grep_ok  "текст: станса на месте → ✔ с перечнем масок" "часовой таймер активен, станса на месте (/var/log/remnanode/*.log)" "$T/out7c.txt"
 rm -f "$LRSTATE/logrotate.owned"
+
+echo "== 8. SIGPIPE под pipefail: большой вывод не гасит сенсоры (v4.1.3) =="
+for i in 1 2 3; do
+    env TERM=dumb NA_TEST_BIG_HELP=1 "$WBASH" "$DIAG" --json > "$T/out8.json" 2>/dev/null || true
+    check "portscan_log_lines_boot=3 при справке journalctl > буфера пайпа (прогон $i)" 3 "$(jget "$T/out8.json" portscan_log_lines_boot)"
+done
+env TERM=dumb NA_TEST_LR_DUP=1 "$WBASH" "$DIAG" > "$T/out8.txt" 2>/dev/null || true
+grep_ok "дубликат в большом выводе logrotate -d найден" "logrotate: дубликат путей" "$T/out8.txt"
+
+echo "== 9. наборы-лимитеры: без timeout копят адреса, на 100% режут клиентов (v4.1.3) =="
+mk_elems() { local n="$1" i out=""; for ((i=1; i<=n; i++)); do out+="${out:+, }198.18.$((i/250)).$((i%250+1))"; done; printf '%s' "$out"; }
+mk_set() {   # mk_set <имя> <size> <flags> <timeout|""> <число элементов> <set|meter>
+    local to_line=""; [[ -n "$4" ]] && to_line="\t\ttimeout $4\n"
+    printf "table inet na_filter {\n\t%s %s {\n\t\ttype ipv4_addr\n\t\tsize %s\n\t\tflags %s\n${to_line}\t\telements = { %s }\n\t}\n}\n" \
+        "$6" "$1" "$2" "$3" "$(mk_elems "$5")" > "$NFTD/$6-$1"
+}
+# nft 1.1.3, правила ≤4.1.2: syn4_443 — бывший meter, виден как набор БЕЗ timeout (85 из 100);
+# autoban_v4 — dynamic,timeout БЕЗ строки timeout (срок на каждой записи) и почти полон:
+# это НЕ лимитер, его считать нельзя; cc4_443 — ct count, ядро чистит само.
+cat > "$NFTD/terse" <<'TERSE'
+table inet na_filter {
+	set whitelist_v4 {
+		type ipv4_addr
+		flags interval
+	}
+	set autoban_v4 {
+		type ipv4_addr
+		size 100
+		flags dynamic,timeout
+	}
+	set syn4_443 {
+		type ipv4_addr
+		size 100
+		flags dynamic
+	}
+	set cc4_443 {
+		type ipv4_addr
+		size 65535
+		flags dynamic
+	}
+}
+TERSE
+mk_set syn4_443 100 dynamic "" 85 set
+mk_set autoban_v4 100 dynamic,timeout "" 95 set
+mk_set cc4_443 65535 dynamic "" 99 set
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9.json" 2>/dev/null || true
+check "json: dynset_fill_max_pct=85 (autoban не лимитер)" 85 "$(jget "$T/out9.json" dynset_fill_max_pct)"
+check "json: dynset_fill_max_set=syn4_443"  syn4_443 "$(jget "$T/out9.json" dynset_fill_max_set)"
+check "json: dynset_no_timeout=1 (autoban и cc4 не в счёт)" 1 "$(jget "$T/out9.json" dynset_no_timeout)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/out9.txt" 2>/dev/null || true
+grep_ok "текст: ✘ legacy-набор почти полон"  "наборы-лимитеры без timeout (1 шт., правила ≤4.1.2) заполнены до 85%" "$T/out9.txt"
+
+# nft 1.0.6, правила ≤4.1.2: meter анонимный — в -t есть только внутри правила
+cat > "$NFTD/terse" <<'TERSE'
+table inet na_filter {
+	set autoban_v4 {
+		type ipv4_addr
+		size 65536
+		flags dynamic,timeout
+	}
+	chain input {
+		type filter hook input priority filter; policy drop;
+		tcp dport 443 ct state new meter cc4_443 size 65535 { ip saddr ct count over 2048 } drop
+		tcp dport 443 ct state new meter syn4_443 size 100 { ip saddr limit rate 200/second burst 400 packets } accept
+		tcp dport 443 ct state new drop
+	}
+}
+TERSE
+rm -f "$NFTD/set-syn4_443"
+mk_set syn4_443 100 dynamic "" 90 meter
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9n.json" 2>/dev/null || true
+check "nft 1.0.6: meter из правила виден, 90%"   90 "$(jget "$T/out9n.json" dynset_fill_max_pct)"
+check "nft 1.0.6: meter считается без timeout"   1 "$(jget "$T/out9n.json" dynset_no_timeout)"
+rm -f "$NFTD/meter-syn4_443"
+
+# v4.1.3: лимитер с timeout (10 из 100) → ✔, autoban на 95% тревоги не поднимает
+cat > "$NFTD/terse" <<'TERSE'
+table inet na_filter {
+	set autoban_v4 {
+		type ipv4_addr
+		size 100
+		flags dynamic,timeout
+	}
+	set syn4_443 {
+		type ipv4_addr
+		size 100
+		flags dynamic,timeout
+		timeout 60s
+	}
+}
+TERSE
+mk_set syn4_443 100 dynamic,timeout 60s 10 set
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9b.json" 2>/dev/null || true
+check "json: с timeout dynset_no_timeout=0"  0 "$(jget "$T/out9b.json" dynset_no_timeout)"
+check "json: заполнение 10%"                 10 "$(jget "$T/out9b.json" dynset_fill_max_pct)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/out9b.txt" 2>/dev/null || true
+grep_ok "текст: ✔ лимитеры с timeout"         "наборы-лимитеры с timeout, максимум заполнения 10%" "$T/out9b.txt"
+rm -f "$NFTD/terse" "$NFTD/set-syn4_443" "$NFTD/set-cc4_443"
+mk_set autoban_v4 65536 dynamic,timeout "" 0 set; rm -f "$NFTD/set-autoban_v4"
+set_fixture autoban_v4 '203.0.113.10 timeout 1d expires 1h11m50s608ms, 203.0.113.11 timeout 1d expires 2h'
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9c.json" 2>/dev/null || true
+check "json: наборов нет → dynset_fill_max_pct=-1" -1 "$(jget "$T/out9c.json" dynset_fill_max_pct)"
+
+echo "== 10. reboot_needed — по факту загрузки, а не вечный маркер (v4.1.3) =="
+OPTM="$T/var/lib/node-accelerator/optimize.installed"
+printf 'installed_at=2026-10-03T10:00:00+00:00\nreboot_needed=1\nboot_id=boot-current\n' > "$OPTM"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out10.json" 2>/dev/null || true
+check "тот же boot_id → ребута не было → true" true "$(jget "$T/out10.json" reboot_needed)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/out10.txt" 2>/dev/null || true
+grep_ok "текст: ▲ ждёт перезагрузки" "а перезагрузки с тех пор не было" "$T/out10.txt"
+printf 'installed_at=2026-10-03T10:00:00+00:00\nreboot_needed=1\nboot_id=boot-before\n' > "$OPTM"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out10b.json" 2>/dev/null || true
+check "другой boot_id → ребут был → false" false "$(jget "$T/out10b.json" reboot_needed)"
+# маркер ≤4.1.2 без boot_id: установка 01.09, загрузка (btime) 02.09 → ребут был
+printf 'installed_at=2026-09-01T00:00:00+00:00\nreboot_needed=1\n' > "$OPTM"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out10c.json" 2>/dev/null || true
+check "старый маркер, btime > installed_at → false" false "$(jget "$T/out10c.json" reboot_needed)"
+printf 'reboot_needed=1\n' > "$OPTM"   # без boot_id и installed_at — верим маркеру, как раньше
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out10d.json" 2>/dev/null || true
+check "маркер без дат → как раньше, true" true "$(jget "$T/out10d.json" reboot_needed)"
+rm -f "$OPTM"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"
