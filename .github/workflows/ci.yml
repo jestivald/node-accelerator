@@ -166,8 +166,10 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - "debian:bullseye"   # nft 0.9.8 — в README заявлен, в матрице не было
-          - "ubuntu:20.04"      # focal, nft 0.9.3 — то же
+          # focal: самый старый nft из заявленных (0.9.3). Debian 11 (nft 0.9.8) вне LTS: в
+          # образе пакеты из debian-security, а пул security без файлов из индексов (404, и
+          # в snapshot тоже) — apt не ставит даже git; синтаксис покрывает focal.
+          - "ubuntu:20.04"
           - "debian:bookworm"
           - "debian:trixie"
           - "ubuntu:22.04"   # jammy → подменяется на bookworm
@@ -181,16 +183,7 @@ jobs:
       options: --privileged
     steps:
       - name: Install git (нужен checkout) + базовые сертификаты
-        run: |
-          . /etc/os-release
-          if [ "${VERSION_CODENAME:-}" = bullseye ]; then
-            # Debian 11 вне LTS: индексы debian-security на deb.debian.org ссылаются на файлы,
-            # которых в пуле уже нет (404), а без security образ (пакеты из него уже стоят)
-            # не ставит git — «held broken packages». Берём согласованный срез snapshot.
-            S=20260920T000000Z
-            printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bullseye main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s bullseye-security main\n' "$S" "$S" > /etc/apt/sources.list
-          fi
-          apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends git ca-certificates
       # SHA-пин: плавающий тег v4 может быть перенесён на другой коммит
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - name: Prep container + runtime-зависимости

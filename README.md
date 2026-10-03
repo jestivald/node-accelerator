@@ -5,7 +5,7 @@
 Оптимизация, диагностика и защита VPN-ноды (Remnawave / Xray / VLESS-Reality, xHTTP, Hysteria2/TUIC).
 Три модуля, все идемпотентны, всё откатывается одной командой.
 
-> **Поддержка:** Debian 11/12/13, Ubuntu 20.04–26.04. Тестируется на нодах с `network_mode: host`.
+> **Поддержка:** Debian 11/12/13, Ubuntu 20.04–26.04 (CI: Debian 12/13 и Ubuntu 20.04–26.04; Debian 11 вне LTS в CI не гоняется — самый старый nft, 0.9.3, покрывает Ubuntu 20.04). Тестируется на нодах с `network_mode: host`.
 
 ---
 
