@@ -18,6 +18,8 @@
 #   NA_LOG_MAXSIZE=200M  NA_LOG_ROTATE=4  NA_LOG_INTERVAL=hourly
 #   NA_JOURNAL_MAX_USE=300M  потолок journald (публичную ноду 300M держат <суток)
 #   ENABLE_PSI=0      дописать psi=1 в cmdline → /proc/pressure (нужен reboot; 1 = вкл)
+#   NA_XPS=0          XPS (раскладка TX-очередей по CPU): 0 — не трогать, её задаёт драйвер
+#   NA_BOOT_MIN_MB=200  минимум свободного места в /boot для установки ядра XanMod
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # при любом выходе, включая Ctrl-C, чтобы не оставить терминал с невидимым курсором.
 # tty_tput, а не голый tput: tput решает по TERM, а не по isatty(1), и под
 # `nohup … > log` управляющие последовательности уезжали в лог раскатки (issue #28).
-trap 'tty_tput cnorm' EXIT
+# Заодно убираем недописанные кандидаты sysctl-файлов (секция 3), если прогон оборвался.
+trap 'tty_tput cnorm; rm -f "${SYSCTL_NEW:-}" "${SYSCTL_CT_NEW:-}" 2>/dev/null || true' EXIT
 trap 'tty_tput cnorm; exit 130' INT
 
 require_root
@@ -76,6 +79,8 @@ ENABLE_XANMOD="${ENABLE_XANMOD:-1}"
 XANMOD_FLAVOR="${XANMOD_FLAVOR:-lts}"
 BACKUP="$(backup_dir)"
 REBOOT_NEEDED=0
+# Непусто = ядро поставлено, но проверка готовности к загрузке не прошла (причина).
+XANMOD_RISK=""
 # Причин ребута теперь может быть две (ядро и psi=1 в cmdline) — копим текстом,
 # чтобы в финале не обещать «установлено новое ядро» там, где его не ставили.
 REBOOT_WHY=""
@@ -196,6 +201,93 @@ xanmod_candidates() {
     esac
 }
 
+# ─── Предполётные проверки ядра ──────────────────────────────────────────────
+# XanMod не подписан ключом дистрибутива: при включённом UEFI Secure Boot shim откажется
+# его грузить, и после ребута нода не поднимется (на облаке без консоли — до тикета
+# хостеру). Тесный /boot — та же беда тише: postinst не дописывает initrd, а GRUB уже
+# выбрал новое ядро. В обоих случаях ядро пропускаем: остальной тюнинг от него не зависит.
+NA_SB_EFIVAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+NA_BOOT_MIN_MB="${NA_BOOT_MIN_MB:-200}"
+[[ "$NA_BOOT_MIN_MB" =~ ^[0-9]+$ ]] || NA_BOOT_MIN_MB=200
+secure_boot_on() {
+    local st b
+    if command -v mokutil >/dev/null 2>&1; then
+        st="$(mokutil --sb-state 2>/dev/null || true)"
+        case "$st" in
+            *"SecureBoot enabled"*)  return 0 ;;
+            *"SecureBoot disabled"*) return 1 ;;
+        esac
+    fi
+    # efivar без mokutil: 4 байта атрибутов, затем байт значения (1 = включён)
+    [[ -r "$NA_SB_EFIVAR" ]] || return 1
+    b="$(od -An -t u1 -j4 -N1 "$NA_SB_EFIVAR" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$b" == 1 ]]
+}
+# Свободно в /boot, МБ (/boot не отдельным разделом — df покажет корень). Пусто = не измерить.
+boot_free_mb() { df -Pm /boot 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
+xanmod_preflight() {
+    local fr
+    if secure_boot_on; then
+        warn "UEFI Secure Boot включён: ядро XanMod не подписано ключом дистрибутива, shim его не загрузит — после ребута нода не поднимется. Ядро пропускаю, остальной тюнинг продолжается (нужен XanMod — выключи Secure Boot в прошивке/панели хостера)"
+        return 1
+    fi
+    fr="$(boot_free_mb)"
+    if [[ "$fr" =~ ^[0-9]+$ ]] && (( fr < NA_BOOT_MIN_MB )); then
+        warn "/boot: свободно ${fr} МБ (нужно ≥ ${NA_BOOT_MIN_MB}): ядро и initrd XanMod могут не поместиться, а недописанный initrd — незагружаемая нода. Ядро пропускаю, остальной тюнинг продолжается (освободить: apt-get autoremove --purge — старые ядра)"
+        return 1
+    fi
+    return 0
+}
+
+# Версия ядра, которую принёс мета-пакет XanMod: Depends → linux-image-<версия>.
+# Фоллбэк — самый свежий по времени vmlinuz XanMod в /boot.
+xanmod_kver() {
+    local v
+    v="$(dpkg-query -W -f='${Depends}' "$1" 2>/dev/null | grep -oE 'linux-image-[^ ,()|]+' | head -1 || true)"
+    v="${v#linux-image-}"
+    if [[ -z "$v" ]]; then
+        # shellcheck disable=SC2012  # имена ядер без пробелов; нужна сортировка по mtime
+        v="$(ls -1t /boot/vmlinuz-*xanmod* 2>/dev/null | head -1 || true)"
+        v="${v#/boot/vmlinuz-}"
+    fi
+    [[ -n "$v" ]] && echo "$v"
+}
+# Драйвер NIC по sysfs: …/device/driver → ../../bus/virtio/drivers/virtio_net.
+nic_driver() {
+    local d; d="$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null || true)"
+    [[ -n "$d" ]] && basename "$d"
+}
+# xanmod_postcheck <версия> <NIC> — поднимется ли новое ядро с сетью: initrd собран, а
+# драйвер текущего NIC есть в /lib/modules/<версия> модулем или встроенным. Ядро без
+# драйвера сетевой карты загрузится — и оставит ноду без сети. stdout — причины, rc=1.
+xanmod_postcheck() {
+    local v="$1" nic="${2:-}" drv alt found why=""
+    if [[ ! -s "/boot/initrd.img-$v" ]]; then
+        # оборванный postinst (место, kill) — одна попытка собрать initrd заново
+        if command -v update-initramfs >/dev/null 2>&1; then
+            update-initramfs -c -k "$v" >/dev/null 2>&1 || true
+        fi
+        [[ -s "/boot/initrd.img-$v" ]] || why+="нет /boot/initrd.img-$v; "
+    fi
+    if [[ ! -d "/lib/modules/$v" ]]; then
+        why+="нет /lib/modules/$v; "
+    elif [[ -n "$nic" ]]; then
+        drv="$(nic_driver "$nic" || true)"
+        if [[ -n "$drv" ]]; then
+            found=0
+            for alt in "$drv" "${drv//_/-}" "${drv//-/_}"; do
+                # модулем (любое сжатие: .ko/.ko.xz/.ko.zst) или встроенным в ядро
+                if [[ -n "$(find "/lib/modules/$v" -name "$alt.ko*" -print -quit 2>/dev/null)" ]]; then found=1; break; fi
+                if grep -qE "/${alt}\.ko(\.[a-z]+)?\$" "/lib/modules/$v/modules.builtin" 2>/dev/null; then found=1; break; fi
+            done
+            [[ "$found" == 1 ]] || why+="драйвера NIC $nic ($drv) нет в /lib/modules/$v ни модулем, ни встроенным; "
+        fi
+    fi
+    [[ -z "$why" ]] && return 0
+    printf '%s' "${why%; }"
+    return 1
+}
+
 install_xanmod() {
     setup_xanmod_repo || return 1
     info "psABI уровень CPU: x86-64-v$(cpu_psabi_level), сборка: $XANMOD_FLAVOR"
@@ -239,7 +331,19 @@ install_xanmod() {
 
     mkdir -p "$STATE_DIR"; echo "$pkg" > "$STATE_DIR/xanmod.pkg"
     update-grub >/dev/null 2>&1 || true
-    ok "XanMod установлен: $pkg (активируется ПОСЛЕ перезагрузки)"
+    # «Нужна перезагрузка» обещаем, только убедившись, что новое ядро поднимет ноду:
+    # GRUB уже выбрал его по умолчанию, и ошибку увидят только после ребута.
+    local kv why
+    kv="$(xanmod_kver "$pkg" || true)"
+    if [[ -z "$kv" ]]; then
+        XANMOD_RISK="версия ядра пакета $pkg не определена — initrd и драйвер NIC не проверены (ls /boot/initrd.img-*xanmod* /lib/modules)"
+        warn "XanMod установлен: $pkg, но $XANMOD_RISK"
+    elif why="$(xanmod_postcheck "$kv" "$(default_iface || true)")"; then
+        ok "XanMod установлен: $pkg (ядро $kv: initrd и драйвер NIC на месте; активируется ПОСЛЕ перезагрузки)"
+    else
+        XANMOD_RISK="$why"
+        warn "XanMod установлен: $pkg ($kv), но к загрузке НЕ готов: $why"
+    fi
     REBOOT_NEEDED=1
     REBOOT_WHY="${REBOOT_WHY:+$REBOOT_WHY; }новое ядро XanMod ($pkg)"
     return 0
@@ -273,7 +377,7 @@ if [[ "$ENABLE_XANMOD" == "1" ]]; then
     elif [[ "$(uname -r)" == *xanmod* ]]; then
         ok "XanMod уже стоит ($(uname -r)) — обновляю только репозиторий (чтобы шли апдейты ядра)"
         setup_xanmod_repo || warn "репозиторий XanMod не обновлён (само ядро не тронуто)"
-    else
+    elif xanmod_preflight; then
         install_xanmod || warn "XanMod не установлен — продолжаю с текущим ядром"
     fi
 else
@@ -361,8 +465,79 @@ QDISC="${QDISC:-fq}"
 # overcommit: на tier1 (≤1.2G) heuristic (0) безопаснее агрессивного always-overcommit (1).
 OVERCOMMIT=1; [[ "$TIER" -le 1 ]] && OVERCOMMIT=0
 info "RAM-tier $TIER (~${_mem_mb} MB): sock_max=$SOCK_MAX def=$SOCK_DEF ecn=$TCP_ECN_MODE tfo=$TFO_VAL overcommit=$OVERCOMMIT qdisc=$QDISC"
-backup_file /etc/sysctl.d/99-node-accelerator.conf "$BACKUP"
-cat > /etc/sysctl.d/99-node-accelerator.conf <<SYSCTL
+
+SYSCTL_FILE=/etc/sysctl.d/99-node-accelerator.conf
+SYSCTL_CT_FILE=/etc/sysctl.d/99-node-accelerator-conntrack.conf
+# Снимок исходных runtime-значений наших ключей — для отката без ребута. Только при
+# ПЕРВОМ применении: на ре-ране в ядре уже наши значения, и «исходными» записались бы они.
+SYSCTL_ORIG="$STATE_DIR/sysctl.orig"
+SYSCTL_FIRST=0
+[[ ! -f "$SYSCTL_FILE" && ! -f "$SYSCTL_ORIG" ]] && SYSCTL_FIRST=1
+
+# ─── Порты ноды в эфемерном диапазоне ────────────────────────────────────────
+# ip_local_port_range ниже = 10000-65535, и в него попадают порты самой ноды: API xray
+# на 127.0.0.1:10085, inbound'ы на высоких портах. Исходящее соединение может занять такой
+# порт раньше, чем xray его забиндит (рестарт контейнера под нагрузкой) — «address already
+# in use», нода без inbound'а. На флоте порты резервировали руками. Собираем LISTEN-порты
+# процессов ноды (ВКЛЮЧАЯ loopback) и порт node-агента и резервируем, не затирая того, что
+# оператор зарезервировал сам.
+NA_EPH_LO=10000; NA_EPH_HI=65535   # = net.ipv4.ip_local_port_range в файле ниже
+NA_RESV_STATE="$STATE_DIR/reserved-ports.na"
+# port_in_list <порт> <список «a,b-c»> — порт покрыт списком (числом или диапазоном)?
+port_in_list() {
+    local p="$1" t
+    for t in ${2//,/ }; do
+        [[ "$t" =~ ^[0-9]+(-[0-9]+)?$ ]] || continue
+        if [[ "$t" == *-* ]]; then
+            (( p >= ${t%-*} && p <= ${t#*-} )) && return 0
+        elif (( p == t )); then
+            return 0
+        fi
+    done
+    return 1
+}
+# LISTEN-порты процессов ноды (xray / rw-core / rw-node; TCP и UDP — диапазон общий) +
+# порт node-агента. По строке на порт.
+na_node_listen_ports() {
+    { ss -Htlnp 2>/dev/null; ss -Hulnp 2>/dev/null; } \
+        | awk '/users:\(\("(xray|rw-core|rw-node)"/ { la = $4; sub(/.*:/, "", la); if (la ~ /^[0-9]+$/) print la }' || true
+    detect_node_port 2>/dev/null | tr ',' '\n' || true
+}
+# Итоговый ip_local_reserved_ports (NA_RESV_LIST): резерв оператора (текущее значение
+# минус то, что ставили мы прошлым прогоном — иначе порт, с которого xray давно ушёл, жил
+# бы вечно) + порты ноды в эфемерном диапазоне. В NA_RESV_OURS — только наши. Зовётся
+# БЕЗ $(…): обе переменные — результат, подоболочка их бы потеряла.
+NA_RESV_OURS=""; NA_RESV_LIST=""
+na_reserved_ports() {
+    local prev="" cur t p list=""
+    prev="$(cat "$NA_RESV_STATE" 2>/dev/null || true)"
+    cur="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+    for t in ${cur//,/ }; do
+        [[ "$t" =~ ^[0-9]+(-[0-9]+)?$ ]] || continue
+        [[ ",$prev," == *",$t,"* ]] && continue
+        list+="${list:+,}$t"
+    done
+    NA_RESV_OURS=""
+    for p in $(na_node_listen_ports | sort -un); do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        (( p >= NA_EPH_LO && p <= NA_EPH_HI )) || continue
+        port_in_list "$p" "$list" && continue
+        list+="${list:+,}$p"; NA_RESV_OURS+="${NA_RESV_OURS:+,}$p"
+    done
+    # ядро печатает список отсортированным — пишем так же, чтобы сверка ниже не спотыкалась
+    NA_RESV_LIST=""
+    [[ -n "$list" ]] && NA_RESV_LIST="$(printf '%s\n' "${list//,/$'\n'}" | sort -t- -k1,1n | paste -sd, -)"
+    return 0
+}
+na_reserved_ports
+
+backup_file "$SYSCTL_FILE" "$BACKUP"
+backup_file "$SYSCTL_CT_FILE" "$BACKUP"
+# Пишем во временный файл рядом (не *.conf — sysctl --system его не прочтёт): снимок
+# исходных значений нужно снять ДО того, как наш файл начнёт действовать.
+SYSCTL_NEW="$(mktemp /etc/sysctl.d/.na-sysctl.XXXXXX)"
+SYSCTL_CT_NEW="$(mktemp /etc/sysctl.d/.na-sysctl-ct.XXXXXX)"
+cat > "$SYSCTL_NEW" <<SYSCTL
 # === node-accelerator / optimize (RAM-tier $TIER, ~${_mem_mb} MB) ===
 
 # --- Network core ---
@@ -414,10 +589,13 @@ net.ipv4.ip_local_port_range      = 10000 65535
 net.ipv4.udp_rmem_min             = 16384
 net.ipv4.udp_wmem_min             = 16384
 
-# --- IP forwarding (XRay/VLESS в network_mode: host + Docker) ---
+# --- IP forwarding (Docker bridge-сети) ---
+# Только IPv4. net.ipv6.conf.all.forwarding=1 переводит ядро в режим роутера: при
+# accept_ra=1 оно перестаёт принимать RA, и на хостах с ядерным SLAAC v6 default route
+# истекает через router lifetime — нода молча теряет IPv6. xray в host-network форвардинг
+# не нужен вовсе, а Docker с IPv6 включает v6-форвардинг сам при старте демона.
 net.ipv4.ip_forward               = 1
 net.ipv4.conf.all.forwarding      = 1
-net.ipv6.conf.all.forwarding      = 1
 
 # --- Conntrack: timeout здесь (tunable CT_EST_TIMEOUT); ёмкость (max/buckets) —
 # отдельным drop-in ниже, масштабируется от RAM (99-node-accelerator-conntrack.conf),
@@ -459,6 +637,14 @@ fs.nr_open                    = 2097152
 fs.inotify.max_user_watches   = 524288
 fs.inotify.max_user_instances = 8192
 SYSCTL
+if [[ -n "$NA_RESV_LIST" ]]; then
+    cat >> "$SYSCTL_NEW" <<SYSCTL
+
+# --- Порты ноды внутри ip_local_port_range: эфемерные исходящие их не займут ---
+# (резерв оператора сохранён; наши — ${NA_RESV_OURS:-нет})
+net.ipv4.ip_local_reserved_ports = $NA_RESV_LIST
+SYSCTL
+fi
 
 # Ёмкость conntrack под RAM ноды: ~320 B на запись, держим таблицу ≤ ~1/8 RAM, чтобы
 # под флудом мелкая VPS не упёрлась в OOM ядра. Потолок 2M, пол 262144 (как было).
@@ -467,7 +653,7 @@ CT_MAX=$(( _mem_kb * 1024 / 8 / 320 ))
 [[ "$CT_MAX" -gt 2000000 ]] && CT_MAX=2000000
 [[ "$CT_MAX" -lt 262144  ]] && CT_MAX=262144
 CT_BUCKETS=$(( CT_MAX / 4 ))
-cat > /etc/sysctl.d/99-node-accelerator-conntrack.conf <<CT
+cat > "$SYSCTL_CT_NEW" <<CT
 # node-accelerator: ёмкость conntrack под RAM этой ноды (~$(( _mem_kb / 1024 )) MB)
 net.netfilter.nf_conntrack_max     = $CT_MAX
 net.netfilter.nf_conntrack_buckets = $CT_BUCKETS
@@ -476,9 +662,117 @@ info "conntrack: max=$CT_MAX buckets=$CT_BUCKETS (под ~$(( _mem_kb / 1024 )) 
 
 modprobe tcp_bbr 2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
+
+# sysctl_keys <файл…> — «ключ<TAB>значение» по строкам sysctl-файла (комментарии мимо).
+sysctl_keys() {
+    awk '
+        /^[[:space:]]*([#;]|$)/ { next }
+        { line = $0; sub(/^[[:space:]]*-/, "", line); i = index(line, "="); if (!i) next
+          k = substr(line, 1, i - 1); gsub(/[[:space:]]/, "", k); gsub(/\//, ".", k)
+          v = substr(line, i + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+          print k "\t" v }' "$@" 2>/dev/null
+}
+if [[ "$SYSCTL_FIRST" == 1 ]]; then
+    mkdir -p "$STATE_DIR"
+    {
+        # ip_local_reserved_ports — всегда: даже если сейчас нечего резервировать, ре-ран
+        # может начать его писать, а откат должен вернуть значение оператора
+        { sysctl_keys "$SYSCTL_NEW" "$SYSCTL_CT_NEW" | cut -f1; echo net.ipv4.ip_local_reserved_ports; } \
+            | sort -u | while IFS= read -r _k; do
+                [[ -e "/proc/sys/${_k//.//}" ]] || continue
+                _v="$(sysctl -n "$_k" 2>/dev/null)" || continue
+                printf '%s\t%s\n' "$_k" "$_v"
+            done
+    } > "$SYSCTL_ORIG.tmp" 2>/dev/null && mv -f "$SYSCTL_ORIG.tmp" "$SYSCTL_ORIG" || rm -f "$SYSCTL_ORIG.tmp"
+    [[ -s "$SYSCTL_ORIG" ]] && info "снимок исходных значений sysctl: $SYSCTL_ORIG (для отката без ребута)"
+fi
+chmod 0644 "$SYSCTL_NEW" "$SYSCTL_CT_NEW"
+mv -f "$SYSCTL_NEW" "$SYSCTL_FILE"
+mv -f "$SYSCTL_CT_NEW" "$SYSCTL_CT_FILE"
 echo "tcp_bbr"      > /etc/modules-load.d/na-bbr.conf
 echo "nf_conntrack" > /etc/modules-load.d/na-conntrack.conf
 sysctl --system >/dev/null 2>&1 || true
+# Своих портов больше нет, а прошлым прогоном мы их резервировали — `sysctl --system`
+# ключ, который никто не задаёт, не сбрасывает: возвращаем значение оператора руками.
+if [[ -z "$NA_RESV_LIST" && -s "$NA_RESV_STATE" && -w /proc/sys/net/ipv4/ip_local_reserved_ports ]]; then
+    printf '\n' > /proc/sys/net/ipv4/ip_local_reserved_ports 2>/dev/null || true
+fi
+if [[ -n "$NA_RESV_OURS" ]]; then
+    mkdir -p "$STATE_DIR"; printf '%s\n' "$NA_RESV_OURS" > "$NA_RESV_STATE"
+    ok "ip_local_reserved_ports: порты ноды $NA_RESV_OURS вынесены из эфемерного диапазона (итог: $NA_RESV_LIST)"
+else
+    rm -f "$NA_RESV_STATE"
+    info "ip_local_reserved_ports: портов ноды в эфемерном диапазоне не нашёл (xray ещё не запущен? ре-ран optimize после старта ноды)"
+fi
+
+# ─── Сверка: действуют ли НАШИ значения ──────────────────────────────────────
+# Файл, который сортируется позже нашего (99-tuning.conf > 99-node-accelerator.conf),
+# молча перебивает ключи — на ноде флота так буферы урезались до 16M, а optimize печатал
+# «применено». Сверяем ядро с нашими файлами и называем виновника.
+# sysctl_conf_order — файлы в порядке применения (последний, задавший ключ, побеждает):
+# как у systemd-sysctl и `sysctl --system` — по ИМЕНИ через все каталоги, одноимённый в
+# /etc перекрывает /run и /usr/lib; /etc/sysctl.conf procps дочитывает последним.
+sysctl_conf_order() {
+    local out="" d f b
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        out="$(systemd-analyze cat-config sysctl.d 2>/dev/null | sed -nE 's|^# (/[^ ]+\.conf)$|\1|p' || true)"
+    fi
+    if [[ -z "$out" ]]; then
+        local -A seen=()
+        for d in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+            for f in "$d"/*.conf; do
+                [[ -f "$f" ]] || continue
+                b="${f##*/}"; [[ -n "${seen[$b]:-}" ]] || seen[$b]="$f"
+            done
+        done
+        out="$(for b in "${!seen[@]}"; do printf '%s\t%s\n' "$b" "${seen[$b]}"; done | LC_ALL=C sort | cut -f2-)"
+    fi
+    printf '%s\n' "$out"
+    [[ -f /etc/sysctl.conf ]] && echo /etc/sysctl.conf
+    return 0
+}
+# sysctl_winner <ключ> — «файл<TAB>значение» последнего файла, задающего ключ.
+sysctl_winner() {
+    local k="$1" f kv w="" wv=""
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        kv="$(sysctl_keys "$f" | awk -F'\t' -v k="$k" '$1 == k { v = $2; n = 1 } END { if (n) print v; else exit 1 }')" || continue
+        w="$f"; wv="$kv"
+    done < <(sysctl_conf_order)
+    [[ -n "$w" ]] && printf '%s\t%s\n' "$w" "$wv"
+    return 0
+}
+_sy_norm() { tr -s '[:space:]' ' ' <<<"$1" | sed -E 's/^ //; s/ $//'; }
+sysctl_verify() {
+    local f k want have win wf wv nb="" p ok_all=1 miss
+    for f in "$@"; do
+        [[ -f "$f" ]] || continue
+        while IFS=$'\t' read -r k want; do
+            # BBR — своё сообщение ниже; ключа нет в этом ядре — сверять нечего
+            [[ "$k" == net.ipv4.tcp_congestion_control ]] && continue
+            [[ -e "/proc/sys/${k//.//}" ]] || continue
+            have="$(_sy_norm "$(sysctl -n "$k" 2>/dev/null || true)")"; want="$(_sy_norm "$want")"
+            [[ "$have" == "$want" ]] && continue
+            if [[ "$k" == net.ipv4.ip_local_reserved_ports ]]; then
+                # ядро сливает соседние порты в диапазон — сверяем покрытие, а не строку
+                miss=""
+                for p in ${want//,/ }; do port_in_list "${p%-*}" "$have" && port_in_list "${p#*-}" "$have" || miss+=" $p"; done
+                [[ -z "$miss" ]] && continue
+            fi
+            ok_all=0
+            win="$(sysctl_winner "$k")"; wf="${win%%$'\t'*}"; wv="${win#*$'\t'}"
+            if [[ -n "$wf" && "$wf" != "$f" ]]; then
+                warn "sysctl $k = ${have:-?}, а $f ставит $want — перебивает $wf (применяется позже${wv:+: $wv}). Осознанно — оставь; иначе убери ключ оттуда"
+            else
+                nb+="${nb:+, }$k=${have:-?} (ждали $want)"
+            fi
+        done < <(sysctl_keys "$f")
+    done
+    [[ -n "$nb" ]] && warn "sysctl: не применились (ядро/контейнер не дал записать?): $nb"
+    [[ "$ok_all" == 1 ]] && ok "sysctl: значения наших файлов действуют (перебивающих файлов нет)"
+    return 0
+}
+sysctl_verify "$SYSCTL_FILE" "$SYSCTL_CT_FILE"
 
 if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
     ok "BBR активен (под XanMod это BBRv3)"
@@ -521,10 +815,36 @@ title "RPS/RFS/XPS (масштабирование приёма пакетов �
 # в ExecStart юнита RPS — на буте default route появляется ПОЗЖЕ network-online.target,
 # и автодетект в этот момент пуст (issue #30). Секция 6 берёт уже готовое значение.
 NIC="$(default_iface || true)"
+NA_XPS="${NA_XPS:-0}"
+[[ "$NA_XPS" =~ ^[01]$ ]] || { warn "NA_XPS='$NA_XPS' — ожидается 0|1, беру 0"; NA_XPS=0; }
+# Снимок исходных масок очередей — при ПЕРВОМ применении (хелпера ещё нет): откат
+# возвращает их без ребута, а хелпер — когда RPS на этой ноде не нужен. На ре-ране в
+# sysfs уже наши маски, и «исходными» записались бы они.
+RPS_ORIG="$STATE_DIR/rps-orig.tsv"
+if [[ ! -e /usr/local/sbin/na-rps-setup && ! -f "$RPS_ORIG" ]]; then
+    mkdir -p "$STATE_DIR"
+    for _q in /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/rx-*/rps_flow_cnt \
+              /sys/class/net/*/queues/tx-*/xps_cpus; do
+        [[ -r "$_q" ]] || continue
+        case "$_q" in /sys/class/net/lo/*|/sys/class/net/veth*|/sys/class/net/docker*|/sys/class/net/br-*) continue;; esac
+        _v="$(cat "$_q" 2>/dev/null)" || continue
+        # `[[ -z ]] ||`, а не `[[ -n ]] &&`: пустое значение у последней очереди дало бы
+        # циклу rc=1, и снимок молча выбросился бы вместо записи
+        [[ -z "$_v" ]] || printf '%s\t%s\n' "$_q" "$_v"
+    done > "$RPS_ORIG.tmp" 2>/dev/null && mv -f "$RPS_ORIG.tmp" "$RPS_ORIG" || rm -f "$RPS_ORIG.tmp"
+    unset _q _v
+fi
 cat > /usr/local/sbin/na-rps-setup <<'RPS'
 #!/usr/bin/env bash
-# Включает Receive/Transmit Packet Steering на основном интерфейсе.
+# Включает Receive Packet Steering на основном интерфейсе (XPS — только с NA_XPS=1).
 # На virtio/single-queue VPS весь RX-softirq иначе висит на cpu0 — это потолок PPS.
+#
+# RPS нужен не везде. На 1 vCPU размазывать нечего, а когда RX-очередей не меньше, чем
+# ядер, приём уже раскидан аппаратно (RSS): программный RPS поверх него только гоняет
+# пакеты между CPU (на ноде флота — NIC с 12 аппаратными очередями). Там RPS не
+# включаем, а маски прошлых версий возвращаем к исходным (снимок optimize) или к 0.
+# XPS по умолчанию не трогаем вовсе: раскладку TX-очередей по CPU задаёт драйвер
+# (virtio/ena — очередь на ядро), а маска «все CPU» её затирала.
 #
 # Почему тут ожидание маршрута и два фолбэка: network-online.target на буте
 # достигается РАНЬШЕ, чем в таблице появляется default route (гонка с dhcpcd, та же,
@@ -535,6 +855,9 @@ cat > /usr/local/sbin/na-rps-setup <<'RPS'
 set -u
 want="${1:-}"
 sysdir=/sys/class/net
+orig=/var/lib/node-accelerator/rps-orig.tsv
+# orig_val <путь sysfs> — значение из снимка optimize (rc=1 — снимка/записи нет)
+orig_val() { [ -r "$orig" ] && awk -F'\t' -v p="$1" '$1 == p { v = $2; n = 1 } END { if (n) print v; else exit 1 }' "$orig"; }
 
 nics=""
 # 1) Интерфейс, определённый при установке. После смены ядра он мог переименоваться
@@ -546,7 +869,9 @@ else
     # 2) Ждём default route до ~20 с: сеть на буте поднимается позже юнита.
     i=0
     while [ "$i" -lt 20 ]; do
-        nics="$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+        # токен после `dev`, а не $5: `default dev venet0 scope link` (OpenVZ) и multipath
+        nics="$(ip -o -4 route show default 2>/dev/null \
+                | awk '!f { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); f = 1; break } }')"
         if [ -n "$nics" ]; then break; fi
         i=$((i + 1))
         sleep 1
@@ -575,16 +900,36 @@ echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
 applied=0
 for NIC in $nics; do
     [ -d "$sysdir/$NIC" ] || continue
-    for q in "$sysdir/$NIC"/queues/rx-*; do
-        [ -e "$q/rps_cpus" ] && echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
-        [ -e "$q/rps_flow_cnt" ] && echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
-    done
-    for q in "$sysdir/$NIC"/queues/tx-*; do
-        [ -e "$q/xps_cpus" ] && echo "$mask" > "$q/xps_cpus" 2>/dev/null || true
-    done
-    # Эта строка — маркер успеха в журнале: её отсутствие в `journalctl -u na-rps`
-    # означает, что RPS не применён, чем бы ни рапортовал статус юнита.
-    echo "na-rps: NIC=$NIC mask=$mask cpus=$ncpu"
+    rxq=0
+    for q in "$sysdir/$NIC"/queues/rx-*; do [ -e "$q" ] && rxq=$((rxq + 1)); done
+    if [ "$ncpu" -le 1 ] || [ "$rxq" -ge "$ncpu" ]; then
+        for q in "$sysdir/$NIC"/queues/rx-*; do
+            [ -e "$q/rps_cpus" ] && { orig_val "$q/rps_cpus" || echo 0; } > "$q/rps_cpus" 2>/dev/null || true
+            [ -e "$q/rps_flow_cnt" ] && { orig_val "$q/rps_flow_cnt" || echo 0; } > "$q/rps_flow_cnt" 2>/dev/null || true
+        done
+        # Маркер успеха: RPS сознательно не включён (а не «не применился»).
+        echo "na-rps: NIC=$NIC rps=off rxq=$rxq cpus=$ncpu (RSS/1 CPU — RPS не нужен)"
+    else
+        for q in "$sysdir/$NIC"/queues/rx-*; do
+            [ -e "$q/rps_cpus" ] && echo "$mask" > "$q/rps_cpus" 2>/dev/null || true
+            [ -e "$q/rps_flow_cnt" ] && echo 4096 > "$q/rps_flow_cnt" 2>/dev/null || true
+        done
+        # Эта строка — маркер успеха в журнале: её отсутствие в `journalctl -u na-rps`
+        # означает, что RPS не применён, чем бы ни рапортовал статус юнита.
+        echo "na-rps: NIC=$NIC mask=$mask cpus=$ncpu"
+    fi
+    if [ "${NA_XPS:-0}" = 1 ]; then
+        for q in "$sysdir/$NIC"/queues/tx-*; do
+            [ -e "$q/xps_cpus" ] && echo "$mask" > "$q/xps_cpus" 2>/dev/null || true
+        done
+        echo "na-rps: NIC=$NIC xps=$mask"
+    else
+        # XPS не наш: возвращаем только то, что записали прошлые версии (есть в снимке)
+        for q in "$sysdir/$NIC"/queues/tx-*; do
+            [ -e "$q/xps_cpus" ] || continue
+            v="$(orig_val "$q/xps_cpus")" && echo "$v" > "$q/xps_cpus" 2>/dev/null || true
+        done
+    fi
     applied=1
 done
 
@@ -611,6 +956,7 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Environment=NA_XPS=${NA_XPS}
 ExecStart=/usr/local/sbin/na-rps-setup ${NIC:-}
 Restart=on-failure
 RestartSec=5
@@ -624,7 +970,7 @@ systemctl daemon-reload
 # буте — нулём), при этом печатался ok. Поэтому: enable + явный restart на каждом прогоне.
 systemctl enable na-rps.service >/dev/null 2>&1 || true
 if systemctl restart na-rps.service >/dev/null 2>&1; then
-    ok "RPS/RFS/XPS включены ($(nproc) ядер, NIC=${NIC:-автодетект на буте})"
+    ok "na-rps применён ($(nproc) ядер, NIC=${NIC:-автодетект на буте}; RPS — когда RX-очередей меньше, чем ядер; XPS — $([[ "$NA_XPS" == 1 ]] && echo 'все CPU (NA_XPS=1)' || echo 'не трогаем, раскладка драйвера'))"
 else
     warn "na-rps.service: не удалось применить RPS — проверь journalctl -u na-rps.service"
 fi
@@ -799,16 +1145,62 @@ title "journald (ограничение логов)"
 NA_JOURNAL_MAX_USE="${NA_JOURNAL_MAX_USE:-300M}"
 [[ "$NA_JOURNAL_MAX_USE" =~ ^[0-9]+[KMG]?$ ]] \
     || { warn "NA_JOURNAL_MAX_USE='$NA_JOURNAL_MAX_USE' — ожидается размер вида 300M/1G; беру 300M"; NA_JOURNAL_MAX_USE=300M; }
-mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/na-size.conf <<J
+# Имя с префиксом 10-: drop-in'ы journald применяются по имени, последний выигрывает.
+# Прежний na-size.conf сортировался ПОСЛЕ операторских 99-*.conf и молча перебивал их
+# SystemMaxUse — теперь операторский файл с любым «поздним» именем сильнее нашего.
+JD_DIR=/etc/systemd/journald.conf.d
+JD_FILE="$JD_DIR/10-na-size.conf"
+JD_PERSIST_MARK="$STATE_DIR/journald.persistent"
+mkdir -p "$JD_DIR"
+if [[ -f "$JD_DIR/na-size.conf" ]]; then
+    backup_file "$JD_DIR/na-size.conf" "$BACKUP"
+    rm -f "$JD_DIR/na-size.conf"
+fi
+# Журнал в RAM (volatile: есть /run/log/journal, нет /var/log/journal) не переживает
+# ребут: история входов и инцидентов до перезагрузки пропадает, а на minimal-образах
+# journald — единственный её источник. Чиним, только если Storage= никто не задал явно:
+# осознанный volatile оператора — его решение.
+jd_storage_explicit() {
+    local f
+    for f in /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf \
+             /run/systemd/journald.conf.d/*.conf /usr/local/lib/systemd/journald.conf.d/*.conf \
+             /usr/lib/systemd/journald.conf.d/*.conf; do
+        [[ -f "$f" && "$f" != "$JD_FILE" ]] || continue
+        if grep -qE '^[[:space:]]*Storage[[:space:]]*=' "$f" 2>/dev/null; then echo "$f"; return 0; fi
+    done
+    return 1
+}
+JD_STORAGE=""
+if _jd_by="$(jd_storage_explicit)"; then
+    if [[ -d /run/log/journal && ! -d /var/log/journal ]]; then
+        info "журнал volatile, но Storage= задан явно ($_jd_by) — не трогаю"
+    fi
+elif [[ -f "$JD_PERSIST_MARK" ]] || [[ -d /run/log/journal && ! -d /var/log/journal ]]; then
+    JD_STORAGE="Storage=persistent"
+    if [[ ! -d /var/log/journal ]]; then
+        mkdir -p /var/log/journal
+        systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+    fi
+    mkdir -p "$STATE_DIR"; [[ -f "$JD_PERSIST_MARK" ]] || date -Is > "$JD_PERSIST_MARK"
+fi
+unset _jd_by
+backup_file "$JD_FILE" "$BACKUP"
+cat > "$JD_FILE" <<J
 [Journal]
-SystemMaxUse=$NA_JOURNAL_MAX_USE
+${JD_STORAGE:+$JD_STORAGE
+}SystemMaxUse=$NA_JOURNAL_MAX_USE
 SystemKeepFree=500M
 SystemMaxFileSize=50M
 Compress=yes
 J
 systemctl restart systemd-journald
-ok "journald ≤ $NA_JOURNAL_MAX_USE"
+if [[ -n "$JD_STORAGE" ]]; then
+    # перенести накопленное в RAM в /var/log/journal сейчас, а не на следующем ребуте
+    journalctl --flush >/dev/null 2>&1 || true
+    ok "journald ≤ $NA_JOURNAL_MAX_USE, Storage=persistent (журнал переживает ребут: /var/log/journal)"
+else
+    ok "journald ≤ $NA_JOURNAL_MAX_USE ($JD_FILE — операторский drop-in с именем позже 10- главнее)"
+fi
 
 # ─── 8b. Ротация файловых логов ноды ─────────────────────────────────────────
 # journald-cap выше держит только журнал systemd. Логи, которые пишут nginx и ядро ноды
@@ -1011,6 +1403,17 @@ fi
 
 # ─── 9. THP off ──────────────────────────────────────────────────────────────
 title "Transparent Huge Pages → never"
+# Исходный режим THP — для отката без ребута; снимаем один раз, пока юнита ещё нет.
+THP_ORIG="$STATE_DIR/thp.orig"
+if [[ ! -f "$THP_ORIG" && ! -f /etc/systemd/system/na-thp-off.service ]]; then
+    mkdir -p "$STATE_DIR"
+    for _k in enabled defrag; do
+        _v="$(grep -oE '\[[a-z+]+\]' "/sys/kernel/mm/transparent_hugepage/$_k" 2>/dev/null | tr -d '[]' || true)"
+        [[ -z "$_v" ]] || printf '%s\t%s\n' "$_k" "$_v"
+    done > "$THP_ORIG.tmp" 2>/dev/null && mv -f "$THP_ORIG.tmp" "$THP_ORIG" || rm -f "$THP_ORIG.tmp"
+    [[ -s "$THP_ORIG" ]] || rm -f "$THP_ORIG"
+    unset _k _v
+fi
 cat > /etc/systemd/system/na-thp-off.service <<'EOF'
 [Unit]
 Description=node-accelerator disable THP
@@ -1067,6 +1470,9 @@ xanmod=$([[ -f "$STATE_DIR/xanmod.pkg" ]] && cat "$STATE_DIR/xanmod.pkg" || echo
 reboot_needed=$REBOOT_NEEDED
 boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
 psi=$PSI_MARK
+tier=$TIER
+sock_max=$SOCK_MAX
+sock_def=$SOCK_DEF
 EOF
 
 # Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
@@ -1074,7 +1480,7 @@ save_conf "$CONF_DIR/optimize.conf" \
     ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
     DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT QDISC \
     ENABLE_LOGROTATE NA_LOG_PATHS NA_LOG_MAXSIZE NA_LOG_ROTATE NA_LOG_INTERVAL \
-    ENABLE_PSI NA_JOURNAL_MAX_USE
+    ENABLE_PSI NA_JOURNAL_MAX_USE NA_XPS
 
 title "ГОТОВО"
 ok "Оптимизатор применён."
@@ -1085,6 +1491,10 @@ printf "    %-32s %s\n" "somaxconn:"          "$(sysctl -n net.core.somaxconn 2>
 printf "    %-32s %s\n" "nf_conntrack_max:"   "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
 printf "    %-32s %s\n" "file-max:"           "$(sysctl -n fs.file-max 2>/dev/null || echo n/a)"
 echo
+if [[ -n "$XANMOD_RISK" ]]; then
+    err "НЕ ПЕРЕЗАГРУЖАЙСЯ, пока не исправлено: $XANMOD_RISK"
+    err "  GRUB уже выбрал новое ядро. Исправить (update-initramfs -c -k <версия>) или снять ядро XanMod: apt-get purge 'linux-image-*xanmod*' && update-grub"
+fi
 if [[ "$REBOOT_NEEDED" == "1" ]]; then
     warn "НУЖНА ПЕРЕЗАГРУЗКА (reboot): ${REBOOT_WHY:-изменения в параметрах загрузки}"
     if [[ "$REBOOT_WHY" == *XanMod* ]]; then
