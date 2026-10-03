@@ -13,7 +13,7 @@
 # curl-bash:
 #   curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/install.sh | sudo bash -s all
 #   # прод: пиньте тег (компрометация ветки main тогда не утечёт сразу на весь флот):
-#   export NA_REF=v4.1.2; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
+#   export NA_REF=v4.1.3; curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 #   # + подписи модулей: NA_REQUIRE_SIG=1 NA_MINISIGN_PUBKEY=<ключ из README>
 #
 # ENV: NA_REF=<ветка|тег>  NA_REPO_URL=<база raw-URL, для форка/зеркала>
@@ -23,10 +23,16 @@
 # (стабильный JSON для мониторинга/панели — без повторного curl|bash). Снимается rollback'ом.
 
 set -euo pipefail
-# ${BASH_SOURCE[0]:-$0}: при запуске через curl|bash (bash -s) BASH_SOURCE пуст, и под
-# set -u голый ${BASH_SOURCE[0]} даёт «unbound variable». Фоллбэк на $0 убирает шум.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-SCRIPTS="$SCRIPT_DIR/scripts"
+# Модули рядом с собой берём ТОЛЬКО когда install.sh запущен из файла. При curl|bash
+# (`bash -s`) BASH_SOURCE пуст, а $0 = "bash" — до v4.1.3 тут был фоллбэк на $0, то есть
+# SCRIPT_DIR = ТЕКУЩАЯ папка: лежит в ней каталог scripts/ (старый клон тулкита, чужой
+# /tmp/scripts) — и root исполнял его, минуя скачивание по NA_REF И проверку подписей
+# NA_REQUIRE_SIG=1. Теперь в curl|bash-режиме модули всегда скачиваются.
+NA_SELF="${BASH_SOURCE[0]:-}"
+SCRIPTS=""
+if [[ -n "$NA_SELF" && -f "$NA_SELF" ]]; then
+    SCRIPTS="$(cd "$(dirname "$NA_SELF")" && pwd)/scripts"
+fi
 # NA_REF — ветка/тег для curl|bash-режима (по умолчанию main). Для прода пиньте тег.
 NA_REF="${NA_REF:-main}"
 # NA_REF уходит в URL модулей — запрещаем path-traversal/инъекцию (увод на чужой репо).
@@ -37,8 +43,8 @@ REPO_URL="${NA_REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accele
 # с ошибкой вместо вывода помощи, поэтому есть встроенный фоллбэк. Обрабатываем ДО
 # скачивания модулей и require_root: за справкой не должно требоваться ни root, ни сеть.
 usage() {
-    if [[ -f "$0" ]]; then
-        sed -n '2,24p' "$0"
+    if [[ -n "$NA_SELF" && -f "$NA_SELF" ]]; then
+        sed -n '2,24p' "$NA_SELF"
     else
         cat <<'U'
 node-accelerator — ⚡ оптимизатор + 🩺 диагностика + 🛡 защита Remnawave/VPN-ноды.
@@ -80,16 +86,22 @@ verify_sig() {  # verify_sig <файл> <url-без-расширения>
         # печатается из пакета подписи ДАЖЕ для BAD-подписи, а exit-код терялся в пайпе
         # (валидная .asc настоящего ключа рядом с подменённым файлом проходила бы как ок).
         # VALIDSIG эмитится ТОЛЬКО для криптографически валидной подписи и несёт полный fpr.
-        gpg --status-fd=1 --verify "$file.asc" "$file" 2>/dev/null \
-          | grep -Eq "^\[GNUPG:\] VALIDSIG ${NA_SIG_FINGERPRINT// /}( |\$)"
+        # Вывод сначала целиком в переменную: gpg пишет статус построчно, и `| grep -q`
+        # под pipefail закрывал пайп на VALIDSIG — следующая строка статуса ловила SIGPIPE,
+        # и валидная подпись отвергалась (141 вместо 0).
+        local st
+        st="$(gpg --status-fd=1 --verify "$file.asc" "$file" 2>/dev/null || true)"
+        grep -Eq "^\[GNUPG:\] VALIDSIG ${NA_SIG_FINGERPRINT// /}( |\$)" <<<"$st"
     else
         echo "[x] NA_REQUIRE_SIG=1, но нет minisign+NA_MINISIGN_PUBKEY или gpg+NA_SIG_FINGERPRINT"; return 1
     fi
 }
 
-# curl|bash — подтянуть модули
-if [[ ! -d "$SCRIPTS" ]]; then
-    SCRIPTS="$(mktemp -d)/scripts"; mkdir -p "$SCRIPTS/lib"
+# curl|bash — подтянуть модули (во временный каталог, который убираем на выходе)
+if [[ -z "$SCRIPTS" || ! -d "$SCRIPTS" ]]; then
+    NA_TMPD="$(mktemp -d)"
+    trap 'rm -rf "$NA_TMPD"' EXIT
+    SCRIPTS="$NA_TMPD/scripts"; mkdir -p "$SCRIPTS/lib"
     echo "[*] Скачиваю модули из $REPO_URL ..."
     for f in lib/common.sh optimize.sh protect.sh diagnose.sh na-report.sh rollback.sh; do
         curl -fsSL "${CURL_PROTO[@]}" "$REPO_URL/scripts/$f" -o "$SCRIPTS/$f" || { echo "[x] Не скачал $f"; exit 1; }

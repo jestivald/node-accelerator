@@ -84,7 +84,7 @@ rollback_optimize() {
     # XanMod-ядро: удаляем ТОЛЬКО если сейчас работаем не на нём (иначе оставим как есть)
     if [[ -f "$STATE_DIR/xanmod.pkg" ]]; then
         local pkg; pkg="$(cat "$STATE_DIR/xanmod.pkg")"
-        if [[ "${NA_REMOVE_XANMOD:-0}" == "1" ]] && ! uname -r | grep -qi xanmod; then
+        if [[ "${NA_REMOVE_XANMOD:-0}" == "1" ]] && [[ "$(uname -r)" != *xanmod* ]]; then
             info "Удаляю XanMod-пакет $pkg ..."
             DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg" >/dev/null 2>&1 || warn "не удалил $pkg"
             update-grub >/dev/null 2>&1 || true
@@ -118,7 +118,9 @@ rollback_protect() {
     # удаляем ТОЛЬКО свои таблицы — CrowdSec/Docker не трогаем
     nft delete table inet na_filter  2>/dev/null || true
     nft delete table inet na_ctguard 2>/dev/null || true
-    rm -f "$CONF_DIR/na_filter.nft"
+    # + отвергнутый ruleset и недописанные кандидаты (protect v4.1.3+ генерирует рядом и
+    # переименовывает в na_filter.nft только после успешного nft -f)
+    rm -f "$CONF_DIR/na_filter.nft" "$CONF_DIR/na_filter.nft.rejected" "$CONF_DIR"/.na_filter.nft.*
     rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
           /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard \
           /usr/local/sbin/na-fw-safety-revert

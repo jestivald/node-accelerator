@@ -159,7 +159,13 @@ portscan_log_lines() {
     command -v journalctl >/dev/null 2>&1 || return 1
     # `-g` (grep по журналу) есть не во всех сборках systemd — спрашиваем help, а не
     # пробный запуск: пустой результат пробы неотличим от «опция не поддержана».
-    _to 5 journalctl --help 2>/dev/null | grep -q -- '--grep' || return 1
+    # Не `journalctl --help | grep -q`: под pipefail grep -q закрывает пайп на первом
+    # совпадении, а справка (5 КБ) уходит в него двумя записями — вторая ловит SIGPIPE,
+    # пайплайн отдаёт 141, и сенсор через раз молча становится «-1» (аудит флота: на
+    # 8 нодах из 8 проверенных, -1 и число чередовались между соседними прогонами).
+    local help
+    help="$(_to 5 journalctl --help 2>/dev/null)"
+    [[ "$help" == *--grep* ]] || return 1
     n="$(_to 15 journalctl -b -k -g '\[na portscan\]' --no-pager -q 2>/dev/null | wc -l | tr -d ' ')"; rc=$?
     # pipefail: timeout, убивший journalctl, отдаёт 124 — счёт неполный, врать не будем
     [[ "$rc" -eq 124 ]] && return 1
@@ -186,7 +192,50 @@ NA_CERT_GLOBS='/etc/letsencrypt/live/*/fullchain.pem /root/.acme.sh/*/fullchain.
 # tls_listening — на :443/:8443 кто-то слушает? Если сертов при этом не нашли, сенсор
 # не «чист», а слеп — это warn, а не info (issue #39).
 tls_listening() {
-    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE '[:.](443|8443)$'
+    # awk дочитывает вход до конца (не grep -q: SIGPIPE под pipefail, см. portscan_log_lines)
+    ss -tlnH 2>/dev/null | awk '$4 ~ /[:.](443|8443)$/{f=1} END{exit !f}'
+}
+
+# reboot_pending — optimize поставил ядро/параметры загрузки, а перезагрузки с тех пор не
+# было. Маркер `reboot_needed=1` пишет optimize, и никто его не снимает: после ребута JSON
+# продолжал отдавать true (аудит флота: 9 нод уже на XanMod, а мониторинг ждал ребута).
+# Сверяем с ТЕКУЩЕЙ загрузкой: boot_id из маркера (v4.1.3+) или, для старых маркеров,
+# время загрузки (btime) против installed_at. Не разобрать — как раньше, верим маркеру.
+reboot_pending() {
+    local f="$STATE_DIR/optimize.installed" bid cur inst inst_s bt
+    [[ -f "$f" ]] || return 1
+    grep -q '^reboot_needed=1' "$f" 2>/dev/null || return 1
+    bid="$(awk -F= '/^boot_id=/{print $2; exit}' "$f" 2>/dev/null)"
+    cur="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+    if [[ -n "$bid" && -n "$cur" ]]; then [[ "$bid" == "$cur" ]]; return; fi
+    inst="$(awk -F= '/^installed_at=/{print $2; exit}' "$f" 2>/dev/null)"
+    inst_s="$(date -d "$inst" +%s 2>/dev/null)" || return 0
+    bt="$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null)"
+    [[ "$inst_s" =~ ^[0-9]+$ && "$bt" =~ ^[0-9]+$ ]] || return 0
+    (( bt < inst_s ))
+}
+
+# dynset_fill — заполненность динамических наборов-лимитеров na_filter (SYN/UDP/SSH/ICMP/
+# анти-скан). До v4.1.3 они создавались без timeout: записи не истекали, и на полном
+# наборе (65535) новые клиенты на порт отсекались (аудит флота: 22 764 адреса за 32 дня).
+# stdout: «имя<TAB>элементов<TAB>size<TAB>timeout(1|0)» на набор; ct count-наборы (cc*/occ*)
+# пропускаем — их ядро чистит само. rc=1 — таблицы нет.
+dynset_fill() {
+    local name size to n
+    nft list table inet na_filter >/dev/null 2>&1 || return 1
+    while IFS=$'\t' read -r name size to; do
+        [[ -n "$name" && "$size" =~ ^[0-9]+$ ]] || continue
+        n="$(nft_set_count inet na_filter "$name")"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        printf '%s\t%s\t%s\t%s\n' "$name" "$n" "$size" "$to"
+    done < <(nft -t list table inet na_filter 2>/dev/null | awk '
+        /^[[:space:]]*(set|meter) [A-Za-z0-9_]+ \{/ { name=$2; size=0; dyn=0; to=0; inset=1; next }
+        inset && /^[[:space:]]*size [0-9]+/       { size=$2 }
+        inset && /^[[:space:]]*flags / && /dynamic/ { dyn=1 }
+        inset && /^[[:space:]]*timeout /           { to=1 }
+        inset && /^[[:space:]]*}/ {
+            if (dyn && size>0 && name !~ /^o?cc[46]/) printf "%s\t%s\t%s\n", name, size, to
+            inset=0
+        }')
 }
 
 # ─── JSON-режим (для флот-мониторинга: Zabbix/Prometheus/SSH-поллинг) ─────────
@@ -198,7 +247,8 @@ emit_json() {
     local nav host up load1 mempct wi wanrx wantx ip6def udperr
     local rnst rnrc rnse fsa bla certd certf nowsec cf cend cends cd npd npfw
     local mcpi jsp psl psist wdc csd tcpp wl_live wl_conf tmpv
-    kern="$(uname -r)"; uname -r | grep -qi xanmod && xanmod=true || xanmod=false
+    local dsf dsfn dsnt _dn _dc _ds _dt
+    kern="$(uname -r)"; [[ "${kern,,}" == *xanmod* ]] && xanmod=true || xanmod=false
     virt="$(detect_virt)"
     cc="$(val net.ipv4.tcp_congestion_control)"; qd="$(val net.core.default_qdisc)"
     ctmax="$(val net.netfilter.nf_conntrack_max)"; ctmax="${ctmax:-0}"
@@ -246,7 +296,7 @@ emit_json() {
     { systemctl is-active --quiet na-fw-safety.timer 2>/dev/null \
       || { [[ -f "$STATE_DIR/na-fw-safety.pid" ]] && kill -0 "$(cat "$STATE_DIR/na-fw-safety.pid" 2>/dev/null)" 2>/dev/null; }; } \
       && safety=true || safety=false
-    rebootn=false; grep -q '^reboot_needed=1' "$STATE_DIR/optimize.installed" 2>/dev/null && rebootn=true
+    rebootn=false; reboot_pending && rebootn=true
 
     # ── na-panel extras: identity, нагрузка, WAN-счётчики, стек ноды, свежесть, серты ──
     nowsec="$(date +%s)"
@@ -262,7 +312,7 @@ emit_json() {
         wantx="$(cat "/sys/class/net/$wi/statistics/tx_bytes" 2>/dev/null || echo 0)"
     fi
     [[ "$wanrx" =~ ^[0-9]+$ ]] || wanrx=0; [[ "$wantx" =~ ^[0-9]+$ ]] || wantx=0
-    ip -6 route show default 2>/dev/null | grep -q . && ip6def=true || ip6def=false
+    [[ -n "$(ip -6 route show default 2>/dev/null)" ]] && ip6def=true || ip6def=false
     udperr="$(awk '/^Udp:/{if(!h){for(i=2;i<=NF;i++)n[i]=$i;h=1;next} for(i=2;i<=NF;i++) if(n[i]=="RcvbufErrors") print $i}' /proc/net/snmp 2>/dev/null)"
     udperr="${udperr:-0}"; [[ "$udperr" =~ ^[0-9]+$ ]] || udperr=0
     # remnanode (Remnawave node-контейнер) — статус/рестарты/SPAWN_ERROR за час. Read-only.
@@ -351,6 +401,16 @@ emit_json() {
     lrc="$(cut -f1 "$STATE_DIR/logrotate.ceded" 2>/dev/null | paste -sd' ' - || true)"; lrc="${lrc:-}"
     lrcn="$(awk -F'\t' '$3=="none"' "$STATE_DIR/logrotate.ceded" 2>/dev/null | grep -c .)"; [[ "$lrcn" =~ ^[0-9]+$ ]] || lrcn=0
     lro="$(json_escape "$lro")"; lrc="$(json_escape "$lrc")"
+    # v4.1.3: заполненность наборов-лимитеров (−1 = таблицы нет) и сколько из них без
+    # timeout (наследие ≤4.1.2: такие копят адреса до ребута и на 100% режут новых)
+    dsf=-1; dsfn=""; dsnt=0
+    while IFS=$'\t' read -r _dn _dc _ds _dt; do
+        [[ -n "$_dn" ]] || continue
+        [[ "$dsf" -lt 0 ]] && dsf=0
+        (( _dc * 100 / _ds > dsf )) && { dsf=$(( _dc * 100 / _ds )); dsfn="$_dn"; }
+        [[ "$_dt" == "0" ]] && dsnt=$((dsnt+1))
+    done < <(dynset_fill 2>/dev/null)
+    dsfn="$(json_escape "$dsfn")"
 
     # Каждое строковое значение — через json_escape. Раньше каждое поле полагалось на то,
     # что источник «и так чистый», и одного сырого перевода строки из docker хватило,
@@ -383,8 +443,10 @@ emit_json() {
         "$mcpi" "$jsp" "$psl" "$psist"
     printf '"whitelist_drift_conf":%s,"conf_stale_defaults":%s,"cert_min_file":"%s",' \
         "$wdc" "$csd" "$certf"
-    printf '"logrotate_owned_masks":"%s","logrotate_ceded_masks":"%s","logrotate_ceded_nocap":%s}\n' \
+    printf '"logrotate_owned_masks":"%s","logrotate_ceded_masks":"%s","logrotate_ceded_nocap":%s,' \
         "$lro" "$lrc" "$lrcn"
+    printf '"dynset_fill_max_pct":%s,"dynset_fill_max_set":"%s","dynset_no_timeout":%s}\n' \
+        "$dsf" "$dsfn" "$dsnt"
 }
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
 
@@ -469,7 +531,9 @@ I
     if command -v ss >/dev/null 2>&1; then
         local ccdist; ccdist="$(ss -tin state established 2>/dev/null | grep -oE ' (bbr|cubic|reno|htcp|vegas|dctcp) ' | sort | uniq -c | sort -rn | awk '{printf "%s:%s  ",$2,$1}')"
         [[ -n "$ccdist" ]] && info "на сокетах: $ccdist" || info "на сокетах: (нет ESTAB или старый ss)"
-        if ss -tin state established 2>/dev/null | grep -qE ' cubic ' && [[ "$(val net.ipv4.tcp_congestion_control)" == "bbr" ]]; then
+        # счёт, а не grep -q: на тысячах сокетов grep -q закрывал пайп раньше ss → SIGPIPE →
+        # под pipefail условие было ложным ВСЕГДА, и предупреждение не срабатывало никогда
+        if [[ "$(ss -tin state established 2>/dev/null | grep -cE ' cubic ')" -gt 0 ]] && [[ "$(val net.ipv4.tcp_congestion_control)" == "bbr" ]]; then
             warn "часть сокетов на cubic при cc=bbr — это коннекты ДО смены CC (или приложение задаёт своё)"
         fi
     fi
@@ -559,8 +623,9 @@ unset _cf _k _old _new _ver _why
 
 # ─── Ядро / BBR ──────────────────────────────────────────────────────────────
 title "Ядро и congestion control"
-if uname -r | grep -qi xanmod; then
-    pass "XanMod-ядро активно ($(uname -r)) → BBRv3 доступен"
+KREL="$(uname -r)"
+if [[ "${KREL,,}" == *xanmod* ]]; then
+    pass "XanMod-ядро активно ($KREL) → BBRv3 доступен"
 else
     if can_install_kernel; then
         wrn "Ядро не XanMod — BBRv3 нет. Поставь оптимизатор (XanMod), будет +скорость."
@@ -572,7 +637,7 @@ else
 fi
 CC="$(val net.ipv4.tcp_congestion_control)"
 AVAIL="$(val net.ipv4.tcp_available_congestion_control)"
-[[ "$CC" == "bbr" ]] && pass "congestion_control = bbr$(uname -r | grep -qi xanmod && echo ' (BBRv3)')" \
+[[ "$CC" == "bbr" ]] && pass "congestion_control = bbr$([[ "${KREL,,}" == *xanmod* ]] && echo ' (BBRv3)')" \
                      || wrn "congestion_control = ${CC:-?} (ожидалось bbr). Доступно: ${AVAIL:-?}"
 QD="$(val net.core.default_qdisc)"
 [[ "$QD" == "fq" || "$QD" == "fq_codel" || "$QD" == "cake" ]] && pass "default_qdisc = $QD" \
@@ -580,6 +645,9 @@ QD="$(val net.core.default_qdisc)"
 if [[ "$(arch)" == "x86_64" ]]; then
     LVL="$(cpu_psabi_level)"
     info "CPU psABI: поддерживает до x86-64-v${LVL} (выбор сборки XanMod)"
+fi
+if reboot_pending; then
+    wrn "optimize поставил ядро/параметры загрузки, а перезагрузки с тех пор не было — reboot (XanMod/BBRv3, psi=1 включатся после него)"
 fi
 # Реальность поверх sysctl: сколько живых TCP-сокетов реально на BBR + доля ретрансмитов.
 BBRN="$(ss -tin 2>/dev/null | grep -c bbr || true)"
@@ -725,7 +793,7 @@ fi
 
 # ─── Память / прочее ─────────────────────────────────────────────────────────
 title "Память, swap, THP, governor"
-if swapon --show 2>/dev/null | grep -q .; then pass "swap: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ')"; else wrn "swap отсутствует"; fi
+if [[ -n "$(swapon --show 2>/dev/null)" ]]; then pass "swap: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ')"; else wrn "swap отсутствует"; fi
 THP="$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -oE '\[.*\]' | tr -d '[]')"
 [[ "$THP" == "never" ]] && pass "THP = never" || wrn "THP = ${THP:-?} (для сетевых нагрузок лучше never)"
 GOV="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
@@ -819,6 +887,27 @@ if nft list table inet na_filter >/dev/null 2>&1; then
             fi
         fi
     fi
+    # Наборы per-IP лимитеров. До v4.1.3 — без timeout: адреса копятся до ребута, и на
+    # полном наборе новые клиенты на порт отсекаются (для ssh4 — новый IP админа в бан).
+    DS_MAX=-1; DS_MAXN=""; DS_NT=0; DS_N=0
+    while IFS=$'\t' read -r _dn _dc _ds _dt; do
+        [[ -n "$_dn" ]] || continue
+        DS_N=$((DS_N+1))
+        (( _dc * 100 / _ds > DS_MAX )) && { DS_MAX=$(( _dc * 100 / _ds )); DS_MAXN="$_dn ($_dc из $_ds)"; }
+        [[ "$_dt" == "0" ]] && DS_NT=$((DS_NT+1))
+    done < <(dynset_fill 2>/dev/null)
+    if [[ "$DS_N" -gt 0 ]]; then
+        if [[ "$DS_NT" -gt 0 && "$DS_MAX" -ge 80 ]]; then
+            bad "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2) заполнены до ${DS_MAX}%: $DS_MAXN — на 100% новые клиенты на порт отсекаются. Ре-ран protect (4.1.3+); пожарно: systemctl reload na-firewall (сбросит и баны)"
+        elif [[ "$DS_NT" -gt 0 ]]; then
+            wrn "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2): адреса копятся до ребута, сейчас максимум ${DS_MAX}% — $DS_MAXN. На 100% новые клиенты на порт отсекаются: ре-ран protect (4.1.3+)"
+        elif [[ "$DS_MAX" -ge 80 ]]; then
+            wrn "набор-лимитер заполнен на ${DS_MAX}%: $DS_MAXN — флуд с множества адресов; на 100% лимит перестаёт действовать для новых адресов (клиентов не режет)"
+        else
+            pass "наборы-лимитеры с timeout, максимум заполнения ${DS_MAX}% ($DS_MAXN)"
+        fi
+    fi
+    unset _dn _dc _ds _dt
     # v3.0 компоненты
     if nft list set inet na_filter suspect_v4 >/dev/null 2>&1; then
         SUSP="$(nft_set_count inet na_filter suspect_v4)"; [[ "$SUSP" =~ ^[0-9]+$ ]] || SUSP=0
@@ -926,7 +1015,7 @@ EXTIP="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true)"
 # IPv6 default-route: на нодах где v6 включён осознанно (напр. CDN-origin) его пропажа
 # после смены сети/провайдера тихо ломает v6-клиентов. Показываем факт, без warn
 # (v4-only ноды — легитимный кейс).
-if ip -6 route show default 2>/dev/null | grep -q .; then
+if [[ -n "$(ip -6 route show default 2>/dev/null)" ]]; then
     info "IPv6 default-route: есть ($(ip -6 route show default 2>/dev/null | awk '{print $3; exit}'))"
 else
     info "IPv6 default-route: нет (v4-only нода)"
@@ -1091,7 +1180,10 @@ elif systemctl is-active --quiet na-logrotate.timer 2>/dev/null; then
 else
     info "часовой таймер ротации не активен — работает только суточный logrotate.timer (maxsize проверяется раз в сутки)"
 fi
-if command -v logrotate >/dev/null 2>&1 && logrotate -d /etc/logrotate.conf 2>&1 | grep -qi 'duplicate log entry'; then
+# grep -c, а не -q: вывод `logrotate -d` большой, grep -q закрывал пайп на первом совпадении →
+# SIGPIPE → под pipefail условие ложно ровно тогда, когда дубликат ЕСТЬ
+if command -v logrotate >/dev/null 2>&1 \
+   && [[ "$(logrotate -d /etc/logrotate.conf 2>&1 | grep -ci 'duplicate log entry')" -gt 0 ]]; then
     wrn "logrotate: дубликат путей — часть станс пропускается целиком (logrotate -d /etc/logrotate.conf)"
 fi
 # Ретеншен журнала ВО ВРЕМЕНИ. Датчик по объёму (выше) спокоен, когда логи капнуты, но

@@ -587,19 +587,48 @@ fi
 [[ -n "$NP_DETECTED" ]] && NODE_PORT_LAST="$NP_DETECTED"
 NP_NFT="${NP_EFF//,/, }"
 
+# ─── Наборы per-IP лимитеров ─────────────────────────────────────────────────
+# До v4.1.3 каждый per-IP лимит был голым `meter … { ip saddr limit rate … } accept`:
+# набор `size 65535; flags dynamic` БЕЗ timeout. Записи с `limit` ядро не чистит никогда
+# (в отличие от `ct count`, у которого есть GC), поэтому набор копил КАЖДЫЙ адрес,
+# хоть раз пришедший на порт, до ребута или перезагрузки таблицы. Аудит флота: 22 764
+# адреса в syn4_2087 за 32 дня аптайма, рост 700–1300 в сутки на порт. На полном наборе
+# ядро не может завести запись новому адресу, правило `… accept` для него не срабатывает,
+# и пакет падает в `ct state new drop` — новые клиенты молча отрезаны (а для ssh4 новый
+# адрес админа уходит в suspect/бан).
+# Теперь: набор объявлен явно, с timeout (запись живёт, пока адрес активен: `update`
+# продлевает её на каждом пакете), а правило построено «превысил → drop, иначе accept».
+# Переполнение (спуф-флуд с десятков тысяч адресов) тогда выключает лимит для новых
+# адресов, а не отрезает их: syncookies и ct count продолжают работать.
+# Timeout с запасом больше времени восстановления корзины (burst/rate): иначе адрес после
+# паузы получал бы свежий burst. Секундные лимиты восстанавливаются за секунды — 60s;
+# минутные (SSH, анти-скан) — за минуты, им 10m. Ручки — для тестов на настоящем nft.
+NA_RATE_SET_SIZE="${NA_RATE_SET_SIZE:-65535}"
+NA_RATE_TO_SEC="${NA_RATE_TO_SEC:-60s}"
+NA_RATE_TO_MIN="${NA_RATE_TO_MIN:-10m}"
+_is_uint "$NA_RATE_SET_SIZE" && (( NA_RATE_SET_SIZE > 0 )) || { err "NA_RATE_SET_SIZE='$NA_RATE_SET_SIZE' — ожидается целое > 0"; exit 1; }
+_is_duration "$NA_RATE_TO_SEC" || { err "NA_RATE_TO_SEC='$NA_RATE_TO_SEC' — ожидается длительность (напр. 60s)"; exit 1; }
+_is_duration "$NA_RATE_TO_MIN" || { err "NA_RATE_TO_MIN='$NA_RATE_TO_MIN' — ожидается длительность (напр. 10m)"; exit 1; }
+RATE_SETS=""
+rate_set() {   # rate_set <имя> <ipv4_addr|ipv6_addr> <timeout>
+    RATE_SETS+="
+    set $1 { type $2; size ${NA_RATE_SET_SIZE}; flags dynamic,timeout; timeout $3; }"
+}
+
 # ─── Сборка per-port правил ──────────────────────────────────────────────────
 TCP_RULES=""
 for p in ${TCP_PORTS//,/ }; do
     [[ -z "$p" ]] && continue
     TCP_RULES+="
-        # порт ${p}: per-IP лимит одновременных коннектов (анти-exhaustion)
+        # порт ${p}: per-IP лимит одновременных коннектов (анти-exhaustion; записи ct count ядро чистит само)
         tcp dport ${p} ct state new meter cc4_${p} { ip saddr ct count over ${CONN_LIMIT} } drop
         tcp dport ${p} ct state new meter cc6_${p} { ip6 saddr ct count over ${CONN_LIMIT} } drop
         # порт ${p}: per-IP SYN-rate (масштабируется по числу клиентов, не глобальный потолок)
-        tcp dport ${p} ct state new meter syn4_${p} { ip saddr limit rate ${SYN_RATE}/second burst ${SYN_BURST} packets } accept
-        tcp dport ${p} ct state new meter syn6_${p} { ip6 saddr limit rate ${SYN_RATE}/second burst ${SYN_BURST} packets } accept
-        tcp dport ${p} ct state new limit rate 5/second log prefix \"[na synflood] \" level info
-        tcp dport ${p} ct state new drop"
+        tcp dport ${p} ct state new update @syn4_${p} { ip saddr limit rate over ${SYN_RATE}/second burst ${SYN_BURST} packets } jump synflood_drop
+        tcp dport ${p} ct state new update @syn6_${p} { ip6 saddr limit rate over ${SYN_RATE}/second burst ${SYN_BURST} packets } jump synflood_drop
+        tcp dport ${p} ct state new accept"
+    rate_set "syn4_${p}" ipv4_addr "$NA_RATE_TO_SEC"
+    rate_set "syn6_${p}" ipv6_addr "$NA_RATE_TO_SEC"
 done
 
 UDP_RULES=""
@@ -612,9 +641,11 @@ for p in ${UDP_PORTS//,/ }; do
     fi
     UDP_RULES+="
         # порт ${p}/udp: per-IP rate (QUIC/Hysteria2/TUIC) — ${_ukind}
-        udp dport ${p} meter udp4_${p} { ip saddr limit rate ${_urate}/second burst ${_uburst} packets } accept
-        udp dport ${p} meter udp6_${p} { ip6 saddr limit rate ${_urate}/second burst ${_uburst} packets } accept
-        udp dport ${p} drop"
+        udp dport ${p} update @udp4_${p} { ip saddr limit rate over ${_urate}/second burst ${_uburst} packets } counter drop
+        udp dport ${p} update @udp6_${p} { ip6 saddr limit rate over ${_urate}/second burst ${_uburst} packets } counter drop
+        udp dport ${p} accept"
+    rate_set "udp4_${p}" ipv4_addr "$NA_RATE_TO_SEC"
+    rate_set "udp6_${p}" ipv6_addr "$NA_RATE_TO_SEC"
 done
 # Порт в bulk-списке, но не в UDP_PORTS — правило для него не сгенерится вообще: молчать нельзя.
 for p in ${UDP_BULK_PORTS//,/ }; do
@@ -715,9 +746,11 @@ elif [[ "$NODE_PORT_WHITELIST_ONLY" == "1" ]]; then
     fi
 else
     NODE_RULES="        # node-agent: whitelist (выше) + мягкий per-IP лимит для неизвестных
-        tcp dport { ${NP_NFT} } ct state new meter na4 { ip saddr limit rate 30/second burst 60 packets } accept
-        tcp dport { ${NP_NFT} } ct state new meter na6 { ip6 saddr limit rate 30/second burst 60 packets } accept
-        tcp dport { ${NP_NFT} } ct state new drop"
+        tcp dport { ${NP_NFT} } ct state new update @na4 { ip saddr limit rate over 30/second burst 60 packets } counter drop
+        tcp dport { ${NP_NFT} } ct state new update @na6 { ip6 saddr limit rate over 30/second burst 60 packets } counter drop
+        tcp dport { ${NP_NFT} } ct state new accept"
+    rate_set na4 ipv4_addr "$NA_RATE_TO_SEC"
+    rate_set na6 ipv6_addr "$NA_RATE_TO_SEC"
 fi
 
 # portscan → autoban (включается флагом). При ENABLE_BANONCE=1 — двухступенчато:
@@ -740,16 +773,23 @@ if [[ "$ENABLE_PORTSCAN_BAN" == "1" && "$FW_MODE" != "open" ]]; then
         PORTSCAN="        # ANTI-SCAN (ban-once): 1-й быстрый скан → suspect, 2-й в окне ${SUSPECT_TIME} → бан.
         $_ps_log4
         # уже suspect и снова бьёт быстрее порога → confirmed-бан
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new ip saddr @suspect_v4 meter psc4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new ip6 saddr @suspect_v6 meter psc6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new ip saddr @suspect_v4 update @psc4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new ip6 saddr @suspect_v6 update @psc6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop
         # ещё не suspect и бьёт быстрее порога → пометить suspect (без бана; скан дропнет catch-all)
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} }
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} }"
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new update @ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} }
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new update @ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} }"
     else
         PORTSCAN="        # ANTI-SCAN: бьёт по закрытым портам быстрее ${PORTSCAN_RATE}/min → бан ${PORTSCAN_BAN_TIME}.
         $_ps_log4
-        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
-        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new meter ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
+        meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn ct state new update @ps4 { ip saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v4 { ip saddr timeout ${PORTSCAN_BAN_TIME} } drop
+        meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn ct state new update @ps6 { ip6 saddr limit rate over ${PORTSCAN_RATE}/minute burst ${PORTSCAN_BURST} packets } add @autoban_v6 { ip6 saddr timeout ${PORTSCAN_BAN_TIME} } drop"
+    fi
+fi
+# наборы анти-скана — вне блока выше: tests/protect-unit.sh исполняет его отдельно
+if [[ -n "$PORTSCAN" ]]; then
+    rate_set ps4 ipv4_addr "$NA_RATE_TO_MIN"; rate_set ps6 ipv6_addr "$NA_RATE_TO_MIN"
+    if [[ "$ENABLE_BANONCE" == "1" ]]; then
+        rate_set psc4 ipv4_addr "$NA_RATE_TO_MIN"; rate_set psc6 ipv6_addr "$NA_RATE_TO_MIN"
     fi
 fi
 
@@ -819,23 +859,34 @@ if [[ "$FLEET_ON" == "1" ]]; then
         ip6 saddr @na_fleet_v6 accept"
 fi
 
-# SSH connect-flood: с ban-once (suspect→confirmed) или прямой бан.
+# SSH connect-flood: превысил лимит → цепочка ssh_flood (ban-once: suspect→confirmed,
+# иначе прямой бан), в пределах лимита → accept. Последний drop цепочки — страховка:
+# если сет suspect/autoban полон и запись не легла, пакет сверх лимита всё равно не
+# проходит (иначе он вернулся бы из цепочки и упал в accept ниже).
+SSH_RULES="        # SSH connect-flood: >${SSH_RATE}/мин новых с одного IP → цепочка ssh_flood
+        tcp dport { ${SSH_NFT} } ct state new update @ssh4 { ip saddr limit rate over ${SSH_RATE}/minute burst ${SSH_BURST} packets } jump ssh_flood
+        tcp dport { ${SSH_NFT} } ct state new update @ssh6 { ip6 saddr limit rate over ${SSH_RATE}/minute burst ${SSH_BURST} packets } jump ssh_flood
+        tcp dport { ${SSH_NFT} } ct state new accept"
+rate_set ssh4 ipv4_addr "$NA_RATE_TO_MIN"
+rate_set ssh6 ipv6_addr "$NA_RATE_TO_MIN"
 if [[ "$ENABLE_BANONCE" == "1" ]]; then
-    SSH_RULES="        # SSH connect-flood (ban-once): перебор → 1-й раз suspect+drop, 2-й в окне → бан ${SSH_BAN_TIME}
-        tcp dport { ${SSH_NFT} } ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport { ${SSH_NFT} } ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport { ${SSH_NFT} } ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
-        tcp dport { ${SSH_NFT} } ct state new ip saddr @suspect_v4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport { ${SSH_NFT} } ct state new ip6 saddr @suspect_v6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv4 add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} } drop
-        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv6 add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} } drop"
+    SSH_FLOOD_CHAIN="    # SSH сверх лимита (ban-once): 1-й раз suspect+drop, повтор в окне ${SUSPECT_TIME} → бан ${SSH_BAN_TIME}
+    chain ssh_flood {
+        limit rate 5/second log prefix \"[na ssh-flood] \" level warn
+        ip saddr @suspect_v4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
+        ip6 saddr @suspect_v6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
+        meta nfproto ipv4 add @suspect_v4 { ip saddr timeout ${SUSPECT_TIME} } drop
+        meta nfproto ipv6 add @suspect_v6 { ip6 saddr timeout ${SUSPECT_TIME} } drop
+        counter drop
+    }"
 else
-    SSH_RULES="        # SSH connect-flood: >${SSH_RATE}/мин новых с одного IP → бан ${SSH_BAN_TIME}
-        tcp dport { ${SSH_NFT} } ct state new meter ssh4 { ip saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport { ${SSH_NFT} } ct state new meter ssh6 { ip6 saddr limit rate ${SSH_RATE}/minute burst ${SSH_BURST} packets } accept
-        tcp dport { ${SSH_NFT} } ct state new limit rate 5/second log prefix \"[na ssh-flood] \" level warn
-        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
-        tcp dport { ${SSH_NFT} } ct state new meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop"
+    SSH_FLOOD_CHAIN="    # SSH сверх лимита: бан ${SSH_BAN_TIME}
+    chain ssh_flood {
+        limit rate 5/second log prefix \"[na ssh-flood] \" level warn
+        meta nfproto ipv4 add @autoban_v4 { ip saddr timeout ${SSH_BAN_TIME} } drop
+        meta nfproto ipv6 add @autoban_v6 { ip6 saddr timeout ${SSH_BAN_TIME} } drop
+        counter drop
+    }"
 fi
 
 WL4_LINE=""; [[ -n "$WL4" ]] && WL4_LINE="elements = { $WL4 }"
@@ -855,23 +906,37 @@ if [[ "$FW_MODE" == "open" ]]; then
         # но per-IP лимиты им — те же, что перечисленным портам (drop сверх лимита ≠ бан)
         meta l4proto tcp ct state new meter occ4 { ip saddr ct count over ${CONN_LIMIT} } drop
         meta l4proto tcp ct state new meter occ6 { ip6 saddr ct count over ${CONN_LIMIT} } drop
-        meta l4proto tcp ct state new meter osyn4 { ip saddr limit rate ${SYN_RATE}/second burst ${SYN_BURST} packets } accept
-        meta l4proto tcp ct state new meter osyn6 { ip6 saddr limit rate ${SYN_RATE}/second burst ${SYN_BURST} packets } accept
-        meta l4proto tcp ct state new limit rate 5/second log prefix \"[na synflood] \" level info
-        meta l4proto tcp ct state new drop
-        meta l4proto udp meter oudp4 { ip saddr limit rate ${UDP_RATE}/second burst ${UDP_BURST} packets } accept
-        meta l4proto udp meter oudp6 { ip6 saddr limit rate ${UDP_RATE}/second burst ${UDP_BURST} packets } accept
-        meta l4proto udp counter drop
+        meta l4proto tcp ct state new update @osyn4 { ip saddr limit rate over ${SYN_RATE}/second burst ${SYN_BURST} packets } jump synflood_drop
+        meta l4proto tcp ct state new update @osyn6 { ip6 saddr limit rate over ${SYN_RATE}/second burst ${SYN_BURST} packets } jump synflood_drop
+        meta l4proto udp update @oudp4 { ip saddr limit rate over ${UDP_RATE}/second burst ${UDP_BURST} packets } counter drop
+        meta l4proto udp update @oudp6 { ip6 saddr limit rate over ${UDP_RATE}/second burst ${UDP_BURST} packets } counter drop
         counter accept"
+    rate_set osyn4 ipv4_addr "$NA_RATE_TO_SEC"; rate_set osyn6 ipv6_addr "$NA_RATE_TO_SEC"
+    rate_set oudp4 ipv4_addr "$NA_RATE_TO_SEC"; rate_set oudp6 ipv6_addr "$NA_RATE_TO_SEC"
 fi
 
+# per-IP лимит ICMP echo — тоже набор с timeout (см. «Наборы per-IP лимитеров»)
+rate_set icmp4 ipv4_addr "$NA_RATE_TO_SEC"
+rate_set icmp6 ipv6_addr "$NA_RATE_TO_SEC"
+
 # ─── Генерация nft-файла ─────────────────────────────────────────────────────
+# NFT_FILE — файл автозагрузки (его грузит na-firewall.service). Кандидат пишется рядом
+# (та же ФС → атомарный mv) и становится файлом автозагрузки только после `nft -c` И
+# успешного `nft -f`. До v4.1.3 генерация шла прямо в файл автозагрузки: провал проверки
+# печатал «ничего не применено», а битый файл уже лежал на месте рабочего — и первый же
+# ребут поднимал ноду без файрвола. В DRY_RUN кандидат и есть результат (/tmp).
 NFT_FILE="$CONF_DIR/na_filter.nft"
-[[ "$DRY_RUN" == "1" ]] && NFT_FILE="$(mktemp /tmp/na_filter.XXXXXX.nft)"
 mkdir -p "$CONF_DIR"
+if [[ "$DRY_RUN" == "1" ]]; then
+    NFT_FILE="$(mktemp /tmp/na_filter.XXXXXX.nft)"; NFT_NEW="$NFT_FILE"
+else
+    NFT_NEW="$(mktemp "$CONF_DIR/.na_filter.nft.XXXXXX")"
+    trap 'rm -f "$NFT_NEW" 2>/dev/null || true' EXIT
+fi
+NFT_REJECTED="$CONF_DIR/na_filter.nft.rejected"
 title "Генерация nftables → $NFT_FILE"
 
-cat > "$NFT_FILE" <<NFT
+cat > "$NFT_NEW" <<NFT
 #!/usr/sbin/nft -f
 # node-accelerator / protect.sh @ $(date -Is)
 # FW_MODE=$FW_MODE
@@ -894,6 +959,9 @@ $SUSPECT_SETS
 $BLOCKLIST_SETS
 $FLEET_SETS
 $NP_SETS
+
+    # per-IP лимитеры: записи живут, пока адрес активен (timeout продлевается update'ом)
+$RATE_SETS
 
     # bogon/martian источники (RFC1918, CGNAT, loopback, link-local, TEST-NET, multicast)
     set bogon_v4 {
@@ -921,6 +989,14 @@ $NP_SETS
         limit rate 5/second log prefix "[na badflags] " level info
         counter drop
     }
+
+    # новые TCP сверх per-IP SYN-rate → лог(rl) + drop
+    chain synflood_drop {
+        limit rate 5/second log prefix "[na synflood] " level info
+        counter drop
+    }
+
+$SSH_FLOOD_CHAIN
 
 $SYNPROXY_PRE
 
@@ -956,11 +1032,11 @@ $ANTISPOOF
 
         # ICMP: пинг работает, флуд режется. Лимит PER-IP (meter), НЕ глобальный — иначе
         # нода с сотнями пингующих клиентов упирается в общий потолок и пинг «пропадает».
-        ip protocol icmp icmp type echo-request meter icmp4 { ip saddr limit rate ${ICMP_RATE}/second burst ${ICMP_BURST} packets } accept
-        ip protocol icmp icmp type echo-request drop
+        ip protocol icmp icmp type echo-request update @icmp4 { ip saddr limit rate over ${ICMP_RATE}/second burst ${ICMP_BURST} packets } drop
+        ip protocol icmp icmp type echo-request accept
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
-        icmpv6 type echo-request meter icmp6 { ip6 saddr limit rate ${ICMP_RATE}/second burst ${ICMP_BURST} packets } accept
-        icmpv6 type echo-request drop
+        icmpv6 type echo-request update @icmp6 { ip6 saddr limit rate over ${ICMP_RATE}/second burst ${ICMP_BURST} packets } drop
+        icmpv6 type echo-request accept
         icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, packet-too-big, time-exceeded, parameter-problem, destination-unreachable, mld-listener-query, mld-listener-report, mld-listener-done } accept
 
 $SYNPROXY_IN
@@ -986,8 +1062,14 @@ $PORTSCAN
 NFT
 
 # ─── Проверка синтаксиса ДО применения ───────────────────────────────────────
-if ! nft -c -f "$NFT_FILE"; then
-    err "Сгенерированный ruleset не прошёл nft -c. Файл: $NFT_FILE (ничего не применено)."
+chmod 0644 "$NFT_NEW"
+if ! nft -c -f "$NFT_NEW"; then
+    if [[ "$DRY_RUN" == "1" ]]; then
+        err "Сгенерированный ruleset не прошёл nft -c. Файл: $NFT_NEW (ничего не применено)."
+    else
+        mv -f "$NFT_NEW" "$NFT_REJECTED"
+        err "Сгенерированный ruleset не прошёл nft -c — ничего не применено, файл автозагрузки $NFT_FILE не тронут. Отвергнутый ruleset: $NFT_REJECTED"
+    fi
     exit 1
 fi
 ok "nft -c: синтаксис валиден"
@@ -1054,7 +1136,18 @@ fi
 
 # ─── Применяем (с сейфти-таймером) ───────────────────────────────────────────
 arm_safety
-nft -f "$NFT_FILE"
+if ! nft -f "$NFT_NEW"; then
+    # Ядро отвергло транзакцию целиком — живая таблица осталась прежней. Взведённый сейфти
+    # через SAFETY_DELAY снёс бы её И выключил автозагрузку: нода, которой ре-ран не
+    # изменил ничего, осталась бы без защиты.
+    disarm_safety
+    mv -f "$NFT_NEW" "$NFT_REJECTED"
+    err "nft -f не применил ruleset (ядро отвергло транзакцию) — живые правила и файл автозагрузки прежние. Отвергнутый ruleset: $NFT_REJECTED"
+    exit 1
+fi
+backup_file "$NFT_FILE" "$BACKUP"
+mv -f "$NFT_NEW" "$NFT_FILE"
+rm -f "$NFT_REJECTED" 2>/dev/null || true
 ok "nftables na_filter применён"
 # новый руллсет применён → прошлое срабатывание сейфти больше не актуально
 rm -f "$STATE_DIR/safety-fired.last" 2>/dev/null || true

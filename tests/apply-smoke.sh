@@ -107,7 +107,21 @@ grep -q '^node_port=2222,3000$' "$T/state/protect.installed" || { echo "[x] stri
 grep -q '198.51.100.7' "$NFTF" && { echo "[x] strict: пир НЕ должен попадать в сет при явном NODE_PORT_WHITELIST_ONLY=1"; fail=1; }
 grep -qF 'node-port сейчас держат коннект: 198.51.100.7' "$LOG" || { echo "[x] strict: нет warn со списком established-пиров node-порта"; fail=1; }
 grep -q '^fw_mode=strict$' "$T/state/protect.installed" || { echo "[x] strict: fw_mode=strict не в маркере"; fail=1; }
-grep -qE 'meter (osyn|occ|oudp)' "$NFTF" && { echo "[x] strict: generic open-лимитеры не должны ставиться (ruleset должен быть идентичен прежнему)"; fail=1; }
+grep -qE '(@osyn|meter occ|@oudp)' "$NFTF" && { echo "[x] strict: generic open-лимитеры не должны ставиться (ruleset должен быть идентичен прежнему)"; fail=1; }
+# v4.1.3: per-IP лимитеры — объявленные наборы С timeout, правило «превысил → drop»
+grep -q 'set syn4_443 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 60s; }' "$NFTF" \
+    || { echo "[x] strict: набор syn4_443 без timeout (записи копятся до ребута → полный набор режет новых клиентов)"; fail=1; }
+grep -q 'set ssh4 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 10m; }' "$NFTF" \
+    || { echo "[x] strict: набор ssh4 без timeout 10m"; fail=1; }
+grep -q 'update @syn4_443 { ip saddr limit rate over 200/second burst 400 packets } jump synflood_drop' "$NFTF" \
+    || { echo "[x] strict: SYN-лимит не по схеме «превысил → drop»"; fail=1; }
+if grep -qE 'meter [A-Za-z0-9_]+ \{ ip6? saddr limit' "$NFTF"; then
+    echo "[x] strict: остался meter с limit без timeout:"; grep -nE 'meter [A-Za-z0-9_]+ \{ ip6? saddr limit' "$NFTF"; fail=1
+fi
+for st in ps4 psc4 icmp4 udp4_443; do
+    grep -q "set $st { type ipv4_addr; size 65535; flags dynamic,timeout;" "$NFTF" || { echo "[x] strict: нет набора $st с timeout"; fail=1; }
+done
+grep -q 'chain ssh_flood {' "$NFTF" || { echo "[x] strict: нет цепочки ssh_flood"; fail=1; }
 
 # Сброс окружения между прогонами режимов
 reset_t() {
@@ -128,9 +142,10 @@ if [ "$rc" -ne 0 ]; then echo "[x] FW_MODE=open: apply упал (exit $rc)"; tai
 grep -qiE 'unbound variable|bad substitution' "$LOG2" && { echo "[x] open: unbound-переменная:"; grep -iE 'unbound variable|bad substitution' "$LOG2"; fail=1; }
 grep -q 'hook input priority filter; policy accept;' "$NFTF" || { echo "[x] open: нет policy accept на input"; fail=1; }
 grep -q 'counter accept' "$NFTF" || { echo "[x] open: нет catch-all accept"; fail=1; }
-grep -q 'meter osyn4' "$NFTF" || { echo "[x] open: нет generic per-IP SYN-rate для неперечисленных портов"; fail=1; }
+grep -q 'update @osyn4 { ip saddr limit rate over' "$NFTF" || { echo "[x] open: нет generic per-IP SYN-rate для неперечисленных портов"; fail=1; }
 grep -q 'meter occ4'  "$NFTF" || { echo "[x] open: нет generic per-IP conn-limit для неперечисленных портов"; fail=1; }
-grep -q 'meter oudp4' "$NFTF" || { echo "[x] open: нет generic per-IP UDP-rate для неперечисленных портов"; fail=1; }
+grep -q 'update @oudp4 { ip saddr limit rate over' "$NFTF" || { echo "[x] open: нет generic per-IP UDP-rate для неперечисленных портов"; fail=1; }
+grep -q 'set osyn4 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 60s; }' "$NFTF" || { echo "[x] open: набор osyn4 без timeout"; fail=1; }
 grep -q 'ANTI-SCAN' "$NFTF" && { echo "[x] open: анти-скан автобан не должен ставиться"; fail=1; }
 grep -qE 'tcp dport \{ 2222|na_nodeport_wl' "$NFTF" && { echo "[x] open: node-port правила/сеты не должны ставиться"; fail=1; }
 grep -q 'ssh-flood' "$NFTF" || { echo "[x] open: SSH-защита должна оставаться"; fail=1; }
@@ -243,6 +258,53 @@ grep -q '^ssh_port=22,56777$' "$T/state/protect.installed" \
   || { echo "[x] ssh-port: эффективный список портов не в маркере"; fail=1; }
 grep -q 'SSH_PORT:=22}' "$T/conf/protect.conf" \
   || { echo "[x] ssh-port: в protect.conf должен персиститься intent (22), а не транзитный порт сессии"; fail=1; }
+
+# ── Файл автозагрузки меняется только после nft -c И успешного nft -f (v4.1.3) ──
+# До v4.1.3 ruleset генерился прямо в na_filter.nft: провал проверки печатал «ничего не
+# применено», а битый файл уже стоял на месте рабочего и поднимался первым же ребутом.
+nft_fail_on() {   # nft_fail_on <check|apply> — стаб nft, падающий на nft -c или на nft -f
+    if [ "$1" = check ]; then
+        printf '#!/bin/sh\ncase "$*" in *-c*) exit 1;; esac\nexit 0\n' > "$T/bin/nft"
+    else
+        printf '#!/bin/sh\ncase "$*" in *-c*) exit 0;; "-f "*) exit 1;; esac\nexit 0\n' > "$T/bin/nft"
+    fi
+    chmod +x "$T/bin/nft"
+}
+for mode in check apply; do
+    reset_t
+    echo '# OLD-WORKING-RULESET' > "$NFTF"
+    : > "$NA_TEST_SYSTEMCTL_LOG"
+    nft_fail_on "$mode"
+    LOG8="$T/apply-nftfail-$mode.log"
+    set +e
+    ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$LOG8" 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || { echo "[x] nft-$mode-fail: protect должен завершиться ошибкой"; fail=1; }
+    grep -qx '# OLD-WORKING-RULESET' "$NFTF" || { echo "[x] nft-$mode-fail: файл автозагрузки подменён отвергнутым ruleset"; fail=1; }
+    [ -s "$T/conf/na_filter.nft.rejected" ] || { echo "[x] nft-$mode-fail: отвергнутый ruleset не сохранён рядом (.rejected)"; fail=1; }
+    ls "$T/conf"/.na_filter.nft.* >/dev/null 2>&1 && { echo "[x] nft-$mode-fail: остался временный кандидат"; fail=1; }
+    [ -e "$T/state/protect.installed" ] && { echo "[x] nft-$mode-fail: маркер не должен писаться при отказе"; fail=1; }
+    if [ "$mode" = apply ]; then
+        # nft -f отвергнут → живая таблица прежняя → сейфти обязан быть снят, иначе он
+        # через SAFETY_DELAY снёс бы рабочую таблицу и автозагрузку
+        # arm_safety сам гасит прошлый таймер перед взводом → ждём ДВА stop: взвод + снятие
+        [ "$(grep -c 'stop na-fw-safety.timer' "$NA_TEST_SYSTEMCTL_LOG")" -ge 2 ] \
+            || { echo "[x] nft-apply-fail: сейфти не снят после отказа nft -f"; fail=1; }
+    fi
+done
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/nft"; chmod +x "$T/bin/nft"
+# успешный прогон: кандидат переименован в файл автозагрузки, прошлый — в бэкапе
+reset_t
+echo '# OLD-WORKING-RULESET' > "$NFTF"
+set +e
+ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-ok.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "[x] nft-ok: прогон упал (exit $rc)"; tail -15 "$T/apply-ok.log"; fail=1; }
+grep -q 'table inet na_filter {' "$NFTF" || { echo "[x] nft-ok: новый ruleset не стал файлом автозагрузки"; fail=1; }
+grep -qx '# OLD-WORKING-RULESET' "$T/backup/na_filter.nft" 2>/dev/null || { echo "[x] nft-ok: прошлый ruleset не попал в бэкап"; fail=1; }
+ls "$T/conf"/.na_filter.nft.* >/dev/null 2>&1 && { echo "[x] nft-ok: остался временный кандидат"; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
