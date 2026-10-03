@@ -71,9 +71,19 @@ check "v6-whitelist: CIDR в живом наборе" 1 "$(nft list set ip6 "$TB
 # bouncer добавляет решения с timeout — набор обязан это принимать
 rc=0; nft add element ip "$TB4" na-t-blacklists '{ 192.0.2.10 timeout 1h }' || rc=$?
 check "в набор блок-листа добавляется адрес с timeout (как это делает bouncer)" 0 "$rc"
-# na-fw allow: flush + add element в живой набор (тем же текстом, что генерирует na-fw)
-rc=0; printf 'flush set ip %s na_wl4\nadd element ip %s na_wl4 { 203.0.113.7, 198.51.100.0/24, 198.51.100.9 }\n' "$TB4" "$TB4" | nft -f - || rc=$?
-check "правка живого набора как в na-fw allow (с адресом внутри CIDR)" 0 "$rc"
+# na-fw allow правит живой набор поэлементно: add, а для адреса, уже покрытого CIDR-ом
+# набора, — get element (nft 0.9.3 отвергает такой add: «interval overlaps»; пачкой
+# `flush` + `add` вся транзакция откатывалась, и набор не обновлялся вовсе)
+covered_or_added() {   # тот же порядок команд, что в na-fw
+    nft add element ip "$TB4" na_wl4 "{ $1 }" 2>/dev/null || nft get element ip "$TB4" na_wl4 "{ $1 }" >/dev/null 2>&1
+}
+rc=0; covered_or_added 198.51.100.9 || rc=$?
+check "na-fw allow: адрес внутри CIDR набора — добавлен или покрыт" 0 "$rc"
+rc=0; covered_or_added 192.0.2.77 || rc=$?
+check "na-fw allow: новый адрес вне CIDR — добавлен" 0 "$rc"
+check "…и виден в живом наборе" 1 "$(nft list set ip "$TB4" na_wl4 2>/dev/null | grep -c '192.0.2.77')"
+rc=0; nft delete element ip "$TB4" na_wl4 '{ 192.0.2.77 }' 2>/dev/null || rc=$?
+check "na-fw allow del: одиночный адрес удаляется" 0 "$rc"
 # ре-ран / юнит na-crowdsec-scope на буте: тот же файл поверх живой таблицы
 rc=0; nft -f "$T/conf/na-crowdsec-scope.nft" || rc=$?
 check "повторная загрузка файла поверх живой таблицы" 0 "$rc"

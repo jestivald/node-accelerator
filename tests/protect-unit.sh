@@ -414,7 +414,25 @@ NF
     check "…и conf обновлён (не оборвалось посередине)" 1 "$(grep -c 'WHITELIST:=203.0.113.7,198.51.100.8}' "$F/etc/protect.conf")"
     fw allow del 198.51.100.8 >/dev/null
     check "отказ на /0" 1 "$(fw allow add 0.0.0.0/0 | grep -c 'слишком широко')"
+    # правило CROWDSEC_SCOPE=ssh стоит — его whitelist-наборы правятся поэлементно (nft 0.9.x
+    # отвергал `flush` + `add` всем списком, когда адрес внутри CIDR того же списка)
+    cat > "$F/etc/na-crowdsec-scope.nft" <<'SCN'
+table ip crowdsec {
+    set crowdsec-blacklists { type ipv4_addr; flags timeout; }
+    set na_wl4 { type ipv4_addr; flags interval; auto-merge; elements = { 203.0.113.7 } } # na-wl4
+}
+table ip6 crowdsec6 {
+    set crowdsec6-blacklists { type ipv6_addr; flags timeout; }
+    set na_wl6 { type ipv6_addr; flags interval; auto-merge; } # na-wl6
+}
+SCN
+    : > "$F/nft.log"
     fw allow add 198.51.100.9 2001:db8::5 >/dev/null
+    check "scope: строка-набор v4 в файле переписана" 1 \
+          "$(grep -c 'set na_wl4 { type ipv4_addr; flags interval; auto-merge; elements = { 198.51.100.9, 203.0.113.7 } } # na-wl4' "$F/etc/na-crowdsec-scope.nft")"
+    check "scope: живые наборы — поэлементно, обе семьи" 2 \
+          "$(grep -cE '^add element ip crowdsec na_wl4 \{ 198\.51\.100\.9 \}$|^add element ip6 crowdsec6 na_wl6 \{ 2001:db8::5 \}$' "$F/nft.log")"
+    check "scope: без flush всего набора" 0 "$(grep -c '^flush set' "$F/nft.log")"
     check "allow add: protect.conf дополнен" 1 "$(grep -c 'WHITELIST:=203.0.113.7,198.51.100.9,2001:db8::5}' "$F/etc/protect.conf")"
     check "allow add: v4 в na_filter.nft" 1 "$(grep -c 'elements = { 198.51.100.9, 203.0.113.7 }' "$F/etc/na_filter.nft")"
     check "allow add: v6 в na_filter.nft" 1 "$(grep -c 'set whitelist_v6 { type ipv6_addr; flags interval; auto-merge; elements = { 2001:db8::5 } }' "$F/etc/na_filter.nft")"
@@ -426,6 +444,7 @@ NF
     check "allow del: убран из conf" 1 "$(grep -c 'WHITELIST:=198.51.100.9,2001:db8::5}' "$F/etc/protect.conf")"
     check "allow del: убран из файла" 0 "$(grep -c '203.0.113.7' "$F/etc/na_filter.nft")"
     check "allow del: убран из живого сета" 1 "$(grep -c 'delete element inet na_filter whitelist_v4 { 203.0.113.7 }' "$F/nft.log")"
+    check "allow del: убран из живого набора scope" 1 "$(grep -c '^delete element ip crowdsec na_wl4 { 203.0.113.7 }$' "$F/nft.log")"
     check "мусор вместо адреса — отказ" 1 "$(fw allow add '1.2.3.4;rm' | grep -c 'не IPv4/IPv6/CIDR')"
     fw unban 192.0.2.66 >/dev/null
     check "unban: autoban и suspect" 2 "$(grep -cE 'delete element inet na_filter (autoban|suspect)_v4 \{ 192.0.2.66 \}' "$F/nft.log")"

@@ -2343,12 +2343,20 @@ case "$cmd" in
             tmp="$(mktemp "$SCOPE_NFT.XXXXXX")"
             awk -v l4="$s4l" -v l6="$s6l" '/# na-wl4$/{print l4; next} /# na-wl6$/{print l6; next} {print}' "$SCOPE_NFT" > "$tmp"
             mv -f "$tmp" "$SCOPE_NFT"
-            for f in 4 6; do
-                tb="$t4"; fm=ip; [[ "$f" == 6 ]] && { tb="$t6"; fm=ip6; }
+            # поэлементно, как основной whitelist: на nft 0.9.x `flush` + `add` всем списком
+            # падает целиком («interval overlaps»), если адрес лежит внутри CIDR из того же
+            # списка. Адрес, уже покрытый CIDR-ом набора, и так в whitelist — это проверяет get.
+            for x in ${live_add[@]+"${live_add[@]}"} ${live_del[@]+"${live_del[@]}"}; do
+                f="${x%% *}"; a="${x#* }"; tb="$t4"; fm=ip; [[ "$f" == 6 ]] && { tb="$t6"; fm=ip6; }
                 [[ -n "$tb" ]] || continue
-                el="$(file_elems "$f" | paste -sd, - | sed 's/,/, /g')"
-                { echo "flush set $fm $tb na_wl$f"; [[ -n "$el" ]] && echo "add element $fm $tb na_wl$f { $el }"; } \
-                    | nft -f - 2>/dev/null || echo "[!] живой набор na_wl$f правила CrowdSec не обновлён — применится при ребуте" >&2
+                if [[ "$sub" == add ]]; then
+                    nft add element "$fm" "$tb" "na_wl$f" "{ $a }" 2>/dev/null \
+                        || nft get element "$fm" "$tb" "na_wl$f" "{ $a }" >/dev/null 2>&1 \
+                        || echo "[!] $a не добавлен в живой набор na_wl$f правила CrowdSec — применится при ребуте/ре-ране protect" >&2
+                else
+                    nft delete element "$fm" "$tb" "na_wl$f" "{ $a }" 2>/dev/null \
+                        || echo "[!] $a не удалён из живого набора na_wl$f правила CrowdSec (слит с соседним интервалом?) — уйдёт при ребуте/ре-ране protect" >&2
+                fi
             done
         fi
         # 6) хэш файла в маркере: правка через na-fw — не «ручная»

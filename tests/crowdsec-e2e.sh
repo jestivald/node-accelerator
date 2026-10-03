@@ -59,6 +59,13 @@ cscli decisions add --ip 198.51.100.77 --duration 2h --reason na-e2e >/dev/null
 wait_for 40 in_table 198.51.100.77 && check "обычный режим: решение в таблице bouncer'а" 1 1 \
     || { check "обычный режим: решение в таблице bouncer'а" 1 0; dump; }
 
+# diagnose/na-report считают решения через `decisions list [-a] --limit 0 -o raw`: флаг должен
+# приниматься этим cscli, а строки данных — начинаться с числового id (как разбирает awk)
+rc=0; raw="$(cscli decisions list -a --limit 0 -o raw 2>&1)" || rc=$?
+check "cscli принимает --limit 0 (-a, -o raw)" 0 "$rc"
+check "…строка решения с числовым id и нашим адресом" 1 \
+      "$(awk -F, '$1 ~ /^[0-9]+$/ && /198\.51\.100\.77/ {c++} END {print (c > 0)}' <<<"$raw")"
+
 for step in "1:ssh" "2:ssh" "3:all" "4:ssh"; do
     n="${step%%:*}"; want="${step#*:}"
     echo "== $n. CROWDSEC_SCOPE=$want"
