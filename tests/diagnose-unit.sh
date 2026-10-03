@@ -259,6 +259,17 @@ case "$*" in
   "list table inet na_filter")   exit 0 ;;
   "list table inet na_ctguard")  exit 1 ;;
   "list table ip crowdsec")      [ "${NA_TEST_CS_TABLE:-0}" = 1 ] && exit 0; exit 1 ;;
+  # живые правила bouncer'а: all — дроп без порта (дефолт bouncer'а), ssh — только :22
+  # (CROWDSEC_SCOPE=ssh или ручная настройка), none — set-only без правил
+  "-t list table ip crowdsec")
+      [ "${NA_TEST_CS_TABLE:-0}" = 1 ] || exit 1
+      printf 'table ip crowdsec {\n\tset crowdsec-blacklists-CAPI {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}\n'
+      case "${NA_TEST_CS_RULES:-all}" in
+        all) printf '\tchain crowdsec-chain-input {\n\t\ttype filter hook input priority filter - 10; policy accept;\n\t\tip saddr @crowdsec-blacklists-CAPI drop\n\t}\n' ;;
+        ssh) printf '\tchain na-scope-input {\n\t\ttype filter hook input priority filter - 10; policy accept;\n\t\tip saddr { 203.0.113.5 } return # na-wl4\n\t\ttcp dport { 22 } ip saddr @crowdsec-blacklists-CAPI counter packets 5 bytes 300 drop\n\t}\n' ;;
+      esac
+      printf '}\n'; exit 0 ;;
+  "-t list table ip6 crowdsec6") exit 1 ;;
   "list counters table inet na_filter") [ -f "$NFTD/counters" ] && cat "$NFTD/counters"; exit 0 ;;
   "-t list ruleset")             [ -f "$NFTD/ruleset" ] && cat "$NFTD/ruleset"; exit 0 ;;
   "list chain inet na_filter input") cat "$NFTD/chain-input"; exit 0 ;;
@@ -890,12 +901,19 @@ env TERM=dumb NA_TEST_CS_TABLE=1 NA_TEST_DECISIONS=2 NA_TEST_CAPI=33 "$WBASH" "$
 grep_ok "текст: локальные и CAPI раздельно" "2 локальных (crowdsec/cscli), 33 из CAPI/списков" "$T/o15.txt"
 grep_ok "текст: scope неизвестен (≤4.1) + CAPI → ▲ «на ВСЕХ портах»" "режет 33 адресов CAPI/списков на ВСЕХ портах" "$T/o15.txt"
 grep_ok "текст: acquisition — только sshd" "CrowdSec читает: journalctl[_SYSTEMD_UNIT=ssh.service] journalctl[_SYSTEMD_UNIT=sshd.service] — только sshd" "$T/o15.txt"
+# правила сужены до :22 руками (маркера 4.2 ещё нет) — не ▲, а info «вручную» (по живым правилам)
+env TERM=dumb NA_TEST_CS_TABLE=1 NA_TEST_CS_RULES=ssh NA_TEST_CAPI=33 "$WBASH" "$DIAG" > "$T/o15m.txt" 2>/dev/null || true
+grep_ok  "ручной scope :22 → info по живым правилам" "блок-листы CrowdSec действуют только на портах 22 (по живым правилам, настроено вручную)" "$T/o15m.txt"
+grep_not "ручной scope → ▲ «на ВСЕХ портах» нет" "на ВСЕХ портах" "$T/o15m.txt"
 printf 'crowdsec_scope=ssh\n' >> "$PROT"
-env TERM=dumb NA_TEST_CS_TABLE=1 NA_TEST_CAPI=33 "$WBASH" "$DIAG" > "$T/o15b.txt" 2>/dev/null || true
-grep_ok  "scope=ssh из маркера → info" "блок-листы CrowdSec действуют только на SSH-порт" "$T/o15b.txt"
+env TERM=dumb NA_TEST_CS_TABLE=1 NA_TEST_CS_RULES=ssh NA_TEST_CAPI=33 "$WBASH" "$DIAG" > "$T/o15b.txt" 2>/dev/null || true
+grep_ok  "scope=ssh → info" "блок-листы CrowdSec действуют только на портах 22 (по живым правилам)" "$T/o15b.txt"
 grep_not "scope=ssh → ▲ «на ВСЕХ портах» нет" "на ВСЕХ портах" "$T/o15b.txt"
-env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o15c.json" 2>/dev/null || true
-check "json: crowdsec_scope из маркера" ssh "$(jget "$T/o15c.json" crowdsec_scope)"
+env TERM=dumb NA_TEST_CS_TABLE=1 NA_TEST_CS_RULES=ssh "$WBASH" "$DIAG" --json > "$T/o15c.json" 2>/dev/null || true
+check "json: crowdsec_scope по живым правилам" "ports:22" "$(jget "$T/o15c.json" crowdsec_scope)"
+# set-only без правил при наличии решений — блок-листы никого не режут: ▲
+env TERM=dumb NA_TEST_CS_TABLE=1 NA_TEST_CS_RULES=none NA_TEST_CAPI=33 "$WBASH" "$DIAG" > "$T/o15n.txt" 2>/dev/null || true
+grep_ok  "решения есть, правил нет → ▲" "а правил, которые их применяют, нет" "$T/o15n.txt"
 cp "$T/protect.installed.orig" "$PROT"
 
 echo "== 16. whitelist: 4-й слой — эффективный allowlist CrowdSec (v4.2) =="

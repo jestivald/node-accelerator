@@ -278,6 +278,21 @@ mark_val() {
 # csv_norm <список> — порты через запятую: только числа, по возрастанию, без повторов
 csv_norm() { tr ', ' '\n\n' <<<"$1" | grep -E '^[0-9]+$' | sort -un | paste -sd, -; }
 # окно дельт по-человечески: «45 с» / «12 мин» (а не «за 0 мин» при коротком окне)
+# cs_live_scope — где РЕАЛЬНО действуют блок-листы CrowdSec, по живым правилам таблиц
+# bouncer'а (маркер есть только после protect 4.2, а на части флота CrowdSec сужали до SSH
+# руками): all — есть drop по набору без ограничения портом; ports:<список> — все такие
+# правила с dport; none — правил нет вовсе (set-only без своих правил: решения никого не
+# режут); rc=1 — таблиц bouncer'а нет.
+cs_live_scope() {
+    local t rules
+    t="$( { nft -t list table ip crowdsec 2>/dev/null; nft -t list table ip6 crowdsec6 2>/dev/null; } )"
+    [[ -n "$t" ]] || return 1
+    rules="$(grep -E 'saddr @[A-Za-z0-9_.-]+ .*(drop|reject)' <<<"$t" || true)"
+    if [[ -z "$rules" ]]; then echo none
+    elif grep -qvE 'dport' <<<"$rules"; then echo all
+    else echo "ports:$(grep -oE 'dport (\{[^}]*\}|[0-9]+)' <<<"$rules" | grep -oE '[0-9]+' | sort -un | paste -sd, -)"
+    fi
+}
 dw_h() { if (( ${DW:-0} < 60 )); then echo "${DW:-0} с"; else echo "$(( DW / 60 )) мин"; fi; }
 
 # Живая input-цепочка na_filter — читаем ОДИН раз (её смотрят несколько сенсоров).
@@ -864,7 +879,7 @@ emit_json() {
     csl=-1; csc=-1
     if tmpv="$(cs_decisions)"; then read -r csl csc <<<"$tmpv"; fi
     [[ "$csl" =~ ^-?[0-9]+$ ]] || csl=-1; [[ "$csc" =~ ^-?[0-9]+$ ]] || csc=-1
-    csscope="$(mark_val crowdsec_scope)"
+    csscope="$(cs_live_scope 2>/dev/null || mark_val crowdsec_scope)"
     # живой whitelist, не прикрытый ЭФФЕКТИВНЫМ allowlist CrowdSec (−1 = сверять не с чем):
     # такой адрес CrowdSec может забанить, а bouncer режет раньше na_filter
     wdcs=-1
@@ -1720,15 +1735,24 @@ if command -v cscli >/dev/null 2>&1; then
         info "CrowdSec decisions: не измерено (cscli не ответил)"; DEC_C=0
     fi
     CS_SCOPE="$(mark_val crowdsec_scope)"
-    if nft list table ip crowdsec >/dev/null 2>&1; then
-        case "$CS_SCOPE" in
-            ssh) info "блок-листы CrowdSec действуют только на SSH-порт (crowdsec_scope=ssh)" ;;
-            all) info "блок-листы CrowdSec действуют на ВСЕ порты (crowdsec_scope=all — выбор оператора)" ;;
-            *)   if [[ "${DEC_C:-0}" -gt 0 ]]; then
-                     wrn "bouncer CrowdSec (priority -10, раньше na_filter) режет ${DEC_C} адресов CAPI/списков на ВСЕХ портах — в т.ч. мобильный CGNAT; protect v4.2 сужает до SSH (CROWDSEC_SCOPE=ssh)"
-                 else
-                     info "таблица bouncer'а ip crowdsec присутствует (priority -10, раньше na_filter; область — все порты)"
-                 fi ;;
+    if CS_LIVE="$(cs_live_scope)"; then
+        case "$CS_LIVE" in
+            ports:*)
+                info "блок-листы CrowdSec действуют только на портах ${CS_LIVE#ports:} (по живым правилам$([[ -z "$CS_SCOPE" ]] && echo ', настроено вручную'))" ;;
+            all)
+                if [[ "$CS_SCOPE" == all ]]; then
+                    info "блок-листы CrowdSec действуют на ВСЕ порты (CROWDSEC_SCOPE=all — выбор оператора)"
+                elif [[ "${DEC_C:-0}" -gt 0 ]]; then
+                    wrn "bouncer CrowdSec (priority -10, раньше na_filter) режет ${DEC_C} адресов CAPI/списков на ВСЕХ портах — в т.ч. мобильный CGNAT; protect v4.2 сужает до SSH (CROWDSEC_SCOPE=ssh)"
+                else
+                    info "таблица bouncer'а ip crowdsec присутствует (priority -10, раньше na_filter; область — все порты)"
+                fi ;;
+            none)
+                if [[ "$(( ${DEC_L:-0} + ${DEC_C:-0} ))" -gt 0 ]]; then
+                    wrn "решений CrowdSec $(( ${DEC_L:-0} + ${DEC_C:-0} )), а правил, которые их применяют, нет (bouncer в set-only без своих правил?) — блок-листы никого не режут: ре-ран protect (CROWDSEC_SCOPE=ssh|all)"
+                else
+                    info "таблицы bouncer'а есть, правил нет (решений тоже нет)"
+                fi ;;
         esac
     fi
     # откуда CrowdSec вообще берёт события: на флоте — только journal sshd
