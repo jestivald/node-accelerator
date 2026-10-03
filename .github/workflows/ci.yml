@@ -50,7 +50,8 @@ jobs:
         # Юнит рапортовал success при неприменённом RPS: default route на буте появляется
         # позже network-online.target, скрипт молча выходил нулём (#30). Теперь NIC из
         # ExecStart, ожидание маршрута, фолбэк на физические, честный отказ; плюс #28 —
-        # в перенаправленном stdout нет escape-кодов курсора.
+        # в перенаправленном stdout нет escape-кодов курсора. v4.2: без RPS на 1 vCPU и
+        # при RX-очередей ≥ ядер, XPS только с NA_XPS=1, маски из снимка, venet0.
         run: bash tests/rps-unit.sh
       - name: psi unit (секция PSI optimize.sh + откат против стаба update-grub)
         # ENABLE_PSI=1 дописывает psi=1 в GRUB_CMDLINE_LINUX_DEFAULT идемпотентно, =0 не
@@ -66,7 +67,23 @@ jobs:
         # считают адреса (#32); датчик CONN_LIMIT без loopback/whitelist (#31); дрейф
         # whitelist относительно protect.conf (#38); PSI три состояния (#37); серты в
         # /opt/*/certs и снятые с renew (#39); глубина журнала (#35); RPS-юнит vs факт (#30).
+        # v4.2: дельты счётчиков между запусками, steal окном 3 с, PSI avg60, ложные ▲ по
+        # аудиту флота, порты из живых правил, CrowdSec по источникам, allowlist CrowdSec,
+        # DNAT мимо na_filter, слушатели вне файрвола, просроченный серт, Caddy/nginx.
         run: bash tests/diagnose-unit.sh
+      - name: optimize unit (секции sysctl/journald/снимки/проверки XanMod + откат runtime против стабов)
+        # v4.2: чужой sysctl.d, перебивающий наш ключ, назван по имени; порты xray внутри
+        # эфемерного диапазона (вкл. 127.0.0.1:10085) резервируются без потери резерва
+        # оператора; без net.ipv6.conf.all.forwarding; journald 10-na-size.conf +
+        # persistent при volatile; откат возвращает sysctl/RPS/XPS/THP без ребута; Secure
+        # Boot и тесный /boot — без ядра, initrd и драйвер NIC — до «нужна перезагрузка»;
+        # default_iface после `dev` (venet0/multipath); apt ждёт чужой dpkg-лок.
+        run: bash tests/optimize-unit.sh
+      - name: na-report unit (CrowdSec по строкам raw, честные метрики 5 мин, asn_enrichment)
+        # v4.2: решения считались по полям "value" в -o json (×33 на ноде флота);
+        # ban_rate_5m был числом строк лога — рядом events_5m/unique_src_5m; флаг
+        # ok|partial|unavailable для ASN; управляющий символ из whois не ломает JSON.
+        run: bash tests/na-report-unit.sh
       - name: lint — никаких `cmd | grep -q` под pipefail (SIGPIPE → ложное «нет»)
         # grep -q закрывает пайп на первом совпадении; дописывающая команда ловит SIGPIPE,
         # пайплайн под pipefail отдаёт 141. В v4.1.2 так через раз гас сенсор лога
@@ -103,6 +120,42 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 python3
       - name: real nft in netns (timeout у наборов, fail-open на полном наборе, rate-limit)
         run: sudo bash tests/nft-behavior.sh
+      - name: правило CROWDSEC_SCOPE=ssh на настоящем nft (auto-merge, правка как в na-fw, ре-загрузка)
+        run: sudo bash tests/cs-scope-nft.sh
+
+  # ── CROWDSEC_SCOPE на НАСТОЯЩЕМ crowdsec-firewall-bouncer ───────────────────
+  # Блокер ревью v4.2: restart bouncer'а после наших таблиц — старый процесс на выходе
+  # удалял таблицу, новый в set-only не стартовал, и CrowdSec не блокировал ничего. Юнит
+  # подменяет systemctl/nft; здесь bouncer настоящий (репо packagecloud, как в protect.sh).
+  crowdsec-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-пин: плавающий тег v4 может быть перенесён на другой коммит
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install CrowdSec + nftables bouncer (packagecloud any/any, ключ — в keyring)
+        run: |
+          curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/crowdsec.gpg
+          echo "deb [signed-by=/usr/share/keyrings/crowdsec.gpg] https://packagecloud.io/crowdsec/crowdsec/any any main" \
+            | sudo tee /etc/apt/sources.list.d/crowdsec.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables crowdsec crowdsec-firewall-bouncer-nftables
+      - name: Bouncer зарегистрирован в LAPI и запущен
+        # postinst регистрирует bouncer и запускает его, только если LAPI уже отвечал; на
+        # раннере crowdsec поднимается позже — регистрируем сами (ключ локальный, одноразовый)
+        run: |
+          Y=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+          sudo systemctl start crowdsec
+          for i in $(seq 60); do sudo cscli lapi status >/dev/null 2>&1 && break; sleep 1; done
+          sudo cscli lapi status
+          if ! sudo grep -qE '^api_key:[[:space:]]*[A-Za-z0-9]' "$Y"; then
+            KEY="$(sudo cscli bouncers add "na-ci-$(date +%s)" -o raw)"
+            sudo sed -i -E "s|^api_key:.*|api_key: ${KEY}|" "$Y"
+          fi
+          sudo systemctl enable --now crowdsec-firewall-bouncer
+          sleep 3; systemctl is-active crowdsec-firewall-bouncer \
+            || { sudo journalctl -u crowdsec-firewall-bouncer -n 30 --no-pager; exit 1; }
+      - name: ssh ↔ all на настоящем bouncer'е (не падает, решения доезжают)
+        run: sudo bash tests/crowdsec-e2e.sh
 
   # ── Smoke-тесты на матрице дистрибутивов ────────────────────────────────────
   # Ловит ровно тот класс регрессий, из-за которых появился этот PR: установка
@@ -113,6 +166,10 @@ jobs:
       fail-fast: false
       matrix:
         image:
+          # focal: самый старый nft из заявленных (0.9.3). Debian 11 (nft 0.9.8) вне LTS: в
+          # образе пакеты из debian-security, а пул security без файлов из индексов (404, и
+          # в snapshot тоже) — apt не ставит даже git; синтаксис покрывает focal.
+          - "ubuntu:20.04"
           - "debian:bookworm"
           - "debian:trixie"
           - "ubuntu:22.04"   # jammy → подменяется на bookworm
@@ -137,6 +194,8 @@ jobs:
             bash curl gnupg nftables iproute2 gawk procps kmod coreutils irqbalance ethtool jq
       - name: Syntax (bash -n)
         run: bash -n install.sh scripts/*.sh scripts/lib/*.sh
+      - name: правило CROWDSEC_SCOPE=ssh грузится nft этой ОС (whitelist с auto-merge)
+        run: bash tests/cs-scope-nft.sh
       - name: protect.sh DRY_RUN (дефолты — генерация + nft -c)
         run: DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
       - name: protect.sh DRY_RUN (full-feature — blocklists/fleet/whitelist-only/ban-once → nft -c)

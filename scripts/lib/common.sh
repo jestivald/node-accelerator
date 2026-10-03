@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="4.1.3"
+NA_VERSION="4.2"
 
 # Числа — только с десятичной ТОЧКОЙ, сообщения утилит — на C. На ноде с LANG/LC_ALL=
 # de_DE.UTF-8 mawk читал «0.35» из /proc/loadavg как 0 (в JSON уезжал "load1":0), printf
@@ -187,17 +187,23 @@ backup_file() {
     return 0
 }
 
+# apt по умолчанию НЕ ждёт чужой dpkg-лок, а падает сразу. На свежем боксе первые минуты
+# лок держит unattended-upgrades: обе попытки ниже падали подряд, и optimize/protect
+# умирали под set -e на первой же зависимости — при живом репозитории и исправном боксе.
+# 120 с хватает, чтобы дождаться штатного прогона unattended-upgrades.
+NA_APT_LOCK_TIMEOUT="${NA_APT_LOCK_TIMEOUT:-120}"
 apt_install() {
+    local -a lk=(-o "DPkg::Lock::Timeout=$NA_APT_LOCK_TIMEOUT")
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq 2>/dev/null || true
-    if ! apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1; then
+    apt-get "${lk[@]}" update -qq 2>/dev/null || true
+    if ! apt-get "${lk[@]}" install -y -qq --no-install-recommends "$@" >/dev/null 2>&1; then
         # Прерванный прошлый прогон / битый dpkg — частый кейс на чужих нодах:
         # dpkg --configure -a + `apt-get -f install` чинят состояние, затем один ретрай.
         warn "apt install $*: первая попытка не прошла — чиню dpkg и повторяю"
         dpkg --configure -a >/dev/null 2>&1 || true
-        apt-get install -y -qq -f >/dev/null 2>&1 || true
-        apt-get update -qq 2>/dev/null || true
-        apt-get install -y -qq --no-install-recommends "$@" >/dev/null
+        apt-get "${lk[@]}" install -y -qq -f >/dev/null 2>&1 || true
+        apt-get "${lk[@]}" update -qq 2>/dev/null || true
+        apt-get "${lk[@]}" install -y -qq --no-install-recommends "$@" >/dev/null
     fi
 }
 
@@ -207,8 +213,15 @@ confirm() {
     [[ "$ans" =~ ^[yYдД] ]]
 }
 
-# Основной интерфейс по default route.
-default_iface() { ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
+# Основной интерфейс по default route — токен ПОСЛЕ `dev`, а не пятое поле: `$5` верен
+# только для `default via <gw> dev <if> …`. На OpenVZ маршрут без шлюза
+# (`default dev venet0 scope link`) давал «scope», а у multipath (`default proto static
+# … nexthop via … dev eth0 …`) — мусор; дальше это имя шло в RPS, NIC-tune и diagnose.
+default_iface() {
+    # awk дочитывает вход до конца (без exit): под pipefail ранний выход дал бы SIGPIPE у ip
+    ip -o -4 route show default 2>/dev/null \
+        | awk '!f { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); f = 1; break } }'
+}
 
 # systemd-интервал ("5min"/"12h"/"90s"/"2d"/"300") → секунды. Для расчёта возраста
 # последнего успешного синка (fleet/blocklist) в диагностике.
@@ -235,23 +248,46 @@ systime_to_s() {
 #   2. `sshd -T` — раскрывает Include /etc/ssh/sshd_config.d/*.conf (сток bookworm/noble,
 #      cloud-init пишет порт именно в drop-in), т.е. надёжнее чтения одного файла;
 #   3. ss по слушателю; 4. сам sshd_config; 5. 22.
+# Все источники отдают ВСЕ порты (sshd на двух портах — типичная миграция), через запятую.
+# Свойство сокет-юнита называется `Listen` (формат «[::]:22 (Stream)»): до v4.2 тут читали
+# несуществующее `ListenStream` — ветка ssh.socket была мёртвой, и на Ubuntu 24.04+ с портом
+# в drop-in сокета детект молча отдавал 22 из `sshd -T`.
+_ports_csv() { tr -c '0-9\n' '\n' | grep -xE '[0-9]{1,5}' | awk '$1>=1 && $1<=65535 && !s[$1]++' | paste -sd, -; }
 detect_ssh_port() {
     local p="" u sshd_bin=""
     for u in ssh.socket sshd.socket; do
         systemctl is-active --quiet "$u" 2>/dev/null || continue
-        p="$(systemctl show "$u" -p ListenStream --value 2>/dev/null \
-             | awk -F: 'NF{print $NF}' | grep -xE '[0-9]+' | head -1)"
+        p="$(systemctl show "$u" -p Listen --value 2>/dev/null \
+             | grep -oE ':[0-9]+ \(Stream\)' | _ports_csv)"
         [[ -n "$p" ]] && break
     done
     if [[ -z "$p" ]]; then
         command -v sshd >/dev/null 2>&1 && sshd_bin=sshd
         [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]] && sshd_bin=/usr/sbin/sshd
-        [[ -n "$sshd_bin" ]] && p="$("$sshd_bin" -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+        [[ -n "$sshd_bin" ]] && p="$("$sshd_bin" -T 2>/dev/null | awk '$1=="port"{print $2}' | _ports_csv)"
     fi
-    [[ -z "$p" ]] && p="$(ss -tnlp 2>/dev/null | awk '/sshd|"ssh"|ssh\.socket/{n=split($4,a,":"); print a[n]; exit}')"
-    [[ -z "$p" ]] && p="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
-    [[ "$p" =~ ^[0-9]+$ ]] || p=""
+    # loopback не в счёт: sshd держит там X11-форвардинг сессий (127.0.0.1:6010+)
+    [[ -z "$p" ]] && p="$(ss -tnlp 2>/dev/null | awk '/sshd|"ssh"|ssh\.socket/ && $4 !~ /^(127\.|\[::1\])/ {n=split($4,a,":"); print a[n]}' | _ports_csv)"
+    [[ -z "$p" ]] && p="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config 2>/dev/null | _ports_csv)"
+    [[ "$p" =~ ^[0-9]+(,[0-9]+)*$ ]] || p=""
     echo "${p:-22}"
+}
+
+# SSH_CONNECTION текущей сессии. `sudo` (env_reset) его вычищает — а README сам предлагает
+# `sudo bash …`: без него не было ни авто-whitelist IP админа, ни защиты порта сессии, и
+# об этом никто не узнавал. Ищем у предков процесса (root читает их environ).
+ssh_conn_env() {
+    local pid="$$" n=0 v
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then printf '%s' "$SSH_CONNECTION"; return 0; fi
+    while [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && "$n" -lt 16 ]]; do
+        if [[ -r "/proc/$pid/environ" ]]; then
+            v="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p' | head -n1)"
+            [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+        fi
+        pid="$(awk '/^PPid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)"
+        n=$((n+1))
+    done
+    return 1
 }
 
 # Порт ЭТОГО сервера в текущей SSH-сессии. SSH_CONNECTION="<c-ip> <c-port> <s-ip> <s-port>" —
@@ -259,7 +295,8 @@ detect_ssh_port() {
 # Пусто, если запущено не по SSH (консоль/cron). Нужен, чтобы файрвол не отрезал порт,
 # на котором ты прямо сейчас сидишь (протухший protect.conf / сменили порт / ошибка детекта).
 ssh_session_port() {
-    local p="${SSH_CONNECTION:-}"
+    local p
+    p="$(ssh_conn_env 2>/dev/null || true)"
     p="$(printf '%s' "$p" | awk '{print $4}')"
     [[ "$p" =~ ^[0-9]+$ ]] && (( p>=1 && p<=65535 )) && echo "$p"
 }
@@ -295,34 +332,44 @@ import_pinned_key() {
 # IP клиента, с которого мы сейчас подключены по SSH (для авто-whitelist от самоблокировки).
 # ${VAR:-} обязателен: при запуске из консоли (не по SSH) переменных нет, а вызов идёт под set -u.
 ssh_client_ip() {
-    local ip="${SSH_CONNECTION:-}"; ip="${ip%% *}"
+    local ip; ip="$(ssh_conn_env 2>/dev/null || true)"; ip="${ip%% *}"
     [[ -z "$ip" ]] && { ip="${SSH_CLIENT:-}"; ip="${ip%% *}"; }
     # отфильтруем мусор/локалхост
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$ip" == *:* ]] && [[ "$ip" != "127.0.0.1" && "$ip" != "::1" ]] && echo "$ip"
 }
 
 # ─── Порт node-agent (Remnawave node) ────────────────────────────────────────
-# Фактический порт node-агента этой ноды. Источники по приоритету (выигрывает первый,
-# где нашлось; несколько контейнеров внутри источника → объединяем):
-#   1. env работающих контейнеров образа remnawave/node* (NODE_PORT= / APP_PORT=);
-#   2. .env compose-каталога контейнера (label working_dir), затем NA_REMNANODE_ENV
-#      (по умолчанию /opt/remnanode/.env) — ловит и временно остановленный контейнер;
-#   3. ss: listening-порт процесса rw-node (бинарь node-агента 2.x).
+# Фактический порт node-агента этой ноды. В правила input идут только порты, которые
+# слушает ХОСТ, поэтому источники по приоритету (выигрывает первый, где нашлось):
+#   1. ss: listening-порт процесса rw-node (бинарь node-агента 2.x) в сети хоста — факт;
+#   2. контейнеры образа remnawave/node с network_mode: host — NODE_PORT=/APP_PORT= из env
+#      (ловит временно остановленный контейнер). Образ — из `.Config.Image` (inspect): при
+#      закреплении по digest `docker ps` показывает ID вместо имени, и регэксп его не ловил;
+#      bridge-контейнеры не в счёт — их порт внутри своего netns, на хост он опубликован
+#      DNAT'ом и в цепочку input не попадает (до v4.2 детект брал NODE_PORT контейнера
+#      ВТОРОГО тенанта на боксе и выдавал его за порт этой ноды);
+#   3. .env compose-каталога такого контейнера, затем NA_REMNANODE_ENV (/opt/remnanode/.env).
+# Несколько агентов на хосте (два тенанта с host-сетью) → все порты + warn у вызывающего.
 # echo: порт(ы) через запятую; пусто = определить не удалось. Read-only, best-effort.
 detect_node_port() {
-    local out="" p c d f cands=""
+    local out="" p c d f img net cands=""
     _np_add() {
         # 10#: ведущий ноль из чужого .env не должен читаться как октал (арифм. ошибка)
         [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1>=1 && 10#$1<=65535 )) || return 0
         [[ ",$out," == *",$1,"* ]] || out+="${out:+,}$1"
     }
+    while read -r p; do _np_add "$p"; done < <(
+        ss -Htlnp 2>/dev/null | awk '/"rw-node"/{n=split($4,a,":"); print a[n]}' | sort -un)
+    [[ -n "$out" ]] && { unset -f _np_add; echo "$out"; return 0; }
     # docker-пайпы под `|| true`: protect живёт под set -e/pipefail — лежащий docker-демон
-    # не должен убивать детект раньше фолбэков на .env/ss
+    # не должен убивать детект раньше фолбэков на .env
     if command -v docker >/dev/null 2>&1; then
-        cands="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
-                 | awk '$2 ~ /remnawave\/node(:|$)/{print $1}' || true)"
-        # каноничное имя на случай кастом-образа/форка
-        [[ -z "$cands" ]] && docker inspect remnanode >/dev/null 2>&1 && cands="remnanode"
+        for c in $(docker ps -a --format '{{.Names}}' 2>/dev/null || true); do
+            img="$(docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null || true)"
+            [[ "$img" =~ remnawave/node([:@]|$) || "$c" == "${NA_NODE_CONTAINER:-remnanode}" ]] || continue
+            net="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$c" 2>/dev/null || true)"
+            [[ "$net" == host ]] && cands+="${cands:+ }$c"
+        done
         for c in $cands; do
             p="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null \
                  | awk -F= '$1=="NODE_PORT"||$1=="APP_PORT"{print $2; exit}' || true)"
@@ -343,10 +390,6 @@ detect_node_port() {
             p="$(sed -nE 's/^[[:space:]]*(NODE_PORT|APP_PORT)=[^0-9]*([0-9]+).*/\2/p' "$f" 2>/dev/null | head -1)"
             _np_add "${p:-}"
         fi
-    fi
-    if [[ -z "$out" ]]; then
-        while read -r p; do _np_add "$p"; done < <(
-            ss -Htlnp 2>/dev/null | awk '/"rw-node"/{n=split($4,a,":"); print a[n]}' | sort -u)
     fi
     unset -f _np_add
     [[ -n "$out" ]] && echo "$out"
@@ -411,6 +454,9 @@ conf_stale_defaults() {
     return 0
 }
 
+# conf_is_explicit <file> <KEY> — ключ в файле помечен как заданный оператором
+conf_is_explicit() { [[ -f "$1" ]] && grep -qE "^# explicit: ${2}$" "$1" 2>/dev/null; }
+
 # load_conf <file> — подхватить сохранённый конфиг (no-op если файла нет), затем
 # доложить о замороженных дефолтах (или принять новые при NA_ADOPT_NEW_DEFAULTS=1).
 load_conf() {
@@ -452,7 +498,9 @@ save_conf() {
         for k in "$@"; do
             v="${!k-}"
             case "$v" in
-                *'"'*|*'`'*|*'$'*|*'}'*|*$'\n'*)
+                # обратный слэш в конце значения экранировал бы закрывающую кавычку — и
+                # load_conf на следующем прогоне падал бы на синтаксисе всего файла
+                *'"'*|*'`'*|*'$'*|*'}'*|*'\'*|*$'\n'*)
                     warn "node.conf: пропускаю $k (спецсимволы в значении)"; continue;;
             esac
             printf ': "${%s:=%s}"\n' "$k" "$v"
@@ -464,6 +512,11 @@ save_conf() {
                 echo "# explicit: $k"
             fi
         done <<< "$NA_DEFAULT_CHANGES"
+        # NA_EXPLICIT_KEYS — ключи вне таблицы дефолтов, которые вызывающий отметил как
+        # заданные оператором (напр. SSH_PORT из ENV/интерактива, а не из автодетекта)
+        for k in ${NA_EXPLICIT_KEYS:-}; do
+            [[ " $* " == *" $k "* ]] && echo "# explicit: $k"
+        done
     } > "$tmp"
     chmod 0600 "$tmp"
     mv -f "$tmp" "$f"

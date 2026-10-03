@@ -17,7 +17,12 @@
 #   {window_hours, generated_at, events_total, ban_rate_5m,
 #    drops_by_reason{portscan,synflood,ssh-flood,badflags,crowdsec},
 #    timeline[12],                                  # последние 60 мин, бакеты по 5 мин
-#    top_asn[{asn,name,country,pct}], top_ips[{ip,asn,country,hits,verdict}]}
+#    top_asn[{asn,name,country,pct}], top_ips[{ip,asn,country,hits,verdict}],
+#    events_5m, unique_src_5m, crowdsec_decisions_all, asn_enrichment}
+#   ban_rate_5m — исторически так названное ЧИСЛО СОБЫТИЙ drop-лога за 5 мин (не банов);
+#   оставлено ради совместимости, честные имена — events_5m / unique_src_5m.
+#   drops_by_reason.crowdsec — активные ЛОКАЛЬНЫЕ решения CrowdSec; crowdsec_decisions_all
+#   — вместе с CAPI/списками (-1 = cscli нет). asn_enrichment: ok|partial|unavailable.
 #
 # JSON-схема (--proxyware --json):
 #   {verdict:"clean|suspect", generated_at,
@@ -77,7 +82,8 @@ collect_events() {
 }
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
-json_str() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+# Через общий json_escape: сырой \r/\t из ответа whois (имя AS) ломал бы документ.
+json_str() { json_escape "$1"; }
 
 # Множество забаненных (autoban v4+v6) — для вердикта.
 load_autoban() {
@@ -91,13 +97,30 @@ is_banned() { grep -qxF "$1" "$TMP".ab 2>/dev/null; }
 count_reason() { awk -F'\t' -v r="$1" '$2==r{c++} END{print c+0}' "$TMP"; }
 events_total() { wc -l < "$TMP" | tr -d ' '; }
 ban_rate_5m()  { awk -F'\t' -v now="$NOW" '$1>=now-300{c++} END{print c+0}' "$TMP"; }
+# уникальные источники за 5 мин — то, что ban_rate_5m обещал названием
+unique_src_5m() { awk -F'\t' -v now="$NOW" '$1>=now-300 && !s[$3]++{c++} END{print c+0}' "$TMP"; }
+# crowdsec_count [-a] — активные решения CrowdSec: строки CSV `-o raw` с числовым id
+# (заголовок не в счёт). Раньше считались строки `"value"` в `-o json`: одно решение
+# содержит несколько таких полей — на ноде флота выходило ×33 к реальности. Без `-a` —
+# только локальные (crowdsec/cscli), с `-a` — плюс CAPI/списки. Ровно ОДНО целое на
+# stdout (уходит в JSON); cscli нет — 0 без `-a`, −1 с `-a`.
 crowdsec_count() {
-    # ВАЖНО: ровно ОДНО целое на stdout (значение уходит в JSON). grep -c печатает 0
-    # и выходит с кодом 1 при нуле совпадений — старый `grep -oc … || echo 0` давал
-    # "0\n0" и ломал JSON на нодах с cscli, но 0 решений. Захватываем в переменную.
-    command -v cscli >/dev/null 2>&1 || { echo 0; return; }
-    local c; c="$(cscli decisions list -o json 2>/dev/null | grep -c '"value"')"
-    echo "${c:-0}"
+    local all="" c
+    [[ "${1:-}" == -a ]] && all=-a
+    command -v cscli >/dev/null 2>&1 || { [[ -n "$all" ]] && echo -1 || echo 0; return; }
+    c="$(cscli decisions list $all --limit 0 -o raw 2>/dev/null | awk -F, '$1 ~ /^[0-9]+$/ {c++} END {print c+0}')"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    echo "$c"
+}
+# asn_enrichment <всего IP> <обогащено> — ok | partial | unavailable: без флага «ASN
+# пуст» не отличить от «атакуют адреса без ASN» (на ноде без dig/whois — всегда пусто)
+asn_status() {
+    local tot="$1" got="$2"
+    command -v dig >/dev/null 2>&1 || command -v whois >/dev/null 2>&1 || { echo unavailable; return; }
+    if (( tot == 0 )); then echo ok
+    elif (( got == 0 )); then echo unavailable
+    elif (( got < tot )); then echo partial
+    else echo ok; fi
 }
 
 # timeline: 12 бакетов по 5 мин за последний час, число событий в каждом.
@@ -179,11 +202,11 @@ verdict() {  # verdict <ip> <hits> <maxhits>
 # ─── JSON-режим ────────────────────────────────────────────────────────────────
 emit_json() {
     collect_events; load_autoban
-    local total rate tl portscan synflood sshflood badflags crowd
+    local total rate tl portscan synflood sshflood badflags crowd crowd_all usrc asnst
     total="$(events_total)"; rate="$(ban_rate_5m)"; tl="$(timeline_csv)"
     portscan="$(count_reason portscan)"; synflood="$(count_reason synflood)"
     sshflood="$(count_reason ssh-flood)"; badflags="$(count_reason badflags)"
-    crowd="$(crowdsec_count)"
+    crowd="$(crowdsec_count)"; crowd_all="$(crowdsec_count -a)"; usrc="$(unique_src_5m)"
 
     # top IP + ASN-обогащение
     local -a ips=() hitsarr=()
@@ -193,6 +216,9 @@ emit_json() {
         ips+=("$ip"); hitsarr+=("$h"); [[ "$h" -gt "$maxhits" ]] && maxhits="$h"
     done < <(top_ips_raw)
     enrich_asn "${ips[@]}"
+    local got=0
+    for ip in "${ips[@]}"; do [[ -n "${ASN[$ip]:-}" ]] && got=$((got+1)); done
+    asnst="$(asn_status "${#ips[@]}" "$got")"
 
     # top_ips JSON
     local ips_json="" i a c
@@ -202,25 +228,28 @@ emit_json() {
         ips_json+="${ips_json:+,}{\"ip\":\"$(json_str "$ip")\",\"asn\":\"$(json_str "$a")\",\"country\":\"$(json_str "$c")\",\"hits\":$h,\"verdict\":\"$(json_str "$(verdict "$ip" "$h" "$maxhits")")\"}"
     done
 
-    # top_asn: агрегируем хиты по ASN (среди top-IP), pct от суммы
-    local asn_json=""
-    asn_json="$(
+    # top_asn: агрегируем хиты по ASN (среди top-IP), pct от суммы. awk только считает и
+    # сортирует (TSV), JSON собирает bash через json_escape: имя AS приходит из whois/DNS
+    # как есть, и экранирования одних \ и " (как было) не хватало на управляющие символы.
+    local asn_json="" an anm acc apct
+    # разделитель \x1f, а не таб: `IFS=$'\t' read` склеивает подряд идущие пустые поля
+    # (таб — «пробельный» разделитель), и при пустой стране имя AS уезжало в country
+    while IFS=$'\x1f' read -r an apct acc anm; do
+        [[ -n "$an" ]] || continue
+        asn_json+="${asn_json:+,}{\"asn\":\"$(json_str "$an")\",\"name\":\"$(json_str "$anm")\",\"country\":\"$(json_str "$acc")\",\"pct\":$apct}"
+    done < <(
         for i in "${!ips[@]}"; do
-            ip="${ips[$i]}"; printf '%s\t%s\t%s\t%s\n' "${ASN[$ip]:-?}" "${hitsarr[$i]}" "${CC[$ip]:-}" "${ANAME[$ip]:-}"
-        done | awk -F'\t' '
+            ip="${ips[$i]}"; printf '%s\x1f%s\x1f%s\x1f%s\n' "${ASN[$ip]:-?}" "${hitsarr[$i]}" "${CC[$ip]:-}" "${ANAME[$ip]:-}"
+        done | awk -F'\037' '
             $1!="?"{ hit[$1]+=$2; cc[$1]=$3; nm[$1]=$4; tot+=$2 }
             END{
                 if(tot<1) exit
                 n=0; for(a in hit){ arr[n++]=a }
                 # простая сортировка по hit desc
                 for(i=0;i<n;i++) for(j=i+1;j<n;j++) if(hit[arr[j]]>hit[arr[i]]){t=arr[i];arr[i]=arr[j];arr[j]=t}
-                out=""
-                for(i=0;i<n && i<8;i++){ a=arr[i]; p=int(hit[a]*100/tot+0.5);
-                    gsub(/\\/,"\\\\",nm[a]); gsub(/"/,"\\\"",nm[a]);
-                    out=out (i?",":"") "{\"asn\":\"" a "\",\"name\":\"" nm[a] "\",\"country\":\"" cc[a] "\",\"pct\":" p "}" }
-                print out
+                for(i=0;i<n && i<8;i++){ a=arr[i]; printf "%s\037%d\037%s\037%s\n", a, int(hit[a]*100/tot+0.5), cc[a], nm[a] }
             }'
-    )"
+    )
 
     printf '{'
     printf '"na_version":"%s","window_hours":%s,"journal_span_h":%s,"generated_at":%s,"events_total":%s,"ban_rate_5m":%s,' "${NA_VERSION:-?}" "$HOURS" "$JSPAN" "$NOW" "$total" "$rate"
@@ -228,7 +257,10 @@ emit_json() {
         "$portscan" "$synflood" "$sshflood" "$badflags" "$crowd"
     printf '"timeline":[%s],' "$tl"
     printf '"top_asn":[%s],' "$asn_json"
-    printf '"top_ips":[%s]}\n' "$ips_json"
+    printf '"top_ips":[%s],' "$ips_json"
+    # v4.2: новые поля — только в хвост (порядок прежних читает панель)
+    printf '"events_5m":%s,"unique_src_5m":%s,"crowdsec_decisions_all":%s,"asn_enrichment":"%s"}\n' \
+        "$rate" "$usrc" "$crowd_all" "$asnst"
 }
 
 # ─── Вердикт по одному IP ───────────────────────────────────────────────────────
@@ -278,8 +310,8 @@ human() {
   └────────────────────────────────────────────┘
 B
     printf "%b" "$NC"
-    local total rate; total="$(events_total)"; rate="$(ban_rate_5m)"
-    info "Окно: последние ${HOURS}ч   ·   событий в drop-логе: $total   ·   за 5 мин: $rate"
+    local total rate usrc; total="$(events_total)"; rate="$(ban_rate_5m)"; usrc="$(unique_src_5m)"
+    info "Окно: последние ${HOURS}ч   ·   событий в drop-логе: $total   ·   за 5 мин: $rate от $usrc адрес(ов)"
     if [[ "$JSPAN" -ge 0 && "$JSPAN" -lt "$HOURS" ]]; then
         warn "журнал хранит только ~${JSPAN}ч (самая старая запись) — окно ${HOURS}ч фактически урезано; «событий мало» может значить «журнал вытеснен» (снизь PORTSCAN_LOG_RATE / подними NA_JOURNAL_MAX_USE)"
     elif [[ "$JSPAN" -ge 0 ]]; then
@@ -290,7 +322,8 @@ B
     for r in portscan synflood ssh-flood badflags; do
         printf "  %-12s %s\n" "$r" "$(count_reason "$r")"
     done
-    printf "  %-12s %s\n" "crowdsec" "$(crowdsec_count)"
+    local cs_all; cs_all="$(crowdsec_count -a)"
+    printf "  %-12s %s\n" "crowdsec" "$(crowdsec_count) активных локальных решений$([[ "$cs_all" -ge 0 ]] && echo " (с CAPI/списками: $cs_all)")"
 
     title "Таймлайн (последний час, бакеты 5 мин)"
     echo "  $(timeline_csv | tr ',' ' ')"
@@ -304,8 +337,17 @@ B
     enrich_asn "${ips[@]}"
     # Колонка ASN остаётся «?», когда обогащать нечем: на боксе без dig И без whois
     # отчёт молча выглядит иначе, чем у соседней ноды, и причина неочевидна.
-    command -v dig >/dev/null 2>&1 || command -v whois >/dev/null 2>&1 \
-        || info "ASN не обогащён: нет dig/whois (best-effort — колонка ASN останется '?')"
+    local got=0
+    for ip in "${ips[@]}"; do [[ -n "${ASN[$ip]:-}" ]] && got=$((got+1)); done
+    case "$(asn_status "${#ips[@]}" "$got")" in
+        unavailable)
+            if command -v dig >/dev/null 2>&1 || command -v whois >/dev/null 2>&1; then
+                info "ASN не обогащён: Team Cymru не ответил (нужен исходящий DNS/43) — колонка ASN останется '?'"
+            else
+                info "ASN не обогащён: нет dig/whois (best-effort — колонка ASN останется '?')"
+            fi ;;
+        partial) info "ASN обогащён частично ($got из ${#ips[@]}: v6 и хвост списка не спрашиваем)" ;;
+    esac
     printf "  %-18s %6s  %-22s %s\n" "IP" "hits" "ASN" "вердикт"
     for i in "${!ips[@]}"; do
         ip="${ips[$i]}"; h="${hitsarr[$i]}"

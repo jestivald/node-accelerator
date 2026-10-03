@@ -15,7 +15,11 @@
 #      вечное active (exited) с невыполненной работой);
 #   6. юнит несёт Restart=on-failure/RestartSec и ExecStart с именем NIC;
 #   7. ничего «курсорного» (tput/\033[K) не уезжает в stdout, когда это не терминал
-#      (issue #28: escape-коды в логах раскатки под nohup … > log).
+#      (issue #28: escape-коды в логах раскатки под nohup … > log);
+#   8. v4.2: RPS не включается на 1 vCPU и при RX-очередей ≥ ядер (аппаратный RSS) —
+#      маски прошлых версий возвращаются к снимку optimize или к 0; XPS не трогается
+#      без NA_XPS=1 (раскладку TX-очередей задаёт драйвер); `default dev venet0 scope
+#      link` (OpenVZ) даёт venet0, а не «scope».
 #
 # Не требует root/сети/systemd. Запуск: bash tests/rps-unit.sh
 set -euo pipefail
@@ -26,7 +30,7 @@ trap 'rm -rf "$T"' EXIT
 SYS="$T/sys/class/net"
 REC="$T/rec"
 export REC
-mkdir -p "$T/bin" "$SYS" "$REC" "$T/proc/sys/net/core"
+mkdir -p "$T/bin" "$SYS" "$REC" "$T/proc/sys/net/core" "$T/state"
 
 # Секции/скрипту нужен bash ≥ 4.4 — системный bash macOS древний, берём первый годный.
 pick_bash() {
@@ -52,9 +56,10 @@ n=$(( $(cat "$REC/ip.calls" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$REC/ip.calls"
 [ "${ROUTE_AFTER:-0}" -gt 0 ] || exit 0
 [ "$n" -ge "${ROUTE_AFTER:-0}" ] || exit 0
+if [ -n "${ROUTE_LINE:-}" ]; then echo "$ROUTE_LINE"; exit 0; fi
 echo "default via 10.0.0.1 dev ${ROUTE_IFACE:-ens18} proto static metric 100"
 IP
-printf '#!/bin/sh\necho 3\n' > "$T/bin/nproc"
+printf '#!/bin/sh\necho "${NA_TEST_NCPU:-3}"\n' > "$T/bin/nproc"
 cat > "$T/bin/sleep" <<'SL'
 #!/bin/sh
 echo "$*" >> "$REC/sleep.calls"
@@ -66,7 +71,8 @@ export PATH="$T/bin:$PATH"
 # ── Достаём тело na-rps-setup из heredoc optimize.sh ────────────────────────────
 extract_rps() {   # extract_rps <исходник optimize.sh> <куда>
     awk "/^cat > \/usr\/local\/sbin\/na-rps-setup <<'RPS'\$/{f=1;next} /^RPS\$/{f=0} f" "$1" \
-        | sed -e "s#/sys/class/net#$SYS#g" -e "s#/proc/sys/net/core#$T/proc/sys/net/core#g" > "$2"
+        | sed -e "s#/sys/class/net#$SYS#g" -e "s#/proc/sys/net/core#$T/proc/sys/net/core#g" \
+              -e "s#/var/lib/node-accelerator#$T/state#g" > "$2"
     [ -s "$2" ] || return 1
     chmod +x "$2"
 }
@@ -83,7 +89,17 @@ mk_net() {   # mk_net <iface> [phys] — очереди rx/tx; phys=1 → ест
     [ -n "$phys" ] && : > "$SYS/$n/device"
     return 0
 }
-reset_net() { rm -rf "$SYS"; mkdir -p "$SYS"; : > "$REC/ip.calls"; : > "$REC/sleep.calls"; }
+reset_net() { rm -rf "$SYS"; mkdir -p "$SYS"; : > "$REC/ip.calls"; : > "$REC/sleep.calls"; rm -f "$T/state/rps-orig.tsv"; }
+mk_queues() {   # mk_queues <iface> <rx-очередей> — multi-queue NIC (RSS), маски заранее «наши»
+    local n="$1" i
+    mkdir -p "$SYS/$n"; : > "$SYS/$n/device"
+    for ((i = 0; i < $2; i++)); do
+        mkdir -p "$SYS/$n/queues/rx-$i" "$SYS/$n/queues/tx-$i"
+        echo 7 > "$SYS/$n/queues/rx-$i/rps_cpus"; echo 4096 > "$SYS/$n/queues/rx-$i/rps_flow_cnt"
+        echo 7 > "$SYS/$n/queues/tx-$i/xps_cpus"
+    done
+}
+q_of() { cat "$SYS/$1/queues/$2" 2>/dev/null || echo ""; }
 run_rps() {  # run_rps <скрипт> [аргумент-NIC] → rc в $rc, вывод в $T/out/$T/err
     rc=0
     "$WBASH" "$@" > "$T/out" 2> "$T/err" || rc=$?
@@ -101,9 +117,13 @@ ROUTE_AFTER=0 run_rps "$RPS" ens18
 expect "rc=0" test "$rc" -eq 0
 expect "rps_cpus = маска 3 ядер (7)" test "$(mask_of ens18)" = "7"
 expect "rps_flow_cnt проставлен" grep -qx 4096 "$SYS/ens18/queues/rx-0/rps_flow_cnt"
-expect "xps_cpus проставлен" grep -qx 7 "$SYS/ens18/queues/tx-0/xps_cpus"
+expect "xps_cpus НЕ тронут без NA_XPS=1 (раскладка драйвера)" test -z "$(q_of ens18 tx-0/xps_cpus)"
 expect "итоговая строка-маркер напечатана" grep -q '^na-rps: NIC=ens18 mask=7 cpus=3$' "$T/out"
 expect "таблица маршрутов не опрашивалась вовсе" test "$(ip_calls)" -eq 0
+reset_net; mk_net ens18 1
+NA_XPS=1 ROUTE_AFTER=0 run_rps "$RPS" ens18
+expect "NA_XPS=1 → xps_cpus проставлен" test "$(q_of ens18 tx-0/xps_cpus)" = 7
+expect "NA_XPS=1 → маркер XPS" grep -q '^na-rps: NIC=ens18 xps=7$' "$T/out"
 
 # ── Кейс (b): интерфейс переименовался после смены ядра ─────────────────────────
 echo "== (b) вшитого интерфейса нет → автодетект =="
@@ -148,12 +168,46 @@ expect "rc≠0 (юнит уйдёт в failed, а не в active/exited)" test "
 expect "«giving up» в stderr" grep -q "giving up" "$T/err"
 expect_not "маркера успеха нет" grep -q '^na-rps: NIC=' "$T/out"
 
+# ── Кейс (f): RX-очередей ≥ ядер — RSS уже размазывает, RPS не нужен (v4.2) ──────
+echo "== (f) RX-очередей ≥ ядер: RPS не включаем, маски прошлых версий снимаем =="
+reset_net; mk_queues ens18 3
+ROUTE_AFTER=0 run_rps "$RPS" ens18
+expect "rc=0 (это успех, а не отказ)" test "$rc" -eq 0
+expect "rps_cpus снят в 0 на всех очередях" test "$(q_of ens18 rx-0/rps_cpus)$(q_of ens18 rx-2/rps_cpus)" = 00
+expect "rps_flow_cnt снят в 0" test "$(q_of ens18 rx-1/rps_flow_cnt)" = 0
+expect "маркер «rps=off» с причиной" grep -q '^na-rps: NIC=ens18 rps=off rxq=3 cpus=3' "$T/out"
+expect "XPS прошлых версий без снимка не трогаем" test "$(q_of ens18 tx-0/xps_cpus)" = 7
+# снимок optimize (первое применение) — возвращаем исходные маски, а не 0
+reset_net; mk_queues ens18 3
+printf '%s\t%s\n' "$SYS/ens18/queues/rx-0/rps_cpus" 5 "$SYS/ens18/queues/rx-0/rps_flow_cnt" 2048 \
+    "$SYS/ens18/queues/tx-0/xps_cpus" 1 "$SYS/ens18/queues/tx-1/xps_cpus" 2 > "$T/state/rps-orig.tsv"
+ROUTE_AFTER=0 run_rps "$RPS" ens18
+expect "rps_cpus из снимка (5), а не 0" test "$(q_of ens18 rx-0/rps_cpus)" = 5
+expect "rps_flow_cnt из снимка (2048)" test "$(q_of ens18 rx-0/rps_flow_cnt)" = 2048
+expect "очередь без записи в снимке → 0" test "$(q_of ens18 rx-1/rps_cpus)" = 0
+expect "XPS без NA_XPS=1 → исходная раскладка из снимка (1, 2)" test "$(q_of ens18 tx-0/xps_cpus)$(q_of ens18 tx-1/xps_cpus)" = 12
+expect "очередь XPS без записи в снимке не тронута" test "$(q_of ens18 tx-2/xps_cpus)" = 7
+
+echo "== (g) 1 vCPU: размазывать нечего =="
+reset_net; mk_net ens18 1; echo 1 > "$SYS/ens18/queues/rx-0/rps_cpus"
+NA_TEST_NCPU=1 ROUTE_AFTER=0 run_rps "$RPS" ens18
+expect "rc=0" test "$rc" -eq 0
+expect "rps_cpus=0" test "$(q_of ens18 rx-0/rps_cpus)" = 0
+expect "маркер «rps=off … cpus=1»" grep -q 'rps=off rxq=1 cpus=1' "$T/out"
+
+echo "== (h) OpenVZ: default dev venet0 scope link =="
+reset_net; mk_net venet0 1
+ROUTE_AFTER=1 ROUTE_LINE="default dev venet0 scope link" run_rps "$RPS"
+expect "интерфейс venet0 (токен после dev, а не \$5=scope)" test "$(mask_of venet0)" = "7"
+expect_not "в stderr нет «scope»" grep -q "scope" "$T/err"
+
 # ── Юнит na-rps.service (статически по генератору) ──────────────────────────────
 echo "== юнит na-rps.service =="
 awk "/^cat > \/etc\/systemd\/system\/na-rps.service <<EOF\$/{f=1;next} /^EOF\$/{f=0} f" \
     "$REPO_ROOT/scripts/optimize.sh" > "$T/unit"
 expect "юнит извлечён" test -s "$T/unit"
 expect "ExecStart передаёт имя NIC" grep -qF 'ExecStart=/usr/local/sbin/na-rps-setup ${NIC:-}' "$T/unit"
+expect "NA_XPS доезжает до юнита (Environment=)" grep -qF 'Environment=NA_XPS=${NA_XPS}' "$T/unit"
 expect "Restart=on-failure" grep -qx 'Restart=on-failure' "$T/unit"
 expect "RestartSec задан" grep -qx 'RestartSec=5' "$T/unit"
 expect "Type=oneshot + RemainAfterExit (is-active остаётся правдой)" grep -qx 'RemainAfterExit=yes' "$T/unit"
@@ -191,7 +245,7 @@ systemctl() {
 . "$ACTIVATION"
 DRIVER
 run_activation() {
-    REPO_ROOT="$REPO_ROOT" WBASH="$WBASH" RPS="$RPS" NIC=ens18 \
+    REPO_ROOT="$REPO_ROOT" WBASH="$WBASH" RPS="$RPS" NIC=ens18 NA_XPS=0 \
         ACTIVATION="$1" "$WBASH" "$T/activation-driver.sh" > "$T/activation.out" 2>&1
 }
 reset_net; mk_net ens18 1
@@ -200,7 +254,7 @@ expect "ре-ран применяет RPS даже при активном ст
 reset_net; mk_net ens18 1
 RPS_FORCE_FAILURE=1 run_activation "$T/activation.sh"
 expect "отказ применения — warn" grep -q 'не удалось применить RPS' "$T/activation.out"
-expect_not "при отказе нет рапорта об успехе" grep -q 'RPS/RFS/XPS включены' "$T/activation.out"
+expect_not "при отказе нет рапорта об успехе" grep -q 'na-rps применён' "$T/activation.out"
 if git -C "$REPO_ROOT" show v4.1.1:scripts/optimize.sh > "$T/v411-optimize.sh" 2>/dev/null; then
     extract_activation "$T/v411-optimize.sh" "$T/v411-activation.sh"
     reset_net; mk_net ens18 1

@@ -20,7 +20,8 @@ rollback_optimize() {
     rm -f /etc/sysctl.d/99-node-accelerator.conf /etc/sysctl.d/99-node-accelerator-conntrack.conf
     rm -f /etc/modules-load.d/na-bbr.conf /etc/modules-load.d/na-conntrack.conf
     rm -f /etc/systemd/system.conf.d/na-limits.conf /etc/systemd/user.conf.d/na-limits.conf
-    rm -f /etc/systemd/journald.conf.d/na-size.conf
+    # journald: имя drop-in'а до v4.2 — na-size.conf, с v4.2 — 10-na-size.conf
+    rm -f /etc/systemd/journald.conf.d/10-na-size.conf /etc/systemd/journald.conf.d/na-size.conf
     sed -i '/# === node-accelerator ===/,/# === \/node-accelerator ===/d' /etc/security/limits.conf 2>/dev/null || true
 
     # pam_limits: строку дописывал optimize (её нет в стоке Debian/Ubuntu common-session)
@@ -59,8 +60,70 @@ rollback_optimize() {
     rm -f "$CONF_DIR/na_mss.nft"
 
     systemctl daemon-reload
+
+    # ── Runtime без ребута ───────────────────────────────────────────────────
+    # Удалить файлы мало: `sysctl --system` вернёт только ключи, которые задаёт другой
+    # файл, а остальные держат наши значения до перезагрузки; маски очередей и THP тоже.
+    # Возвращаем то, что было ДО первого применения (снимки optimize v4.2+), затем
+    # `sysctl --system` — чужие файлы по-прежнему главнее снимка.
+    local rt="" n line k v p
+    if [[ -s "$STATE_DIR/sysctl.orig" ]]; then
+        n=0
+        while IFS= read -r line; do
+            k="${line%%$'\t'*}"; v="${line#*$'\t'}"
+            [[ "$k" =~ ^[a-z0-9_.-]+$ ]] || continue
+            # Форвардинг НЕ возвращаем: снимок снят до Docker (штатный порядок раскатки), там
+            # 0, а `conf.all.forwarding=0` выключил бы его на всех интерфейсах — bridge-
+            # контейнеры (Caddy панели, второй тенант) потеряли бы сеть до рестарта Docker.
+            case "$k" in
+                net.ipv4.ip_forward|net.ipv4.conf.*.forwarding|net.ipv6.conf.*.forwarding) continue ;;
+            esac
+            # потолок conntrack ниже текущего числа записей — «table full», дроп новых соединений
+            if [[ "$k" == net.netfilter.nf_conntrack_max && "$v" =~ ^[0-9]+$ ]]; then
+                local cnt; cnt="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
+                [[ "$cnt" =~ ^[0-9]+$ ]] && (( v < cnt * 2 )) && v=$(( cnt * 2 ))
+            fi
+            p="/proc/sys/${k//.//}"
+            [[ -w "$p" ]] || continue
+            printf '%s\n' "$v" > "$p" 2>/dev/null && n=$((n+1))
+        done < "$STATE_DIR/sysctl.orig"
+        rt+="sysctl — $n ключ(ей) возвращены к значениям до первого прогона; "
+    else
+        rt+="sysctl — снимка нет (optimize ставился до v4.2): ключи, которых не задаёт другой файл, держат наши значения до ребута; "
+    fi
     sysctl --system >/dev/null 2>&1 || true
     systemctl restart systemd-journald 2>/dev/null || true
+
+    if [[ -s "$STATE_DIR/rps-orig.tsv" ]]; then
+        while IFS=$'\t' read -r p v; do
+            [[ "$p" == /sys/class/net/*/queues/* && -e "$p" ]] || continue
+            printf '%s\n' "$v" > "$p" 2>/dev/null || true
+        done < "$STATE_DIR/rps-orig.tsv"
+        rt+="маски RPS/XPS — из снимка; "
+    else
+        # RPS включал тулкит, дефолт ядра — 0; раскладку XPS драйвер восстановит на ребуте
+        local nic; nic="$(awk -F= '/^nic=/{print $2; exit}' "$STATE_DIR/optimize.installed" 2>/dev/null)"
+        if [[ -n "$nic" && "$nic" != none && -d "/sys/class/net/$nic" ]]; then
+            for p in /sys/class/net/"$nic"/queues/rx-*/rps_cpus; do
+                [[ -e "$p" ]] && { printf '0\n' > "$p" 2>/dev/null || true; }
+            done
+        fi
+        rt+="RPS выключен (снимка масок нет), XPS — к раскладке драйвера после ребута; "
+    fi
+    if [[ -s "$STATE_DIR/thp.orig" ]]; then
+        while IFS=$'\t' read -r k v; do
+            [[ "$k" == enabled || "$k" == defrag ]] || continue
+            printf '%s\n' "$v" > "/sys/kernel/mm/transparent_hugepage/$k" 2>/dev/null || true
+        done < "$STATE_DIR/thp.orig"
+        rt+="THP — из снимка; "
+    else
+        rt+="THP — never до ребута (снимка нет); "
+    fi
+    if [[ -f "$STATE_DIR/journald.persistent" ]]; then
+        info "журнал остаётся постоянным: /var/log/journal создал optimize, в нём история (удалить: rm -rf /var/log/journal — история пропадёт)"
+    fi
+    rm -f "$STATE_DIR/sysctl.orig" "$STATE_DIR/rps-orig.tsv" "$STATE_DIR/thp.orig" \
+          "$STATE_DIR/reserved-ports.na" "$STATE_DIR/journald.persistent"
 
     # psi=1 в GRUB_CMDLINE_LINUX_DEFAULT снимаем ТОЛЬКО если дописывали его МЫ: ровно
     # в этом случае в маркере есть строка psi=1. Оператор мог включить учёт давления
@@ -97,7 +160,7 @@ rollback_optimize() {
         fi
     fi
     rm -f "$STATE_DIR/optimize.installed" "$CONF_DIR/optimize.conf"
-    ok "optimize откатан (значения sysctl вернутся к дефолтам; XanMod — по флагу)"
+    ok "optimize откатан. Runtime: ${rt%; }. Лимиты nofile для сервисов — после ребута; XanMod — по флагу"
 }
 
 rollback_protect() {
@@ -121,9 +184,45 @@ rollback_protect() {
     # + отвергнутый ruleset и недописанные кандидаты (protect v4.1.3+ генерирует рядом и
     # переименовывает в na_filter.nft только после успешного nft -f)
     rm -f "$CONF_DIR/na_filter.nft" "$CONF_DIR/na_filter.nft.rejected" "$CONF_DIR"/.na_filter.nft.*
-    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
+    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers /usr/local/sbin/na-fw \
           /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard \
           /usr/local/sbin/na-fw-safety-revert
+    rm -f "$STATE_DIR"/.bans.* 2>/dev/null || true
+    [[ -d "$CONF_DIR/na_filter.d" ]] && info "оставлен $CONF_DIR/na_filter.d (локальные правила оператора)"
+    # SYNPROXY: свой sysctl снимаем и возвращаем дефолт ядра
+    if [[ -f /etc/sysctl.d/99-na-synproxy.conf ]]; then
+        rm -f /etc/sysctl.d/99-na-synproxy.conf
+        sysctl -q -w net.netfilter.nf_conntrack_tcp_loose=1 2>/dev/null || true
+    fi
+    # CROWDSEC_SCOPE=ssh: наш юнит/правила снимаем. Порядок как в protect: bouncer в set-only
+    # таблицу на остановке не трогает — stop → режим/таблицы → start. Если protect выключал
+    # ручной crowdsec-nft-scope.service оператора (флаг) — возвращаем его вместе с set-only:
+    # откат не должен снова включить community-лист на всех портах, который оператор сузил сам.
+    if [[ -f /etc/systemd/system/na-crowdsec-scope.service ]]; then
+        local _by=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml _legacy=crowdsec-nft-scope.service
+        systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+        systemctl disable na-crowdsec-scope.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/na-crowdsec-scope.service "$CONF_DIR/na-crowdsec-scope.nft"
+        systemctl daemon-reload 2>/dev/null || true
+        if [[ -f "$STATE_DIR/crowdsec-legacy-scope.disabled" ]] && systemctl cat "$_legacy" >/dev/null 2>&1; then
+            systemctl enable "$_legacy" >/dev/null 2>&1 || true
+            systemctl restart "$_legacy" >/dev/null 2>&1 || true
+            info "CrowdSec scope: возвращён ручной $_legacy (как было до protect)"
+        else
+            if [[ -f "$_by" ]]; then
+                sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*true[[:space:]]*$/\1 false/' "$_by" && rm -f "$_by.na-tmp"
+            fi
+            local _t
+            for _t in "ip $(awk '/^nftables:/{n=1} n && $1=="ipv4:"{f=1} f && $1=="table:"{print $2; exit}' "$_by" 2>/dev/null)" \
+                      "ip6 $(awk '/^nftables:/{n=1} n && $1=="ipv6:"{f=1} f && $1=="table:"{print $2; exit}' "$_by" 2>/dev/null)"; do
+                [[ "$_t" == *" " ]] && continue
+                nft delete table $_t 2>/dev/null || true
+            done
+            info "CrowdSec scope снят: bouncer снова ставит свои правила (на всех портах)"
+        fi
+        rm -f "$STATE_DIR/crowdsec-legacy-scope.disabled"
+        systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    fi
     rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock"
     # nftables.service до v4.1.2 включал сам protect (boot-persist), но выключать не будем: он
     # лишь грузит /etc/nftables.conf, который тулкит никогда не писал — трогать чужой конфиг нельзя.

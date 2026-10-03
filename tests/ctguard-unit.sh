@@ -27,6 +27,7 @@ SELF_IP='198.51.100.7'      # адрес самой ноды
 PHANTOM='203.0.113.66'      # холдер без живых сокетов — законный кандидат
 LEGIT='192.0.2.55'          # клиент за CGNAT: много conntrack, но есть живые сокеты
 DOCKER='172.17.0.4'         # контейнерный бридж
+DNATCLI='192.0.2.77'        # клиент второго тенанта: DNAT в контейнер, сокеты в его netns
 
 # ── Достаём хелпер из heredoc protect.sh ────────────────────────────────────────
 awk "/cat > \/usr\/local\/sbin\/na-ctguard <<'CTG'/{f=1;next} f&&/^CTG\$/{exit} f" \
@@ -66,6 +67,10 @@ i=0; while [ \$i -lt 4200 ]; do
   i=\$((i+1)); done
 i=0; while [ \$i -lt 4100 ]; do
   echo "ipv4 2 tcp 6 7440 ESTABLISHED src=$DOCKER dst=$SELF_IP sport=\$((60000+i)) dport=443"
+  i=\$((i+1)); done
+# DNAT: reply-src (контейнер) ≠ orig-dst (адрес ноды) — живые сокеты не в netns хоста
+i=0; while [ \$i -lt 4300 ]; do
+  echo "ipv4 2 tcp 6 7440 ESTABLISHED src=$DNATCLI dst=$SELF_IP sport=\$((20000+i)) dport=8443 src=172.31.250.2 dst=$DNATCLI sport=443 dport=\$((20000+i)) [ASSURED]"
   i=\$((i+1)); done
 CT
 
@@ -124,6 +129,8 @@ chk "conntrack -D НЕ вызывался по своему адресу" \
     "! grep -q -- '-D -s $SELF_IP' <<<\"\$CTARGV\""
 chk "приватный адрес контейнера НЕ эвиктится" \
     "! grep -q 'evict $DOCKER' <<<\"\$LOGTXT\""
+chk "клиент за DNAT (второй тенант) НЕ фантом — его сокеты в netns контейнера (v4.2)" \
+    "! grep -q '$DNATCLI' <<<\"\$LOGTXT\""
 chk "клиент с живыми сокетами пощажён (live-lookup видит ::ffff:-пиров)" \
     "! grep -q 'evict $LEGIT' <<<\"\$LOGTXT\""
 chk "live у клиента с сокетами прочитан НЕ как 0 (ровно баг #22)" \
