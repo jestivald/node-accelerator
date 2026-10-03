@@ -644,7 +644,14 @@ check "json: dynset_fill_max_pct=85 (autoban не лимитер)" 85 "$(jget "$
 check "json: dynset_fill_max_set=syn4_443"  syn4_443 "$(jget "$T/out9.json" dynset_fill_max_set)"
 check "json: dynset_no_timeout=1 (autoban и cc4 не в счёт)" 1 "$(jget "$T/out9.json" dynset_no_timeout)"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/out9.txt" 2>/dev/null || true
-grep_ok "текст: ✘ legacy-набор почти полон"  "наборы-лимитеры без timeout (1 шт., правила ≤4.1.2) заполнены до 85%" "$T/out9.txt"
+grep_ok "текст: ✘ legacy-набор почти полон"  "✘  наборы-лимитеры без timeout (правила ≤4.1.2) заполнены до 85%: syn4_443" "$T/out9.txt"
+# анти-скан на 100% — слепнет, но клиентов не режет: ▲, а не ✘
+sed -i.bak 's/set syn4_443 {/set ps4 {/' "$NFTD/terse"; rm -f "$NFTD/terse.bak"
+mk_set ps4 100 dynamic "" 100 set
+env TERM=dumb "$WBASH" "$DIAG" > "$T/out9p.txt" 2>/dev/null || true
+grep_ok  "текст: ▲ полный ps4 — анти-скан ослеп"  "▲  анти-скан без timeout (правила ≤4.1.2) заполнен до 100%: ps4" "$T/out9p.txt"
+grep_not "текст: полный ps4 — не ✘ «клиенты отсекаются»" "✘  наборы-лимитеры" "$T/out9p.txt"
+sed -i.bak 's/set ps4 {/set syn4_443 {/' "$NFTD/terse"; rm -f "$NFTD/terse.bak" "$NFTD/set-ps4"
 
 # nft 1.0.6, правила ≤4.1.2: meter анонимный — в -t есть только внутри правила
 cat > "$NFTD/terse" <<'TERSE'
@@ -955,12 +962,17 @@ LISTEN 0 128 [::]:10050 [::]:* users:(("monitor-agent",pid=20,fd=5))
 LISTEN 0 4096 127.0.0.1:10085 0.0.0.0:* users:(("xray",pid=10,fd=8))
 LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=5,fd=14))
 LTP
-printf 'UNCONN 0 0 10.0.0.5%%eth0:68 0.0.0.0:* users:(("dhclient",pid=3,fd=6))\n' > "$SSD/listen-up"
+# + исходящие UDP-сокеты xray на эфемерных портах (на ноде их десятки): не слушатели
+{ printf 'UNCONN 0 0 10.0.0.5%%eth0:68 0.0.0.0:* users:(("dhclient",pid=3,fd=6))\n'
+  printf 'UNCONN 0 0 *:23456 *:* users:(("rw-core",pid=10,fd=31))\n'
+  printf 'UNCONN 0 0 *:51234 *:* users:(("rw-core",pid=10,fd=32))\n'; } > "$SSD/listen-up"
 cp "$NFTD/chain-input" "$T/chain.orig"
 awk '{print} /meter cc4_443/ { print "\t\ttcp dport 8445 ct state new meter cc4_8445 { ip saddr ct count over 8192 } drop" }' "$T/chain.orig" > "$NFTD/chain-input"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/o17c.txt" 2>/dev/null || true
 grep_ok  "strict: слушатель вне портов — info, назван процесс" "strict их режет (доступны только whitelist/флоту): tcp/10050(monitor-agent)" "$T/o17c.txt"
 grep_not "DHCP-клиент не в списке слушателей" "udp/68" "$T/o17c.txt"
+grep_not "исходящий UDP-сокет xray — не «слушатель» (проверено на нодах флота)" "udp/23456" "$T/o17c.txt"
+grep_not "…и не «порт ноды без резерва»" "23456(rw-core)" "$T/o17c.txt"
 grep_ok  "разрешён, но никто не слушает — info"   "разрешены в файрволе, но никто не слушает: tcp/8445" "$T/o17c.txt"
 sed 's/^fw_mode=strict/fw_mode=open/' "$T/protect.installed.orig" > "$PROT"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/o17d.txt" 2>/dev/null || true

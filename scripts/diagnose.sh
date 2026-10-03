@@ -277,6 +277,8 @@ mark_val() {
 }
 # csv_norm <список> — порты через запятую: только числа, по возрастанию, без повторов
 csv_norm() { tr ', ' '\n\n' <<<"$1" | grep -E '^[0-9]+$' | sort -un | paste -sd, -; }
+# окно дельт по-человечески: «45 с» / «12 мин» (а не «за 0 мин» при коротком окне)
+dw_h() { if (( ${DW:-0} < 60 )); then echo "${DW:-0} с"; else echo "$(( DW / 60 )) мин"; fi; }
 
 # Живая input-цепочка na_filter — читаем ОДИН раз (её смотрят несколько сенсоров).
 NA_CHAIN=""; NA_CHAIN_READ=0
@@ -404,15 +406,30 @@ listen_load() {
     NA_LT="$(ss -Htlnp 2>/dev/null)"; NA_LU="$(ss -Hulnp 2>/dev/null)"
     return 0
 }
-# listen_rows tcp|udp — «адрес<TAB>порт<TAB>процесс» (адрес без [] и %iface)
+# listen_rows tcp|udp — «адрес<TAB>порт<TAB>процесс» (адрес без [] и %iface).
+# UDP: исходящие сокеты xray (UNCONN на случайном эфемерном порту — каждый UDP-запрос
+# клиента через ноду) в `ss -ul` неотличимы от слушателей. Их десятки, и без фильтра они
+# шли в «слушают публично» и в резерв эфемерных портов (проверено на нодах флота). Входящий
+# UDP у xray — всегда явный порт из UDP_PORTS: UDP-сокет xray/rw-core в эфемерном диапазоне
+# вне UDP_PORTS — исходящий, пропускаем.
+NA_UDP_OK=""; NA_UDP_OK_READ=0
 listen_rows() {
     listen_load
-    local src="$NA_LT"; [[ "$1" == udp ]] && src="$NA_LU"
-    awk '$1 == "LISTEN" || $1 == "UNCONN" {
+    local src="$NA_LT" lo=0 hi=0
+    if [[ "$1" == udp ]]; then
+        src="$NA_LU"
+        if [[ "$NA_UDP_OK_READ" == 0 ]]; then NA_UDP_OK="$(fw_ports udp 2>/dev/null)"; NA_UDP_OK_READ=1; fi
+        read -r lo hi <<<"$(val net.ipv4.ip_local_port_range)"
+        [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || { lo=0; hi=0; }
+    fi
+    awk -v lo="$lo" -v hi="$hi" -v ok=",$NA_UDP_OK," '$1 == "LISTEN" || $1 == "UNCONN" {
         la = $4; p = la; sub(/.*:/, "", p); a = substr(la, 1, length(la) - length(p) - 1)
         sub(/%.*/, "", a); gsub(/[][]/, "", a)
         proc = "?"; if (match($0, /users:\(\("[^"]+"/)) proc = substr($0, RSTART + 9, RLENGTH - 10)
-        if (p ~ /^[0-9]+$/) print a "\t" p "\t" proc
+        if (p !~ /^[0-9]+$/) next
+        if ($1 == "UNCONN" && hi > 0 && (proc == "xray" || proc == "rw-core") \
+            && p + 0 >= lo + 0 && p + 0 <= hi + 0 && index(ok, "," p ",") == 0) next
+        print a "\t" p "\t" proc
     }' <<<"$src"
 }
 # addr_public <адрес> — wildcard или глобальный (не loopback/link-local/частный/CGNAT)
@@ -1067,7 +1084,7 @@ if [[ -r /proc/stat ]]; then
     [[ "$STEAL" =~ ^[0-9]+$ ]] || STEAL=0; [[ "$STEAL_BOOT" =~ ^[0-9]+$ ]] || STEAL_BOOT=0
     STEAL_LONG="$STEAL_BOOT"; [[ "$D_STEAL" -ge 0 ]] && STEAL_LONG="$D_STEAL"
     STEAL_TXT="CPU steal = ${STEAL}% за 3 с, в среднем с загрузки ${STEAL_BOOT}%"
-    [[ "$D_STEAL" -ge 0 ]] && STEAL_TXT+=", за $((DW/60)) мин с прошлого запуска ${D_STEAL}%"
+    [[ "$D_STEAL" -ge 0 ]] && STEAL_TXT+=", за $(dw_h) с прошлого запуска ${D_STEAL}%"
     if   [[ "$STEAL" -ge 10 && "$STEAL_LONG" -ge 5 ]]; then bad "$STEAL_TXT — гипервизор хронически отбирает CPU (оверселл/шумный сосед)"
     elif [[ "$STEAL" -ge 10 ]];  then wrn  "$STEAL_TXT — всплеск: в моменте отбирают заметно, в среднем терпимо"
     elif [[ "$STEAL" -ge 3 || "$STEAL_LONG" -ge 3 ]]; then wrn "$STEAL_TXT (заметный — под пиками может проседать)"
@@ -1303,11 +1320,11 @@ fi
 if [[ -r /proc/net/softnet_stat ]]; then
     if [[ "$DW" -ge 0 && "$D_SNDROP" -ge 0 && "$D_SQZ" -ge 0 ]]; then
         if [[ "$D_SNDROP" -gt 0 ]]; then
-            wrn "softnet: +$D_SNDROP пакетов отброшено за $((DW/60)) мин (backlog полон, netdev_max_backlog=$(val net.core.netdev_max_backlog)) — приём не успевает: RPS/ядра/CPU steal"
+            wrn "softnet: +$D_SNDROP пакетов отброшено за $(dw_h) (backlog полон, netdev_max_backlog=$(val net.core.netdev_max_backlog)) — приём не успевает: RPS/ядра/CPU steal"
         elif [[ $(( D_SQZ / (DW > 0 ? DW : 1) )) -ge 1 ]]; then
-            wrn "softnet: time_squeeze +$D_SQZ за $((DW/60)) мин (≥1/с) — softirq упирается в бюджет (netdev_budget=$(val net.core.netdev_budget)); дропов нет"
+            wrn "softnet: time_squeeze +$D_SQZ за $(dw_h) (≥1/с) — softirq упирается в бюджет (netdev_budget=$(val net.core.netdev_budget)); дропов нет"
         else
-            pass "softnet: за $((DW/60)) мин дропов нет, time_squeeze +$D_SQZ"
+            pass "softnet: за $(dw_h) дропов нет, time_squeeze +$D_SQZ"
         fi
     else
         info "softnet с загрузки: dropped=$C_SNDROP time_squeeze=$C_SQZ (прирост покажет следующий запуск — снимок сохранён)"
@@ -1479,28 +1496,40 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
     # полном наборе новые клиенты на порт отсекаются (для ssh4 — новый IP админа в бан).
     # максимум считаем ОТДЕЛЬНО по наборам без timeout: ✘ — про них (режут клиентов),
     # заполненный набор с timeout — другой случай (флуд, лимит отключается)
-    DS_MAX=-1; DS_MAXN=""; DS_NT=0; DS_N=0; DS_NTMAX=-1; DS_NTMAXN=""
+    DS_MAX=-1; DS_MAXN=""; DS_NT=0; DS_N=0
+    # без timeout — два разных отказа: лимитер «в лимите → accept» (SYN/UDP/SSH/ICMP/node-port)
+    # на полном наборе РЕЖЕТ новых клиентов; анти-скан (ps*/psc*, «превысил → suspect/бан») —
+    # СЛЕПНЕТ: новые сканеры не попадают ни в suspect, ни в бан (на ноде флота ps4 стоял на 100%)
+    DS_CMAX=-1; DS_CMAXN=""; DS_PMAX=-1; DS_PMAXN=""
     while IFS=$'\t' read -r _dn _dc _ds _dt; do
         [[ -n "$_dn" ]] || continue
         DS_N=$((DS_N+1))
         (( _dc * 100 / _ds > DS_MAX )) && { DS_MAX=$(( _dc * 100 / _ds )); DS_MAXN="$_dn ($_dc из $_ds)"; }
         if [[ "$_dt" == "0" ]]; then
             DS_NT=$((DS_NT+1))
-            (( _dc * 100 / _ds > DS_NTMAX )) && { DS_NTMAX=$(( _dc * 100 / _ds )); DS_NTMAXN="$_dn ($_dc из $_ds)"; }
+            if [[ "$_dn" =~ ^psc?[46]$ ]]; then
+                (( _dc * 100 / _ds > DS_PMAX )) && { DS_PMAX=$(( _dc * 100 / _ds )); DS_PMAXN="$_dn ($_dc из $_ds)"; }
+            else
+                (( _dc * 100 / _ds > DS_CMAX )) && { DS_CMAX=$(( _dc * 100 / _ds )); DS_CMAXN="$_dn ($_dc из $_ds)"; }
+            fi
         fi
     done < <(dynset_fill 2>/dev/null)
     if [[ "$DS_N" -gt 0 ]]; then
-        if [[ "$DS_NT" -gt 0 && "$DS_NTMAX" -ge 80 ]]; then
-            bad "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2) заполнены до ${DS_NTMAX}%: $DS_NTMAXN — на 100% новые клиенты на порт отсекаются. Ре-ран protect (4.1.3+); пожарно: systemctl reload na-firewall (сбросит и баны)"
-        elif [[ "$DS_NT" -gt 0 ]]; then
-            wrn "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2): адреса копятся до ребута, сейчас максимум ${DS_NTMAX}% — $DS_NTMAXN. На 100% новые клиенты на порт отсекаются: ре-ран protect (4.1.3+)"
-        elif [[ "$DS_MAX" -ge 80 ]]; then
+        if [[ "$DS_CMAX" -ge 80 ]]; then
+            bad "наборы-лимитеры без timeout (правила ≤4.1.2) заполнены до ${DS_CMAX}%: $DS_CMAXN — на 100% новые клиенты на порт отсекаются. Ре-ран protect (4.1.3+); пожарно: systemctl reload na-firewall (сбросит и баны)"
+        fi
+        if [[ "$DS_PMAX" -ge 80 ]]; then
+            wrn "анти-скан без timeout (правила ≤4.1.2) заполнен до ${DS_PMAX}%: $DS_PMAXN — на 100% новые сканеры не попадают ни в suspect, ни в бан (клиентов не режет). Ре-ран protect (4.1.3+)"
+        fi
+        if [[ "$DS_NT" -gt 0 && "$DS_CMAX" -lt 80 && "$DS_PMAX" -lt 80 ]]; then
+            wrn "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2): адреса копятся до ребута, сейчас максимум ${DS_CMAX}% у лимитеров клиентов${DS_CMAXN:+ ($DS_CMAXN)}. На 100% новые клиенты на порт отсекаются: ре-ран protect (4.1.3+)"
+        elif [[ "$DS_NT" -eq 0 && "$DS_MAX" -ge 80 ]]; then
             wrn "набор-лимитер заполнен на ${DS_MAX}%: $DS_MAXN — флуд с множества адресов; на 100% лимит перестаёт действовать для новых адресов (клиентов не режет)"
-        else
+        elif [[ "$DS_NT" -eq 0 ]]; then
             pass "наборы-лимитеры с timeout, максимум заполнения ${DS_MAX}% ($DS_MAXN)"
         fi
     fi
-    unset _dn _dc _ds _dt DS_NTMAX DS_NTMAXN
+    unset _dn _dc _ds _dt DS_CMAX DS_CMAXN DS_PMAX DS_PMAXN
     # Порты: живые правила ↔ protect.conf ↔ маркер. Живые — то, что действует; conf — то,
     # что применит ре-ран protect; маркер пишет только прогон protect. Ручная правка правил
     # (порт добавлен `nft add rule`) живёт до ре-рана — и молча исчезает (аудит флота).
@@ -1747,11 +1776,11 @@ if [[ "$UDP_SVC" == 1 ]]; then UDP_CTX="входящий UDP (QUIC/Hysteria2/TUI
 else UDP_CTX="UDP-слушателей нет — это исходящие сокеты (xray/DNS) с буфером по умолчанию: net.core.rmem_default=$(val net.core.rmem_default)"; fi
 if [[ "$DW" -ge 0 && "$D_UDPERR" -ge 0 ]]; then
     if [[ "$D_UDPERR" -gt 0 ]] && { [[ "$D_UDPIN" -le 0 ]] || [[ $(( D_UDPERR * 1000 / D_UDPIN )) -ge 1 ]]; }; then
-        wrn "UDP RcvbufErrors +$D_UDPERR за $((DW/60)) мин ($(awk -v e="$D_UDPERR" -v d="$D_UDPIN" 'BEGIN{ printf "%.2f", (d > 0 ? e * 100 / d : 100) }')% принятых) — $UDP_CTX"
+        wrn "UDP RcvbufErrors +$D_UDPERR за $(dw_h) ($(awk -v e="$D_UDPERR" -v d="$D_UDPIN" 'BEGIN{ printf "%.2f", (d > 0 ? e * 100 / d : 100) }')% принятых) — $UDP_CTX"
     elif [[ "$D_UDPERR" -gt 0 ]]; then
-        info "UDP RcvbufErrors +$D_UDPERR за $((DW/60)) мин (<0.1% принятых — шум)"
+        info "UDP RcvbufErrors +$D_UDPERR за $(dw_h) (<0.1% принятых — шум)"
     else
-        pass "UDP RcvbufErrors не растут (за $((DW/60)) мин +0; с загрузки $C_UDPERR)"
+        pass "UDP RcvbufErrors не растут (за $(dw_h) +0; с загрузки $C_UDPERR)"
     fi
 elif [[ "$C_UDPERR" -gt 0 && "$C_UDPIN" -gt 0 && $(( C_UDPERR * 100 / C_UDPIN )) -ge 1 ]]; then
     wrn "UDP RcvbufErrors = $C_UDPERR с загрузки (≥1% принятых) — $UDP_CTX; рост покажет следующий запуск"
@@ -1761,9 +1790,9 @@ fi
 # Переполнение accept-очереди: SYN/ACK отброшен, клиент ждёт ретрансмита (секунды)
 if [[ "$DW" -ge 0 && "$D_LOVF" -ge 0 ]]; then
     if [[ "$D_LOVF" -gt 0 ]]; then
-        wrn "accept-очередь переполнялась: ListenOverflows +$D_LOVF (ListenDrops +$D_LDROP) за $((DW/60)) мин (somaxconn=$(val net.core.somaxconn)) — приложение не успевает accept'ить"
+        wrn "accept-очередь переполнялась: ListenOverflows +$D_LOVF (ListenDrops +$D_LDROP) за $(dw_h) (somaxconn=$(val net.core.somaxconn)) — приложение не успевает accept'ить"
     else
-        pass "accept-очереди не переполнялись за $((DW/60)) мин"
+        pass "accept-очереди не переполнялись за $(dw_h)"
     fi
 elif [[ "$C_LOVF" -gt 0 ]]; then
     info "ListenOverflows = $C_LOVF (ListenDrops = $C_LDROP) с загрузки (рост покажет следующий запуск)"

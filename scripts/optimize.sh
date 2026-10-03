@@ -496,11 +496,16 @@ port_in_list() {
     done
     return 1
 }
-# LISTEN-порты процессов ноды (xray / rw-core / rw-node; TCP и UDP — диапазон общий) +
-# порт node-агента. По строке на порт.
+# TCP-LISTEN процессов ноды (xray / rw-core / rw-node) + входящие UDP из UDP_PORTS
+# protect.conf + порт node-агента. По строке на порт. UDP из `ss -ul` НЕ берём: там же
+# висят исходящие UDP-сокеты xray на случайных эфемерных портах (десятки на ноде флота) —
+# зарезервировать их значит засорить ip_local_reserved_ports и менять его каждый прогон.
 na_node_listen_ports() {
-    { ss -Htlnp 2>/dev/null; ss -Hulnp 2>/dev/null; } \
+    local u
+    ss -Htlnp 2>/dev/null \
         | awk '/users:\(\("(xray|rw-core|rw-node)"/ { la = $4; sub(/.*:/, "", la); if (la ~ /^[0-9]+$/) print la }' || true
+    u="$(sed -nE 's/^: "\$\{UDP_PORTS:?=([^}]*)\}".*/\1/p' "$CONF_DIR/protect.conf" 2>/dev/null | tail -1)"
+    for u in ${u//,/ }; do [[ "$u" =~ ^[0-9]+$ ]] && echo "$u"; done
     detect_node_port 2>/dev/null | tr ',' '\n' || true
 }
 # Итоговый ip_local_reserved_ports (NA_RESV_LIST): резерв оператора (текущее значение

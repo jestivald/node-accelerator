@@ -172,7 +172,9 @@ LISTEN 0 4096 127.0.0.1:10085 0.0.0.0:* users:(("xray",pid=10,fd=8))
 LISTEN 0 511 0.0.0.0:2222 0.0.0.0:* users:(("rw-node",pid=11,fd=3))
 LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))
 L
-printf 'UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("xray",pid=10,fd=9))\n' > "$T/ss-u"
+# + исходящие UDP-сокеты xray на эфемерных портах — резервировать их нельзя
+{ printf 'UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("xray",pid=10,fd=9))\n'
+  printf 'UNCONN 0 0 *:40404 *:* users:(("rw-core",pid=10,fd=31))\n'; } > "$T/ss-u"
 # чужой файл сортируется ПОЗЖЕ нашего (t > n) и урезает буфер
 printf 'net.core.rmem_max = 16777216\n' > "$T/etc/sysctl.d/99-tuning.conf"
 run_sysctl() { rc=0; "$WBASH" "$T/wrap-sysctl.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
@@ -185,6 +187,7 @@ expect_not "net.ipv6.conf.all.forwarding больше не ставится" gre
 expect "net.ipv4.ip_forward на месте" grep -qE '^net.ipv4.ip_forward[[:space:]]+= 1' "$F"
 expect "резерв: порт xray 10085 (127.0.0.1) + резерв оператора" grep -qE '^net.ipv4.ip_local_reserved_ports = 10085,20000-20010$' "$F"
 expect_not "резерв: 443 и 2222 ниже диапазона — не резервируются" grep -qE 'reserved_ports = .*(443|2222)' "$F"
+expect_not "резерв: исходящий UDP-сокет xray (40404) не резервируется" grep -qE 'reserved_ports = .*40404' "$F"
 expect "состояние: наши порты = 10085" grep -qx 10085 "$T/state/reserved-ports.na"
 expect "снимок исходных значений создан" test -s "$T/state/sysctl.orig"
 expect "снимок: rmem_max = сток 212992" tsv_has "$T/state/sysctl.orig" net.core.rmem_max 212992
