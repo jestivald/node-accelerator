@@ -133,6 +133,81 @@ printf ': "${CROWDSEC_STRICT:=0}"\n' > "$T/etc/second.conf"
 OUT="$(run "load_conf '$CONF' >/dev/null; load_conf '$T/etc/second.conf'")"
 check "второй load_conf: ключ из первого файла — не ENV (warn есть)" 1 "$(printf '%s\n' "$OUT" | grep -c 'записан старой версией')"
 
+echo "== 6. v4.2: save_conf отсекает обратный слэш =="
+OUT="$(run "export REMNAWAVE_SWAP_SIZE='2G\\'; save_conf '$T/etc/bs.conf' REMNAWAVE_SWAP_SIZE; cat '$T/etc/bs.conf'")"
+check "значение с \\ пропущено (иначе load_conf падал бы на синтаксисе всего файла)" 0 \
+      "$(printf '%s\n' "$OUT" | grep -c 'REMNAWAVE_SWAP_SIZE:=')"
+check "…и об этом предупреждено" 1 "$(printf '%s\n' "$OUT" | grep -c 'пропускаю REMNAWAVE_SWAP_SIZE')"
+OUT="$(run "export NA_EXPLICIT_KEYS=' SSH_PORT'; export SSH_PORT=2222; save_conf '$T/etc/ex.conf' SSH_PORT; conf_is_explicit '$T/etc/ex.conf' SSH_PORT && echo EXPL")" || true
+check "NA_EXPLICIT_KEYS → метка # explicit: SSH_PORT" 1 "$(grep -cx '# explicit: SSH_PORT' "$T/etc/ex.conf" 2>/dev/null || true)"
+check "conf_is_explicit её видит" EXPL "$(printf '%s\n' "$OUT" | tail -1)"
+
+echo "== 7. v4.2: detect_ssh_port — все порты, свойство Listen сокет-юнита =="
+mkdir -p "$T/bin2"
+cat > "$T/bin2/systemctl" <<'SC'
+#!/bin/sh
+case "$*" in
+  "is-active --quiet ssh.socket") [ "${NA_T_SOCK:-0}" = 1 ] && exit 0; exit 3 ;;
+  "is-active --quiet sshd.socket") exit 3 ;;
+  "show ssh.socket -p Listen --value") echo "[::]:2222 (Stream) 0.0.0.0:22 (Stream)" ;;
+esac
+exit 0
+SC
+cat > "$T/bin2/sshd" <<'SD'
+#!/bin/sh
+[ "$1" = "-T" ] && printf 'port 22\nport 2200\naddressfamily any\n'
+SD
+chmod +x "$T/bin2"/*
+check "ssh.socket активен → оба порта из Listen" "2222,22" "$(PATH="$T/bin2:$PATH" NA_T_SOCK=1 run 'detect_ssh_port')"
+check "без сокета → все port из sshd -T" "22,2200" "$(PATH="$T/bin2:$PATH" NA_T_SOCK=0 run 'detect_ssh_port')"
+
+echo "== 8. v4.2: detect_node_port — свой агент, а не второй тенант =="
+cat > "$T/bin2/ss" <<'SS'
+#!/bin/sh
+[ "${NA_T_RWNODE:-0}" = 1 ] && echo 'LISTEN 0 511 *:2222 *:* users:(("rw-node",pid=10,fd=20))'
+exit 0
+SS
+cat > "$T/bin2/docker" <<'DK'
+#!/bin/sh
+# три контейнера: свой агент (образ по digest, host-сеть), второй тенант (bridge, тот же
+# внутренний порт), агент третьего тенанта (host-сеть, свой порт)
+case "$*" in
+  "ps -a --format {{.Names}}") printf 'remnanode\nreka-remnanode\nremnanode-dbn\nnginx\n' ;;
+  "inspect -f {{.Config.Image}} remnanode") echo 'remnawave/node@sha256:0cdf386dd49f' ;;
+  "inspect -f {{.Config.Image}} reka-remnanode") echo 'remnawave/node:3.4.1' ;;
+  "inspect -f {{.Config.Image}} remnanode-dbn") echo 'remnawave/node:latest' ;;
+  "inspect -f {{.Config.Image}} nginx") echo 'nginx:alpine' ;;
+  "inspect -f {{.HostConfig.NetworkMode}} remnanode") echo host ;;
+  "inspect -f {{.HostConfig.NetworkMode}} reka-remnanode") echo reka-node ;;
+  "inspect -f {{.HostConfig.NetworkMode}} remnanode-dbn") echo host ;;
+  *"{{range .Config.Env}}"*remnanode-dbn) printf 'NODE_PORT=2322\n' ;;
+  *"{{range .Config.Env}}"*reka-remnanode) printf 'NODE_PORT=9999\n' ;;
+  *"{{range .Config.Env}}"*remnanode) printf 'NODE_PORT=2222\n' ;;
+  *) exit 1 ;;
+esac
+DK
+chmod +x "$T/bin2"/*
+check "слушатель rw-node — первый источник" "2222" "$(PATH="$T/bin2:$PATH" NA_T_RWNODE=1 NA_REMNANODE_ENV=/nonexistent run 'detect_node_port')"
+check "без слушателя: host-сеть агенты (digest-образ найден, bridge-тенант не в счёт)" "2222,2322" \
+      "$(PATH="$T/bin2:$PATH" NA_T_RWNODE=0 NA_REMNANODE_ENV=/nonexistent run 'detect_node_port')"
+
+echo "== 9. v4.2: SSH_CONNECTION у предков (sudo вычищает его из env) =="
+# /proc в песочнице: процесс теста → «предок» 4242 (sshd-сессия) с SSH_CONNECTION
+PCOPY="$T/common-proc.sh"
+sed -e "s#/proc/#$T/proc/#g" "$REPO_ROOT/scripts/lib/common.sh" > "$PCOPY"
+cat > "$T/ancestor.sh" <<ANC
+mkdir -p "$T/proc/\$\$" "$T/proc/4242"
+printf 'Name:\tbash\nPPid:\t4242\n' > "$T/proc/\$\$/status"
+: > "$T/proc/\$\$/environ"
+printf 'HOME=/root\0SSH_CONNECTION=198.51.100.77 50022 10.0.0.5 2200\0' > "$T/proc/4242/environ"
+printf 'Name:\tsshd\nPPid:\t1\n' > "$T/proc/4242/status"
+unset SSH_CONNECTION SSH_CLIENT
+. "$PCOPY"
+echo "\$(ssh_client_ip) \$(ssh_session_port)"
+ANC
+check "IP и порт сессии найдены у предка" "198.51.100.77 2200" "$("$WBASH" "$T/ancestor.sh" 2>&1)"
+check "без SSH_CONNECTION нигде — пусто, без ошибок" "" "$(env -u SSH_CONNECTION "$WBASH" -c ". '$PCOPY'; ssh_client_ip" 2>&1)"
+
 echo
 echo "итого: ok=$PASS fail=$FAIL"
 [[ "$FAIL" -eq 0 ]]

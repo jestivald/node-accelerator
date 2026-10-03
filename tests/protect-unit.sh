@@ -160,7 +160,7 @@ fi
 
 # ─── 3. Сборка анти-скан-правил: PORTSCAN_LOG_RATE ───────────────────────────
 echo "== 3. анти-скан: рейт лога вынесен в ручку (issue #35) =="
-awk '/^PORTSCAN=""$/{f=1} f{print} f&&/^fi$/{exit}' "$PROTECT" > "$T/portscan.sh"
+awk '/^PORTSCAN=""/{f=1} f{print} f&&/^fi$/{exit}' "$PROTECT" > "$T/portscan.sh"
 if [[ ! -s "$T/portscan.sh" ]]; then
     checkf "не смог извлечь сборку PORTSCAN из $PROTECT"
 else
@@ -171,22 +171,30 @@ PORTSCAN_RATE=15; PORTSCAN_BURST=30; PORTSCAN_BAN_TIME=1h; SUSPECT_TIME=30m
 PORTSCAN_LOG_RATE=60; PORTSCAN_LOG_BURST=30
 $1
 . '$T/portscan.sh'
-printf '%s\n' \"\$PORTSCAN\"" 2>&1
+printf '%s\n' \"\$PORTSCAN\" \"\${PORTSCAN_CHAINS:-}\"" 2>&1
     }
-    check "дефолт v4.1: лог 60/минуту с burst 30" 1 \
+    # v4.2: лог — только на переходе адреса в suspect/бан (цепочки ps_suspect*/ps_ban*), а не
+    # на каждый SYN в закрытый порт: ban-once → 4 лог-правила (v4/v6 × suspect/ban)
+    check "лог 60/минуту с burst 30 — в цепочках перехода (ban-once: 4)" 4 \
           "$(ps_run ':' | grep -c 'limit rate 60/minute burst 30 packets log prefix "\[na portscan\] "')"
+    check "лога на КАЖДЫЙ SYN больше нет (правило с ct state new + log)" 0 \
+          "$(ps_run ':' | grep -c 'ct state new limit rate .* log prefix "\[na portscan\]')"
+    check "suspect логируется один раз: уже-suspect — return до лога" 1 \
+          "$(ps_run ':' | grep -c 'ip saddr @suspect_v4 return')"
     check "прежние 5/second из правила ушли" 0 "$(ps_run ':' | grep -c '5/second log prefix "\[na portscan\]')"
-    check "ручки доезжают до правила" 1 \
+    check "ручки доезжают до правила" 4 \
           "$(ps_run 'PORTSCAN_LOG_RATE=5; PORTSCAN_LOG_BURST=7' | grep -c 'limit rate 5/minute burst 7 packets')"
-    check "PORTSCAN_LOG_RATE=0 → лог-правила нет вовсе" 0 \
+    check "PORTSCAN_LOG_RATE=0 → лог-правил нет вовсе" 0 \
           "$(ps_run 'PORTSCAN_LOG_RATE=0' | grep -c '\[na portscan\]')"
-    check "…но бан продолжает работать (meter → @autoban)" 1 \
+    check "…но бан продолжает работать (→ @autoban)" 1 \
           "$(ps_run 'PORTSCAN_LOG_RATE=0' | grep -c 'add @autoban_v4')"
-    check "…и наблюдение ban-once тоже (meter → @suspect)" 1 \
+    check "…и наблюдение ban-once тоже (→ @suspect)" 1 \
           "$(ps_run 'PORTSCAN_LOG_RATE=0' | grep -c 'add @suspect_v4 { ip saddr timeout 30m }')"
-    check "в ruleset остаётся видно, ПОЧЕМУ лога нет" 1 \
+    check "бан считает именованный счётчик c_portscan" 2 \
+          "$(ps_run ':' | grep -c 'counter name c_portscan drop')"
+    check "в ruleset остаётся видно, ПОЧЕМУ лога нет" 4 \
           "$(ps_run 'PORTSCAN_LOG_RATE=0' | grep -c 'PORTSCAN_LOG_RATE=0')"
-    check "без ban-once правило лога такое же" 1 \
+    check "без ban-once — лог только на бане (v4/v6)" 2 \
           "$(ps_run 'ENABLE_BANONCE=0' | grep -c 'limit rate 60/minute burst 30 packets log prefix "\[na portscan\] "')"
 fi
 
@@ -296,6 +304,136 @@ check "дубли названы поимённо (оба, включая нор
 check "широкий /24 предупреждён" 1 "$(grep -c 'ПОЛНЫЙ обход защиты' "$A/apply.log")"
 check "хелпер na-fw-status собран со вшитым счётчиком" 1 \
       "$(grep -c '^nft_set_count ' "$A/sbin/na-fw-status")"
+
+# ─── 6. v4.2: CROWDSEC_SCOPE — блок-листы только на SSH ───────────────────────
+echo "== 6. CrowdSec scope: set-only bouncer + правило только на SSH (v4.2) =="
+CS="$T/cs"; mkdir -p "$CS/bin" "$CS/conf" "$CS/sys" "$CS/backup"
+cat > "$CS/bouncer.yaml" <<'YML'
+mode: nftables
+deny_action: DROP
+blacklists_ipv4: crowdsec-blacklists
+blacklists_ipv6: crowdsec6-blacklists
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+    priority: -10
+  ipv6:
+    enabled: true
+    set-only: false
+    table: crowdsec6
+    chain: crowdsec6-chain
+    priority: -10
+YML
+printf '#!/bin/sh\nexit 0\n' > "$CS/bin/nft"
+printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\ncase "$*" in "is-enabled --quiet crowdsec-nft-scope.service") exit 1;; esac\nexit 0\n' "$CS" > "$CS/bin/systemctl"
+chmod +x "$CS/bin"/*
+sed -n '/^# ─── Область действия блок-листов CrowdSec/,/^# ─── Сейфти-таймер/p' "$PROTECT" | sed '$d' \
+    | sed -e "s#/etc/systemd/system/#$CS/sys/#g" > "$CS/scope.sh"
+if [[ ! -s "$CS/scope.sh" ]]; then
+    checkf "в $PROTECT нет crowdsec_scope_apply (CROWDSEC_SCOPE)"
+else
+    cs_run() {   # cs_run <CROWDSEC_SCOPE>
+        PATH="$CS/bin:$PATH" "$WBASH" -c "set -euo pipefail
+. '$REPO_ROOT/scripts/lib/common.sh'
+CONF_DIR='$CS/conf'; BACKUP='$CS/backup'; CS_BOUNCER_YAML='$CS/bouncer.yaml'
+CROWDSEC_SCOPE='$1'; SSH_NFT='22, 2200'; SSH_EFF='22,2200'; WL4='203.0.113.7, 198.51.100.0/29'; WL6=''
+. '$CS/scope.sh'
+crowdsec_scope_apply" 2>&1
+    }
+    OUT="$(cs_run ssh)"
+    check "ssh: bouncer переведён в set-only (обе семьи)" 2 "$(grep -c 'set-only: true' "$CS/bouncer.yaml")"
+    check "ssh: правило дропа — только на SSH-портах" 1 \
+          "$(grep -c 'tcp dport { 22, 2200 } ip saddr @crowdsec-blacklists counter drop' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: whitelist исключён раньше дропа (CAPI-адрес админа не режет SSH)" 1 \
+          "$(grep -c 'ip saddr { 203.0.113.7, 198.51.100.0/29 } return # na-wl4' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: пустой v6-whitelist — метка-заглушка для na-fw" 1 "$(grep -c '# na-wl6 (whitelist пуст)' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: таблица/набор из конфига bouncer'а" 2 \
+          "$(grep -cE '^table ip crowdsec \{$|set crowdsec-blacklists \{' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: юнит грузит правила ДО bouncer'а" 1 "$(grep -c 'Before=crowdsec-firewall-bouncer.service' "$CS/sys/na-crowdsec-scope.service")"
+    check "ssh: bouncer перезапущен (заполнит наборы)" 1 "$(grep -c 'restart crowdsec-firewall-bouncer' "$CS/systemctl.log")"
+    : > "$CS/systemctl.log"
+    OUT="$(cs_run all)"
+    check "all: set-only снят" 0 "$(grep -c 'set-only: true' "$CS/bouncer.yaml")"
+    check "all: наш юнит и правила убраны" 0 "$(ls "$CS/sys/na-crowdsec-scope.service" "$CS/conf/na-crowdsec-scope.nft" 2>/dev/null | wc -l | tr -d ' ')"
+    sed -i.bak '/set-only/d' "$CS/bouncer.yaml"; rm -f "$CS/bouncer.yaml.bak"
+    OUT="$(cs_run ssh)"
+    check "старый bouncer без set-only → честный откат на all" 1 "$(printf '%s\n' "$OUT" | grep -c 'без опции set-only')"
+fi
+
+# ─── 7. v4.2: na-fw — whitelist во всех слоях одной командой ──────────────────
+echo "== 7. na-fw allow/unban (v4.2) =="
+F="$T/nafw"; mkdir -p "$F/bin" "$F/etc" "$F/state" "$F/crowdsec/parsers/s02-enrich"
+sed -n "/cat > \/usr\/local\/sbin\/na-fw <<'NAFW'/,/^NAFW\$/p" "$PROTECT" | sed '1d;$d' \
+    | sed -e "s#/etc/node-accelerator#$F/etc#g" -e "s#/var/lib/node-accelerator#$F/state#g" \
+          -e "s#/etc/crowdsec/parsers/s02-enrich#$F/crowdsec/parsers/s02-enrich#g" \
+          -e 's#\[\[ \${EUID:-\$(id -u)} -eq 0 \]\] || die "нужен root"#:#' > "$F/na-fw"
+if [[ ! -s "$F/na-fw" ]]; then
+    checkf "в $PROTECT нет генератора na-fw"
+else
+    printf '#!/bin/sh\necho "$*" >> "%s/nft.log"\nexit 0\n' "$F" > "$F/bin/nft"
+    printf '#!/bin/sh\nexit 0\n' > "$F/bin/systemctl"; printf '#!/bin/sh\necho "$*" >> "%s/cscli.log"\nexit 0\n' "$F" > "$F/bin/cscli"
+    printf '#!/bin/sh\nshasum -a 256 "$@" 2>/dev/null || /usr/bin/sha256sum "$@"\n' > "$F/bin/sha256sum"
+    chmod +x "$F/bin"/*
+    printf ': "${FW_MODE:=strict}"\n: "${WHITELIST:=203.0.113.7}"\n' > "$F/etc/protect.conf"
+    cat > "$F/etc/na_filter.nft" <<'NF'
+table inet na_filter {
+    set whitelist_v4 { type ipv4_addr; flags interval; auto-merge; elements = { 203.0.113.7 } }
+    set whitelist_v6 { type ipv6_addr; flags interval; auto-merge;  }
+}
+NF
+    printf 'nft_sha256=old\n' > "$F/state/protect.installed"
+    fw() { PATH="$F/bin:$PATH" "$WBASH" "$F/na-fw" "$@" 2>&1; }
+    fw allow add 198.51.100.9 2001:db8::5 >/dev/null
+    check "allow add: protect.conf дополнен" 1 "$(grep -c 'WHITELIST:=203.0.113.7,198.51.100.9,2001:db8::5}' "$F/etc/protect.conf")"
+    check "allow add: v4 в na_filter.nft" 1 "$(grep -c 'elements = { 198.51.100.9, 203.0.113.7 }' "$F/etc/na_filter.nft")"
+    check "allow add: v6 в na_filter.nft" 1 "$(grep -c 'set whitelist_v6 { type ipv6_addr; flags interval; auto-merge; elements = { 2001:db8::5 } }' "$F/etc/na_filter.nft")"
+    check "allow add: живой сет (nft add element)" 1 "$(grep -c 'add element inet na_filter whitelist_v4 { 198.51.100.9 }' "$F/nft.log")"
+    check "allow add: снят из autoban" 1 "$(grep -c 'delete element inet na_filter autoban_v4 { 198.51.100.9 }' "$F/nft.log")"
+    check "allow add: CrowdSec-yaml пересобран" 1 "$(grep -c '"198.51.100.9"' "$F/crowdsec/parsers/s02-enrich/na-whitelist.yaml")"
+    check "allow add: хэш в маркере обновлён" 0 "$(grep -c '^nft_sha256=old$' "$F/state/protect.installed")"
+    fw allow del 203.0.113.7 >/dev/null
+    check "allow del: убран из conf" 1 "$(grep -c 'WHITELIST:=198.51.100.9,2001:db8::5}' "$F/etc/protect.conf")"
+    check "allow del: убран из файла" 0 "$(grep -c '203.0.113.7' "$F/etc/na_filter.nft")"
+    check "allow del: убран из живого сета" 1 "$(grep -c 'delete element inet na_filter whitelist_v4 { 203.0.113.7 }' "$F/nft.log")"
+    check "мусор вместо адреса — отказ" 1 "$(fw allow add '1.2.3.4;rm' | grep -c 'не IPv4/IPv6/CIDR')"
+    fw unban 192.0.2.66 >/dev/null
+    check "unban: autoban и suspect" 2 "$(grep -cE 'delete element inet na_filter (autoban|suspect)_v4 \{ 192.0.2.66 \}' "$F/nft.log")"
+    check "unban: решения CrowdSec" 1 "$(grep -c 'decisions delete --ip 192.0.2.66' "$F/cscli.log")"
+fi
+
+# ─── 8. v4.2: активные баны переживают ре-ран ────────────────────────────────
+echo "== 8. перенос autoban/suspect через ре-ран (v4.2) =="
+B="$T/bans"; mkdir -p "$B/bin" "$B/state"
+cat > "$B/bin/nft" <<'NFTB'
+#!/bin/sh
+case "$*" in
+  "list set inet na_filter autoban_v4")
+    printf 'table inet na_filter {\n\tset autoban_v4 {\n\t\ttype ipv4_addr\n\t\tsize 65536\n\t\tflags dynamic,timeout\n\t\telements = { 203.0.113.10 timeout 1h expires 59m10s608ms,\n\t\t\t     198.51.100.22 timeout 1d expires 220ms }\n\t}\n}\n' ;;
+  "list set inet na_filter suspect_v4")
+    printf 'table inet na_filter {\n\tset suspect_v4 {\n\t\ttype ipv4_addr\n\t\tflags dynamic,timeout\n\t\telements = { 192.0.2.5 timeout 30m expires 12m3s }\n\t}\n}\n' ;;
+  "-f "*) cp "$2" "$NA_T_BANS_OUT" ;;
+esac
+exit 0
+NFTB
+chmod +x "$B/bin/nft"
+sed -n '/^# ─── Активные баны переживают ре-ран/,/^snapshot_bans$/p' "$PROTECT" | sed '$d' > "$B/bans.sh"
+if [[ ! -s "$B/bans.sh" ]]; then
+    checkf "в $PROTECT нет snapshot_bans/restore_bans"
+else
+    OUT="$(PATH="$B/bin:$PATH" NA_T_BANS_OUT="$B/restored.nft" "$WBASH" -c "set -euo pipefail
+. '$REPO_ROOT/scripts/lib/common.sh'
+STATE_DIR='$B/state'; ENABLE_BANONCE=1
+. '$B/bans.sh'
+snapshot_bans; restore_bans" 2>&1)"
+    check "бан с остатком срока возвращён (мс отброшены)" 1 \
+          "$(grep -c 'add element inet na_filter autoban_v4 { 203.0.113.10 timeout 59m10s }' "$B/restored.nft" 2>/dev/null || true)"
+    check "бан, которому осталось < 1с, не возвращается" 0 "$(grep -c '198.51.100.22' "$B/restored.nft" 2>/dev/null || true)"
+    check "suspect возвращён" 1 "$(grep -c 'add element inet na_filter suspect_v4 { 192.0.2.5 timeout 12m3s }' "$B/restored.nft" 2>/dev/null || true)"
+    check "временный файл убран" 0 "$(ls "$B/state"/.bans.* 2>/dev/null | wc -l | tr -d ' ')"
+fi
 
 echo
 echo "итого: ok=$PASS fail=$FAIL"

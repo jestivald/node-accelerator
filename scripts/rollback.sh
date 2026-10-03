@@ -121,9 +121,30 @@ rollback_protect() {
     # + отвергнутый ruleset и недописанные кандидаты (protect v4.1.3+ генерирует рядом и
     # переименовывает в na_filter.nft только после успешного nft -f)
     rm -f "$CONF_DIR/na_filter.nft" "$CONF_DIR/na_filter.nft.rejected" "$CONF_DIR"/.na_filter.nft.*
-    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers \
+    rm -f /usr/local/sbin/na-fw-status /usr/local/sbin/na-fw-top-talkers /usr/local/sbin/na-fw \
           /usr/local/sbin/na-fleet-sync /usr/local/sbin/na-blocklist-update /usr/local/sbin/na-ctguard \
           /usr/local/sbin/na-fw-safety-revert
+    rm -f "$STATE_DIR"/.bans.* 2>/dev/null || true
+    [[ -d "$CONF_DIR/na_filter.d" ]] && info "оставлен $CONF_DIR/na_filter.d (локальные правила оператора)"
+    # SYNPROXY: свой sysctl снимаем и возвращаем дефолт ядра
+    if [[ -f /etc/sysctl.d/99-na-synproxy.conf ]]; then
+        rm -f /etc/sysctl.d/99-na-synproxy.conf
+        sysctl -q -w net.netfilter.nf_conntrack_tcp_loose=1 2>/dev/null || true
+    fi
+    # CROWDSEC_SCOPE=ssh: наш юнит/правила снимаем, bouncer возвращаем к своим правилам на
+    # всех портах (set-only: false) — иначе он только наполнял бы наборы, которые никто не читает
+    if [[ -f /etc/systemd/system/na-crowdsec-scope.service ]]; then
+        systemctl disable na-crowdsec-scope.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/na-crowdsec-scope.service "$CONF_DIR/na-crowdsec-scope.nft"
+        systemctl daemon-reload 2>/dev/null || true
+        _by=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+        if [[ -f "$_by" ]]; then
+            sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*true[[:space:]]*$/\1 false/' "$_by" && rm -f "$_by.na-tmp"
+            systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+        fi
+        unset _by
+        info "CrowdSec scope снят: bouncer снова ставит свои правила (на всех портах)"
+    fi
     rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock"
     # nftables.service до v4.1.2 включал сам protect (boot-persist), но выключать не будем: он
     # лишь грузит /etc/nftables.conf, который тулкит никогда не писал — трогать чужой конфиг нельзя.
