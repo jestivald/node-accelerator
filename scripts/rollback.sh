@@ -20,7 +20,8 @@ rollback_optimize() {
     rm -f /etc/sysctl.d/99-node-accelerator.conf /etc/sysctl.d/99-node-accelerator-conntrack.conf
     rm -f /etc/modules-load.d/na-bbr.conf /etc/modules-load.d/na-conntrack.conf
     rm -f /etc/systemd/system.conf.d/na-limits.conf /etc/systemd/user.conf.d/na-limits.conf
-    rm -f /etc/systemd/journald.conf.d/na-size.conf
+    # journald: имя drop-in'а до v4.2 — na-size.conf, с v4.2 — 10-na-size.conf
+    rm -f /etc/systemd/journald.conf.d/10-na-size.conf /etc/systemd/journald.conf.d/na-size.conf
     sed -i '/# === node-accelerator ===/,/# === \/node-accelerator ===/d' /etc/security/limits.conf 2>/dev/null || true
 
     # pam_limits: строку дописывал optimize (её нет в стоке Debian/Ubuntu common-session)
@@ -59,8 +60,59 @@ rollback_optimize() {
     rm -f "$CONF_DIR/na_mss.nft"
 
     systemctl daemon-reload
+
+    # ── Runtime без ребута ───────────────────────────────────────────────────
+    # Удалить файлы мало: `sysctl --system` вернёт только ключи, которые задаёт другой
+    # файл, а остальные держат наши значения до перезагрузки; маски очередей и THP тоже.
+    # Возвращаем то, что было ДО первого применения (снимки optimize v4.2+), затем
+    # `sysctl --system` — чужие файлы по-прежнему главнее снимка.
+    local rt="" n line k v p
+    if [[ -s "$STATE_DIR/sysctl.orig" ]]; then
+        n=0
+        while IFS= read -r line; do
+            k="${line%%$'\t'*}"; v="${line#*$'\t'}"
+            [[ "$k" =~ ^[a-z0-9_.-]+$ ]] || continue
+            p="/proc/sys/${k//.//}"
+            [[ -w "$p" ]] || continue
+            printf '%s\n' "$v" > "$p" 2>/dev/null && n=$((n+1))
+        done < "$STATE_DIR/sysctl.orig"
+        rt+="sysctl — $n ключ(ей) возвращены к значениям до первого прогона; "
+    else
+        rt+="sysctl — снимка нет (optimize ставился до v4.2): ключи, которых не задаёт другой файл, держат наши значения до ребута; "
+    fi
     sysctl --system >/dev/null 2>&1 || true
     systemctl restart systemd-journald 2>/dev/null || true
+
+    if [[ -s "$STATE_DIR/rps-orig.tsv" ]]; then
+        while IFS=$'\t' read -r p v; do
+            [[ "$p" == /sys/class/net/*/queues/* && -e "$p" ]] || continue
+            printf '%s\n' "$v" > "$p" 2>/dev/null || true
+        done < "$STATE_DIR/rps-orig.tsv"
+        rt+="маски RPS/XPS — из снимка; "
+    else
+        # RPS включал тулкит, дефолт ядра — 0; раскладку XPS драйвер восстановит на ребуте
+        local nic; nic="$(awk -F= '/^nic=/{print $2; exit}' "$STATE_DIR/optimize.installed" 2>/dev/null)"
+        if [[ -n "$nic" && "$nic" != none && -d "/sys/class/net/$nic" ]]; then
+            for p in /sys/class/net/"$nic"/queues/rx-*/rps_cpus; do
+                [[ -e "$p" ]] && { printf '0\n' > "$p" 2>/dev/null || true; }
+            done
+        fi
+        rt+="RPS выключен (снимка масок нет), XPS — к раскладке драйвера после ребута; "
+    fi
+    if [[ -s "$STATE_DIR/thp.orig" ]]; then
+        while IFS=$'\t' read -r k v; do
+            [[ "$k" == enabled || "$k" == defrag ]] || continue
+            printf '%s\n' "$v" > "/sys/kernel/mm/transparent_hugepage/$k" 2>/dev/null || true
+        done < "$STATE_DIR/thp.orig"
+        rt+="THP — из снимка; "
+    else
+        rt+="THP — never до ребута (снимка нет); "
+    fi
+    if [[ -f "$STATE_DIR/journald.persistent" ]]; then
+        info "журнал остаётся постоянным: /var/log/journal создал optimize, в нём история (удалить: rm -rf /var/log/journal — история пропадёт)"
+    fi
+    rm -f "$STATE_DIR/sysctl.orig" "$STATE_DIR/rps-orig.tsv" "$STATE_DIR/thp.orig" \
+          "$STATE_DIR/reserved-ports.na" "$STATE_DIR/journald.persistent"
 
     # psi=1 в GRUB_CMDLINE_LINUX_DEFAULT снимаем ТОЛЬКО если дописывали его МЫ: ровно
     # в этом случае в маркере есть строка psi=1. Оператор мог включить учёт давления
@@ -97,7 +149,7 @@ rollback_optimize() {
         fi
     fi
     rm -f "$STATE_DIR/optimize.installed" "$CONF_DIR/optimize.conf"
-    ok "optimize откатан (значения sysctl вернутся к дефолтам; XanMod — по флагу)"
+    ok "optimize откатан. Runtime: ${rt%; }. Лимиты nofile для сервисов — после ребута; XanMod — по флагу"
 }
 
 rollback_protect() {

@@ -187,17 +187,23 @@ backup_file() {
     return 0
 }
 
+# apt по умолчанию НЕ ждёт чужой dpkg-лок, а падает сразу. На свежем боксе первые минуты
+# лок держит unattended-upgrades: обе попытки ниже падали подряд, и optimize/protect
+# умирали под set -e на первой же зависимости — при живом репозитории и исправном боксе.
+# 120 с хватает, чтобы дождаться штатного прогона unattended-upgrades.
+NA_APT_LOCK_TIMEOUT="${NA_APT_LOCK_TIMEOUT:-120}"
 apt_install() {
+    local -a lk=(-o "DPkg::Lock::Timeout=$NA_APT_LOCK_TIMEOUT")
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq 2>/dev/null || true
-    if ! apt-get install -y -qq --no-install-recommends "$@" >/dev/null 2>&1; then
+    apt-get "${lk[@]}" update -qq 2>/dev/null || true
+    if ! apt-get "${lk[@]}" install -y -qq --no-install-recommends "$@" >/dev/null 2>&1; then
         # Прерванный прошлый прогон / битый dpkg — частый кейс на чужих нодах:
         # dpkg --configure -a + `apt-get -f install` чинят состояние, затем один ретрай.
         warn "apt install $*: первая попытка не прошла — чиню dpkg и повторяю"
         dpkg --configure -a >/dev/null 2>&1 || true
-        apt-get install -y -qq -f >/dev/null 2>&1 || true
-        apt-get update -qq 2>/dev/null || true
-        apt-get install -y -qq --no-install-recommends "$@" >/dev/null
+        apt-get "${lk[@]}" install -y -qq -f >/dev/null 2>&1 || true
+        apt-get "${lk[@]}" update -qq 2>/dev/null || true
+        apt-get "${lk[@]}" install -y -qq --no-install-recommends "$@" >/dev/null
     fi
 }
 
@@ -207,8 +213,15 @@ confirm() {
     [[ "$ans" =~ ^[yYдД] ]]
 }
 
-# Основной интерфейс по default route.
-default_iface() { ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
+# Основной интерфейс по default route — токен ПОСЛЕ `dev`, а не пятое поле: `$5` верен
+# только для `default via <gw> dev <if> …`. На OpenVZ маршрут без шлюза
+# (`default dev venet0 scope link`) давал «scope», а у multipath (`default proto static
+# … nexthop via … dev eth0 …`) — мусор; дальше это имя шло в RPS, NIC-tune и diagnose.
+default_iface() {
+    # awk дочитывает вход до конца (без exit): под pipefail ранний выход дал бы SIGPIPE у ip
+    ip -o -4 route show default 2>/dev/null \
+        | awk '!f { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); f = 1; break } }'
+}
 
 # systemd-интервал ("5min"/"12h"/"90s"/"2d"/"300") → секунды. Для расчёта возраста
 # последнего успешного синка (fleet/blocklist) в диагностике.

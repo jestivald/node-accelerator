@@ -50,7 +50,8 @@ jobs:
         # Юнит рапортовал success при неприменённом RPS: default route на буте появляется
         # позже network-online.target, скрипт молча выходил нулём (#30). Теперь NIC из
         # ExecStart, ожидание маршрута, фолбэк на физические, честный отказ; плюс #28 —
-        # в перенаправленном stdout нет escape-кодов курсора.
+        # в перенаправленном stdout нет escape-кодов курсора. v4.2: без RPS на 1 vCPU и
+        # при RX-очередей ≥ ядер, XPS только с NA_XPS=1, маски из снимка, venet0.
         run: bash tests/rps-unit.sh
       - name: psi unit (секция PSI optimize.sh + откат против стаба update-grub)
         # ENABLE_PSI=1 дописывает psi=1 в GRUB_CMDLINE_LINUX_DEFAULT идемпотентно, =0 не
@@ -66,7 +67,23 @@ jobs:
         # считают адреса (#32); датчик CONN_LIMIT без loopback/whitelist (#31); дрейф
         # whitelist относительно protect.conf (#38); PSI три состояния (#37); серты в
         # /opt/*/certs и снятые с renew (#39); глубина журнала (#35); RPS-юнит vs факт (#30).
+        # v4.2: дельты счётчиков между запусками, steal окном 3 с, PSI avg60, ложные ▲ по
+        # аудиту флота, порты из живых правил, CrowdSec по источникам, allowlist CrowdSec,
+        # DNAT мимо na_filter, слушатели вне файрвола, просроченный серт, Caddy/nginx.
         run: bash tests/diagnose-unit.sh
+      - name: optimize unit (секции sysctl/journald/снимки/проверки XanMod + откат runtime против стабов)
+        # v4.2: чужой sysctl.d, перебивающий наш ключ, назван по имени; порты xray внутри
+        # эфемерного диапазона (вкл. 127.0.0.1:10085) резервируются без потери резерва
+        # оператора; без net.ipv6.conf.all.forwarding; journald 10-na-size.conf +
+        # persistent при volatile; откат возвращает sysctl/RPS/XPS/THP без ребута; Secure
+        # Boot и тесный /boot — без ядра, initrd и драйвер NIC — до «нужна перезагрузка»;
+        # default_iface после `dev` (venet0/multipath); apt ждёт чужой dpkg-лок.
+        run: bash tests/optimize-unit.sh
+      - name: na-report unit (CrowdSec по строкам raw, честные метрики 5 мин, asn_enrichment)
+        # v4.2: решения считались по полям "value" в -o json (×33 на ноде флота);
+        # ban_rate_5m был числом строк лога — рядом events_5m/unique_src_5m; флаг
+        # ok|partial|unavailable для ASN; управляющий символ из whois не ломает JSON.
+        run: bash tests/na-report-unit.sh
       - name: lint — никаких `cmd | grep -q` под pipefail (SIGPIPE → ложное «нет»)
         # grep -q закрывает пайп на первом совпадении; дописывающая команда ловит SIGPIPE,
         # пайплайн под pipefail отдаёт 141. В v4.1.2 так через раз гас сенсор лога
