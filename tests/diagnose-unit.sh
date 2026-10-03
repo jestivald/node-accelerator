@@ -234,6 +234,10 @@ case "$*" in
   "list table inet na_ctguard")  exit 1 ;;
   "list table ip crowdsec")      exit 1 ;;
   "list chain inet na_filter input") cat "$NFTD/chain-input"; exit 0 ;;
+  "list meter inet "*)
+      all="$*"; s=${all##* }
+      if [ -f "$NFTD/meter-$s" ]; then cat "$NFTD/meter-$s"; exit 0; fi
+      echo "Error: No such file or directory" >&2; exit 1 ;;
   "list set inet "*)
       # ${*##* } раскрывается по КАЖДОМУ параметру, а не по склейке — берём имя набора
       # через промежуточную переменную
@@ -523,12 +527,25 @@ env TERM=dumb NA_TEST_LR_DUP=1 "$WBASH" "$DIAG" > "$T/out8.txt" 2>/dev/null || t
 grep_ok "дубликат в большом выводе logrotate -d найден" "logrotate: дубликат путей" "$T/out8.txt"
 
 echo "== 9. наборы-лимитеры: без timeout копят адреса, на 100% режут клиентов (v4.1.3) =="
-# legacy (≤4.1.2): syn4_443 без timeout, 85 из 100; cc4_443 — ct count, ядро чистит само
+mk_elems() { local n="$1" i out=""; for ((i=1; i<=n; i++)); do out+="${out:+, }198.18.$((i/250)).$((i%250+1))"; done; printf '%s' "$out"; }
+mk_set() {   # mk_set <имя> <size> <flags> <timeout|""> <число элементов> <set|meter>
+    local to_line=""; [[ -n "$4" ]] && to_line="\t\ttimeout $4\n"
+    printf "table inet na_filter {\n\t%s %s {\n\t\ttype ipv4_addr\n\t\tsize %s\n\t\tflags %s\n${to_line}\t\telements = { %s }\n\t}\n}\n" \
+        "$6" "$1" "$2" "$3" "$(mk_elems "$5")" > "$NFTD/$6-$1"
+}
+# nft 1.1.3, правила ≤4.1.2: syn4_443 — бывший meter, виден как набор БЕЗ timeout (85 из 100);
+# autoban_v4 — dynamic,timeout БЕЗ строки timeout (срок на каждой записи) и почти полон:
+# это НЕ лимитер, его считать нельзя; cc4_443 — ct count, ядро чистит само.
 cat > "$NFTD/terse" <<'TERSE'
 table inet na_filter {
 	set whitelist_v4 {
 		type ipv4_addr
 		flags interval
+	}
+	set autoban_v4 {
+		type ipv4_addr
+		size 100
+		flags dynamic,timeout
 	}
 	set syn4_443 {
 		type ipv4_addr
@@ -542,24 +559,64 @@ table inet na_filter {
 	}
 }
 TERSE
-mk_elems() { local n="$1" i out=""; for ((i=1; i<=n; i++)); do out+="${out:+, }198.18.$((i/250)).$((i%250+1))"; done; printf '%s' "$out"; }
-printf 'table inet na_filter {\n\tset syn4_443 {\n\t\ttype ipv4_addr\n\t\tsize 100\n\t\tflags dynamic\n\t\telements = { %s }\n\t}\n}\n' "$(mk_elems 85)" > "$NFTD/set-syn4_443"
-printf 'table inet na_filter {\n\tset cc4_443 {\n\t\ttype ipv4_addr\n\t\tsize 65535\n\t\tflags dynamic\n\t\telements = { %s }\n\t}\n}\n' "$(mk_elems 99)" > "$NFTD/set-cc4_443"
+mk_set syn4_443 100 dynamic "" 85 set
+mk_set autoban_v4 100 dynamic,timeout "" 95 set
+mk_set cc4_443 65535 dynamic "" 99 set
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9.json" 2>/dev/null || true
-check "json: dynset_fill_max_pct=85"        85 "$(jget "$T/out9.json" dynset_fill_max_pct)"
+check "json: dynset_fill_max_pct=85 (autoban не лимитер)" 85 "$(jget "$T/out9.json" dynset_fill_max_pct)"
 check "json: dynset_fill_max_set=syn4_443"  syn4_443 "$(jget "$T/out9.json" dynset_fill_max_set)"
-check "json: dynset_no_timeout=1 (cc4 не в счёт)" 1 "$(jget "$T/out9.json" dynset_no_timeout)"
+check "json: dynset_no_timeout=1 (autoban и cc4 не в счёт)" 1 "$(jget "$T/out9.json" dynset_no_timeout)"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/out9.txt" 2>/dev/null || true
 grep_ok "текст: ✘ legacy-набор почти полон"  "наборы-лимитеры без timeout (1 шт., правила ≤4.1.2) заполнены до 85%" "$T/out9.txt"
-# v4.1.3: тот же набор с timeout, 10 из 100 → ✔
-printf 'table inet na_filter {\n\tset syn4_443 {\n\t\ttype ipv4_addr\n\t\tsize 100\n\t\tflags dynamic,timeout\n\t\ttimeout 1m\n\t\telements = { %s }\n\t}\n}\n' "$(mk_elems 10)" > "$NFTD/set-syn4_443"
-awk '{ if ($0 ~ /flags dynamic$/) { print "\t\tflags dynamic,timeout"; print "\t\ttimeout 1m" } else print }' "$NFTD/terse" > "$NFTD/terse.new" && mv "$NFTD/terse.new" "$NFTD/terse"
+
+# nft 1.0.6, правила ≤4.1.2: meter анонимный — в -t есть только внутри правила
+cat > "$NFTD/terse" <<'TERSE'
+table inet na_filter {
+	set autoban_v4 {
+		type ipv4_addr
+		size 65536
+		flags dynamic,timeout
+	}
+	chain input {
+		type filter hook input priority filter; policy drop;
+		tcp dport 443 ct state new meter cc4_443 size 65535 { ip saddr ct count over 2048 } drop
+		tcp dport 443 ct state new meter syn4_443 size 100 { ip saddr limit rate 200/second burst 400 packets } accept
+		tcp dport 443 ct state new drop
+	}
+}
+TERSE
+rm -f "$NFTD/set-syn4_443"
+mk_set syn4_443 100 dynamic "" 90 meter
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9n.json" 2>/dev/null || true
+check "nft 1.0.6: meter из правила виден, 90%"   90 "$(jget "$T/out9n.json" dynset_fill_max_pct)"
+check "nft 1.0.6: meter считается без timeout"   1 "$(jget "$T/out9n.json" dynset_no_timeout)"
+rm -f "$NFTD/meter-syn4_443"
+
+# v4.1.3: лимитер с timeout (10 из 100) → ✔, autoban на 95% тревоги не поднимает
+cat > "$NFTD/terse" <<'TERSE'
+table inet na_filter {
+	set autoban_v4 {
+		type ipv4_addr
+		size 100
+		flags dynamic,timeout
+	}
+	set syn4_443 {
+		type ipv4_addr
+		size 100
+		flags dynamic,timeout
+		timeout 60s
+	}
+}
+TERSE
+mk_set syn4_443 100 dynamic,timeout 60s 10 set
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9b.json" 2>/dev/null || true
 check "json: с timeout dynset_no_timeout=0"  0 "$(jget "$T/out9b.json" dynset_no_timeout)"
 check "json: заполнение 10%"                 10 "$(jget "$T/out9b.json" dynset_fill_max_pct)"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/out9b.txt" 2>/dev/null || true
 grep_ok "текст: ✔ лимитеры с timeout"         "наборы-лимитеры с timeout, максимум заполнения 10%" "$T/out9b.txt"
 rm -f "$NFTD/terse" "$NFTD/set-syn4_443" "$NFTD/set-cc4_443"
+mk_set autoban_v4 65536 dynamic,timeout "" 0 set; rm -f "$NFTD/set-autoban_v4"
+set_fixture autoban_v4 '203.0.113.10 timeout 1d expires 1h11m50s608ms, 203.0.113.11 timeout 1d expires 2h'
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out9c.json" 2>/dev/null || true
 check "json: наборов нет → dynset_fill_max_pct=-1" -1 "$(jget "$T/out9c.json" dynset_fill_max_pct)"
 
@@ -577,6 +634,9 @@ check "другой boot_id → ребут был → false" false "$(jget "$T/o
 printf 'installed_at=2026-09-01T00:00:00+00:00\nreboot_needed=1\n' > "$OPTM"
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out10c.json" 2>/dev/null || true
 check "старый маркер, btime > installed_at → false" false "$(jget "$T/out10c.json" reboot_needed)"
+printf 'reboot_needed=1\n' > "$OPTM"   # без boot_id и installed_at — верим маркеру, как раньше
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/out10d.json" 2>/dev/null || true
+check "маркер без дат → как раньше, true" true "$(jget "$T/out10d.json" reboot_needed)"
 rm -f "$OPTM"
 
 echo

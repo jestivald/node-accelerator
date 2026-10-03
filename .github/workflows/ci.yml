@@ -72,6 +72,8 @@ jobs:
         # пайплайн под pipefail отдаёт 141. В v4.1.2 так через раз гас сенсор лога
         # анти-скана, никогда не срабатывал cubic-warn и не виден был дубль logrotate.
         run: bash tests/lint-pipefail.sh
+      - name: Install minisign (install unit — подписи локальных модулей)
+        run: sudo apt-get install -y -qq minisign || echo "minisign недоступен — секция подписей в install-unit пропустится"
       - name: install unit (curl|bash НЕ исполняет scripts/ из текущей папки)
         # До v4.1.3 SCRIPT_DIR брался из $0 = "bash" → текущая папка: подложенный scripts/
         # исполнялся root'ом мимо скачивания по NA_REF и проверки подписей.

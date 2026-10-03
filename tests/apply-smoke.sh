@@ -33,6 +33,10 @@ export NA_TEST_SYSTEMCTL_LOG="$T/systemctl.log"
 cat > "$T/bin/systemctl" <<'SYSTEMCTL'
 #!/bin/sh
 printf '%s\n' "$*" >> "$NA_TEST_SYSTEMCTL_LOG"
+# сейфти прошлого прогона «взведён» только по просьбе теста (иначе — нет)
+case "$*" in
+    "is-active --quiet na-fw-safety.timer") [ "${NA_TEST_SAFETY_ACTIVE:-0}" = 1 ] && exit 0; exit 3 ;;
+esac
 exit 0
 SYSTEMCTL
 # curl падает → сетевые fetch (crowdsec/blocklist/fleet) деградируют мягко, не висят.
@@ -111,8 +115,16 @@ grep -qE '(@osyn|meter occ|@oudp)' "$NFTF" && { echo "[x] strict: generic open-�
 # v4.1.3: per-IP лимитеры — объявленные наборы С timeout, правило «превысил → drop»
 grep -q 'set syn4_443 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 60s; }' "$NFTF" \
     || { echo "[x] strict: набор syn4_443 без timeout (записи копятся до ребута → полный набор режет новых клиентов)"; fail=1; }
-grep -q 'set ssh4 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 10m; }' "$NFTF" \
-    || { echo "[x] strict: набор ssh4 без timeout 10m"; fail=1; }
+grep -q 'set ssh4 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 600s; }' "$NFTF" \
+    || { echo "[x] strict: набор ssh4 без timeout 600s (пол 10m)"; fail=1; }
+# SSH на полном ssh4 НЕ открывается: известный адрес — accept, прочим — общий потолок
+grep -q 'tcp dport { 22 } ct state new ip  saddr @ssh4 accept' "$NFTF" \
+    || { echo "[x] strict: нет accept для адресов из ssh4"; fail=1; }
+grep -q 'tcp dport { 22 } ct state new limit rate 30/minute burst 30 packets accept' "$NFTF" \
+    || { echo "[x] strict: нет общего потолка SSH на полном наборе"; fail=1; }
+# медленный rate → timeout растёт вместе с временем восстановления корзины
+grep -q 'set ps4 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 600s; }' "$NFTF" \
+    || { echo "[x] strict: набор ps4 — ожидался timeout 600s (пол 10m)"; fail=1; }
 grep -q 'update @syn4_443 { ip saddr limit rate over 200/second burst 400 packets } jump synflood_drop' "$NFTF" \
     || { echo "[x] strict: SYN-лимит не по схеме «превысил → drop»"; fail=1; }
 if grep -qE 'meter [A-Za-z0-9_]+ \{ ip6? saddr limit' "$NFTF"; then
@@ -259,6 +271,22 @@ grep -q '^ssh_port=22,56777$' "$T/state/protect.installed" \
 grep -q 'SSH_PORT:=22}' "$T/conf/protect.conf" \
   || { echo "[x] ssh-port: в protect.conf должен персиститься intent (22), а не транзитный порт сессии"; fail=1; }
 
+# ── timeout набора растёт с медленным rate; NA_RATE_TO_*=0 (вечные записи) отвергается ──
+reset_t
+set +e
+PORTSCAN_RATE=1 PORTSCAN_BURST=30 ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$T/apply-slow.log" 2>&1
+rc=$?
+NA_RATE_TO_MIN=0 ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 \
+  bash "$T/scripts/protect.sh" >"$T/apply-to0.log" 2>&1
+rc0=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "[x] slow-rate: прогон упал"; fail=1; }
+# 30 пакетов при 1/мин = 30 мин восстановления → timeout 2×30 мин = 3600s (выше пола 10m)
+grep -q 'set ps4 { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 3600s; }' "$NFTF" \
+    || { echo "[x] slow-rate: timeout ps4 не вырос до 2× восстановления корзины"; fail=1; }
+[ "$rc0" -ne 0 ] && grep -q 'NA_RATE_TO_MIN' "$T/apply-to0.log" || { echo "[x] NA_RATE_TO_MIN=0 должен отвергаться"; fail=1; }
+
 # ── Файл автозагрузки меняется только после nft -c И успешного nft -f (v4.1.3) ──
 # До v4.1.3 ruleset генерился прямо в na_filter.nft: провал проверки печатал «ничего не
 # применено», а битый файл уже стоял на месте рабочего и поднимался первым же ребутом.
@@ -293,6 +321,16 @@ for mode in check apply; do
             || { echo "[x] nft-apply-fail: сейфти не снят после отказа nft -f"; fail=1; }
     fi
 done
+# сейфти прошлого неинтерактивного прогона ещё взведён → при отказе nft -f его НЕ снимаем
+reset_t
+echo '# OLD-WORKING-RULESET' > "$NFTF"
+: > "$NA_TEST_SYSTEMCTL_LOG"
+nft_fail_on apply
+set +e
+NA_TEST_SAFETY_ACTIVE=1 ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-nftfail-pre.log" 2>&1
+set -e
+[ "$(grep -c 'stop na-fw-safety.timer' "$NA_TEST_SYSTEMCTL_LOG")" -eq 1 ] \
+    || { echo "[x] nft-apply-fail: сейфти прошлого прогона снят (а должен остаться взведённым)"; fail=1; }
 printf '#!/bin/sh\nexit 0\n' > "$T/bin/nft"; chmod +x "$T/bin/nft"
 # успешный прогон: кандидат переименован в файл автозагрузки, прошлый — в бэкапе
 reset_t

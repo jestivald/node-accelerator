@@ -8,16 +8,20 @@
 # shellcheck disable=SC2034
 NA_VERSION="4.1.3"
 
-# Числа — только с десятичной ТОЧКОЙ. На ноде с LANG/LC_ALL=de_DE.UTF-8 mawk читал «0.35»
-# из /proc/loadavg как 0 (в JSON уезжал "load1":0), printf печатал «0,99» прямо в
-# na-report --json, а пороги --retrans сравнивали «4,99» как 4 (аудит флота). LC_ALL
-# перебивает любой LC_*, поэтому переносим его в LANG — кодировка и кириллица в выводе
-# остаются как были (а с ними и разбор «д/Д» в подтверждениях), — и фиксируем LC_NUMERIC.
-if [[ -n "${LC_ALL:-}" && "$LC_ALL" != C && "$LC_ALL" != POSIX ]]; then
-    export LANG="$LC_ALL"
-fi
-unset LC_ALL
-export LC_NUMERIC=C
+# Числа — только с десятичной ТОЧКОЙ, сообщения утилит — на C. На ноде с LANG/LC_ALL=
+# de_DE.UTF-8 mawk читал «0.35» из /proc/loadavg как 0 (в JSON уезжал "load1":0), printf
+# печатал «0,99» прямо в na-report --json, а пороги --retrans сравнивали «4,99» как 4
+# (аудит флота); локализованный вывод утилит (`free`: «Speicher:» вместо «Mem:») ломал
+# разбор. Явный LC_ALL=C/POSIX/C.UTF-8 уважаем — он и так даёт ровно это. Любой другой
+# LC_ALL перебил бы LC_* — переносим его в LANG: кодировка и кириллица в выводе остаются
+# как были (а с ними и разбор «д/Д» в подтверждениях), фиксируем числа и сообщения.
+case "${LC_ALL:-}" in
+    C|POSIX|C.UTF-8|C.utf8) ;;
+    *)
+        [[ -n "${LC_ALL:-}" ]] && export LANG="$LC_ALL"
+        unset LC_ALL
+        export LC_NUMERIC=C LC_MESSAGES=C ;;
+esac
 
 # shellcheck disable=SC2034
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'

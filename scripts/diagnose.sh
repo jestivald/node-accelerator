@@ -209,33 +209,50 @@ reboot_pending() {
     cur="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
     if [[ -n "$bid" && -n "$cur" ]]; then [[ "$bid" == "$cur" ]]; return; fi
     inst="$(awk -F= '/^installed_at=/{print $2; exit}' "$f" 2>/dev/null)"
+    [[ -n "$inst" ]] || return 0   # `date -d ""` = сегодняшняя полночь — не дата установки
     inst_s="$(date -d "$inst" +%s 2>/dev/null)" || return 0
     bt="$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null)"
     [[ "$inst_s" =~ ^[0-9]+$ && "$bt" =~ ^[0-9]+$ ]] || return 0
     (( bt < inst_s ))
 }
 
-# dynset_fill — заполненность динамических наборов-лимитеров na_filter (SYN/UDP/SSH/ICMP/
-# анти-скан). До v4.1.3 они создавались без timeout: записи не истекали, и на полном
-# наборе (65535) новые клиенты на порт отсекались (аудит флота: 22 764 адреса за 32 дня).
-# stdout: «имя<TAB>элементов<TAB>size<TAB>timeout(1|0)» на набор; ct count-наборы (cc*/occ*)
-# пропускаем — их ядро чистит само. rc=1 — таблицы нет.
+# dynset_fill — заполненность наборов-лимитеров na_filter (SYN/UDP/SSH/ICMP/анти-скан/
+# node-port/open). До v4.1.3 они создавались `meter` без timeout: записи не истекали, и на
+# полном наборе (65535) новые клиенты на порт отсекались (аудит флота: 22 764 адреса за
+# 32 дня). Берём ТОЛЬКО лимитеры по имени: nft помечает dynamic и сеты autoban/suspect
+# (в них пишет правило), а timeout у тех — на каждой записи, не в объявлении. Старые
+# meter на nft 1.0.6 — анонимные: в `-t list table` они есть только внутри правил
+# (`meter NAME size N {`), содержимое отдаёт `nft list meter`.
+# stdout: «имя<TAB>элементов<TAB>size<TAB>timeout(1|0)»; набор, который не уложился в
+# таймаут (флуд — десятки тысяч записей), пропускается. rc=1 — таблицы нет.
+NA_LIMITER_RE='^((syn|udp|osyn|oudp)[46](_[0-9]+)?|ssh[46]|icmp[46]|na[46]|psc?[46])$'
+_dyn_count() {   # _dyn_count set|meter <имя> → число записей; rc≠0 — не измерено
+    local out
+    out="$(_to 5 nft list "$1" inet na_filter "$2" 2>/dev/null)" || return 1
+    printf '%s\n' "$out" | sed -n '/elements = {/,/^[[:space:]]*}/p' \
+        | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}(/[0-9]+)?' \
+        | sort -u | wc -l | tr -d ' '
+}
 dynset_fill() {
-    local name size to n
-    nft list table inet na_filter >/dev/null 2>&1 || return 1
-    while IFS=$'\t' read -r name size to; do
-        [[ -n "$name" && "$size" =~ ^[0-9]+$ ]] || continue
-        n="$(nft_set_count inet na_filter "$name")"; [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    local terse kind name size to n
+    terse="$(_to 10 nft -t list table inet na_filter 2>/dev/null)" || return 1
+    [[ -n "$terse" ]] || return 1
+    while IFS=$'\t' read -r kind name size to; do
+        [[ "$name" =~ $NA_LIMITER_RE && "$size" =~ ^[0-9]+$ ]] && (( size > 0 )) || continue
+        n="$(_dyn_count "$kind" "$name")" && [[ "$n" =~ ^[0-9]+$ ]] || continue
         printf '%s\t%s\t%s\t%s\n' "$name" "$n" "$size" "$to"
-    done < <(nft -t list table inet na_filter 2>/dev/null | awk '
-        /^[[:space:]]*(set|meter) [A-Za-z0-9_]+ \{/ { name=$2; size=0; dyn=0; to=0; inset=1; next }
-        inset && /^[[:space:]]*size [0-9]+/       { size=$2 }
-        inset && /^[[:space:]]*flags / && /dynamic/ { dyn=1 }
-        inset && /^[[:space:]]*timeout /           { to=1 }
-        inset && /^[[:space:]]*}/ {
-            if (dyn && size>0 && name !~ /^o?cc[46]/) printf "%s\t%s\t%s\n", name, size, to
-            inset=0
-        }')
+    done < <(awk '
+        /^[[:space:]]*set [A-Za-z0-9_]+ \{/ { name=$2; size=0; to=0; inset=1; next }
+        inset && /^[[:space:]]*size [0-9]+/  { size=$2 }
+        inset && /^[[:space:]]*timeout /     { to=1 }
+        inset && /^[[:space:]]*}/            { print "set\t" name "\t" size "\t" to; seen[name]=1; inset=0; next }
+        { while (match($0, /meter [A-Za-z0-9_]+ size [0-9]+/)) {
+              split(substr($0, RSTART, RLENGTH), m, " ")
+              if (!(m[2] in meters)) meters[m[2]] = m[4]
+              $0 = substr($0, RSTART + RLENGTH)
+          } }
+        END { for (k in meters) if (!(k in seen)) print "meter\t" k "\t" meters[k] "\t0" }
+    ' <<<"$terse")
 }
 
 # ─── JSON-режим (для флот-мониторинга: Zabbix/Prometheus/SSH-поллинг) ─────────
@@ -272,7 +289,7 @@ emit_json() {
         eval "$(awk '/^Tcp:/{ if(!h){for(i=2;i<=NF;i++)nm[i]=$i;h=1;next} for(i=2;i<=NF;i++){if(nm[i]=="OutSegs")print "out="$i;if(nm[i]=="RetransSegs")print "rtx="$i} }' /proc/net/snmp 2>/dev/null)"
         out="${out:-0}"; rtx="${rtx:-0}"; [[ "$out" -gt 0 ]] && rtxpct=$(( rtx * 100 / out ))
     fi
-    nft list table inet na_filter >/dev/null 2>&1 && fw=true || fw=false
+    nft -t list table inet na_filter >/dev/null 2>&1 && fw=true || fw=false
     # режим файрвола из маркера protect (strict|open|skip; пусто = protect не гонялся
     # или старая версия без fw_mode) — панель отличает осознанный skip/open от «защиты нет»
     fwm="$(awk -F= '/^fw_mode=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"; fwm="${fwm:-}"
@@ -803,7 +820,7 @@ systemctl is-active --quiet irqbalance 2>/dev/null && pass "irqbalance акти�
 # ─── Firewall / защита ───────────────────────────────────────────────────────
 title "Firewall и защита"
 FW_MODE_INST="$(awk -F= '/^fw_mode=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
-if nft list table inet na_filter >/dev/null 2>&1; then
+if nft -t list table inet na_filter >/dev/null 2>&1; then
     if [[ "$FW_MODE_INST" == "open" ]]; then
         pass "nftables na_filter активна (FW_MODE=open: лимиты/баны есть, не перечисленные порты открыты)"
     else
@@ -889,25 +906,30 @@ if nft list table inet na_filter >/dev/null 2>&1; then
     fi
     # Наборы per-IP лимитеров. До v4.1.3 — без timeout: адреса копятся до ребута, и на
     # полном наборе новые клиенты на порт отсекаются (для ssh4 — новый IP админа в бан).
-    DS_MAX=-1; DS_MAXN=""; DS_NT=0; DS_N=0
+    # максимум считаем ОТДЕЛЬНО по наборам без timeout: ✘ — про них (режут клиентов),
+    # заполненный набор с timeout — другой случай (флуд, лимит отключается)
+    DS_MAX=-1; DS_MAXN=""; DS_NT=0; DS_N=0; DS_NTMAX=-1; DS_NTMAXN=""
     while IFS=$'\t' read -r _dn _dc _ds _dt; do
         [[ -n "$_dn" ]] || continue
         DS_N=$((DS_N+1))
         (( _dc * 100 / _ds > DS_MAX )) && { DS_MAX=$(( _dc * 100 / _ds )); DS_MAXN="$_dn ($_dc из $_ds)"; }
-        [[ "$_dt" == "0" ]] && DS_NT=$((DS_NT+1))
+        if [[ "$_dt" == "0" ]]; then
+            DS_NT=$((DS_NT+1))
+            (( _dc * 100 / _ds > DS_NTMAX )) && { DS_NTMAX=$(( _dc * 100 / _ds )); DS_NTMAXN="$_dn ($_dc из $_ds)"; }
+        fi
     done < <(dynset_fill 2>/dev/null)
     if [[ "$DS_N" -gt 0 ]]; then
-        if [[ "$DS_NT" -gt 0 && "$DS_MAX" -ge 80 ]]; then
-            bad "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2) заполнены до ${DS_MAX}%: $DS_MAXN — на 100% новые клиенты на порт отсекаются. Ре-ран protect (4.1.3+); пожарно: systemctl reload na-firewall (сбросит и баны)"
+        if [[ "$DS_NT" -gt 0 && "$DS_NTMAX" -ge 80 ]]; then
+            bad "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2) заполнены до ${DS_NTMAX}%: $DS_NTMAXN — на 100% новые клиенты на порт отсекаются. Ре-ран protect (4.1.3+); пожарно: systemctl reload na-firewall (сбросит и баны)"
         elif [[ "$DS_NT" -gt 0 ]]; then
-            wrn "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2): адреса копятся до ребута, сейчас максимум ${DS_MAX}% — $DS_MAXN. На 100% новые клиенты на порт отсекаются: ре-ран protect (4.1.3+)"
+            wrn "наборы-лимитеры без timeout ($DS_NT шт., правила ≤4.1.2): адреса копятся до ребута, сейчас максимум ${DS_NTMAX}% — $DS_NTMAXN. На 100% новые клиенты на порт отсекаются: ре-ран protect (4.1.3+)"
         elif [[ "$DS_MAX" -ge 80 ]]; then
             wrn "набор-лимитер заполнен на ${DS_MAX}%: $DS_MAXN — флуд с множества адресов; на 100% лимит перестаёт действовать для новых адресов (клиентов не режет)"
         else
             pass "наборы-лимитеры с timeout, максимум заполнения ${DS_MAX}% ($DS_MAXN)"
         fi
     fi
-    unset _dn _dc _ds _dt
+    unset _dn _dc _ds _dt DS_NTMAX DS_NTMAXN
     # v3.0 компоненты
     if nft list set inet na_filter suspect_v4 >/dev/null 2>&1; then
         SUSP="$(nft_set_count inet na_filter suspect_v4)"; [[ "$SUSP" =~ ^[0-9]+$ ]] || SUSP=0
@@ -983,7 +1005,7 @@ if [[ -f "$STATE_DIR/safety-fired.last" ]]; then
     fi
 fi
 # Таблица есть, а автозагрузки нет → после ребута нода останется без правил.
-if nft list table inet na_filter >/dev/null 2>&1 \
+if nft -t list table inet na_filter >/dev/null 2>&1 \
    && [[ -f /etc/systemd/system/na-firewall.service ]] \
    && ! systemctl is-enabled --quiet na-firewall.service 2>/dev/null; then
     wrn "na_filter активна, но na-firewall.service ВЫКЛЮЧЕН — после ребута правила не поднимутся. Лечится повторным прогоном protect."
@@ -1069,7 +1091,7 @@ if [[ -n "$NP_DET" && -f "$STATE_DIR/protect.installed" ]]; then
     NP_FW="$(awk -F= '/^node_port=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
     NP_FWM="$(awk -F= '/^fw_mode=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
     NP_TCPP="$(awk -F= '/^tcp_ports=/{print $2}' "$STATE_DIR/protect.installed" 2>/dev/null)"
-    if [[ "${NP_FWM:-strict}" == "strict" ]] && nft list table inet na_filter >/dev/null 2>&1; then
+    if [[ "${NP_FWM:-strict}" == "strict" ]] && nft -t list table inet na_filter >/dev/null 2>&1; then
         NP_MISS=""
         for _np in ${NP_DET//,/ }; do
             [[ ",${NP_FW:-},${NP_TCPP:-}," == *",$_np,"* ]] || NP_MISS+="${NP_MISS:+,}$_np"

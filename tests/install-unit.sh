@@ -81,6 +81,38 @@ if grep -q DECOY-HELP "$T/out3.log"; then fail_ "справка напечата
 elif grep -q 'install.sh rollback' "$T/out3.log"; then ok_ "встроенная справка"
 else fail_ "справки нет: $(head -c 200 "$T/out3.log")"; fi
 
+echo "== 4. из файла, но scripts/ рядом НЕ доверенный (запись для группы) → скачивание =="
+mkdir -p "$T/shared"
+cp "$REPO_ROOT/install.sh" "$T/shared/install.sh"
+cp -R "$T/decoy/scripts" "$T/shared/scripts"
+chmod g+w "$T/shared/scripts"
+: > "$NA_TEST_CURL_LOG"
+( cd "$T" && PATH="$T/bin:$BDIR:$PATH" bash "$T/shared/install.sh" diagnose ) > "$T/out4.log" 2>&1 || true
+grep -q DECOY-EXECUTED "$T/out4.log" && fail_ "исполнен scripts/ с записью для группы" || ok_ "scripts/ с записью для группы не исполнялся"
+grep -q '/scripts/lib/common.sh$' "$NA_TEST_CURL_LOG" && ok_ "вместо него модули скачаны" || fail_ "модули не скачивались"
+grep -q 'не доверенный' "$T/out4.log" && ok_ "причина названа" || fail_ "нет сообщения о недоверенном scripts/"
+
+echo "== 5. NA_REQUIRE_SIG=1 проверяет и ЛОКАЛЬНЫЕ модули =="
+if command -v minisign >/dev/null 2>&1; then
+    mkdir -p "$T/signed" "$T/key"
+    cp "$REPO_ROOT/install.sh" "$T/signed/install.sh"
+    cp -R "$REPO_ROOT/scripts" "$T/signed/scripts"
+    rm -f "$T/signed/scripts"/*.minisig "$T/signed/scripts/lib"/*.minisig
+    minisign -G -W -p "$T/key/k.pub" -s "$T/key/k.key" >/dev/null 2>&1
+    for m in lib/common.sh optimize.sh protect.sh diagnose.sh na-report.sh rollback.sh; do
+        minisign -S -s "$T/key/k.key" -m "$T/signed/scripts/$m" >/dev/null 2>&1
+    done
+    PUB="$(sed -n 2p "$T/key/k.pub")"
+    : > "$NA_TEST_CURL_LOG"
+    ( cd "$T" && NA_REQUIRE_SIG=1 NA_MINISIGN_PUBKEY="$PUB" PATH="$T/bin:$BDIR:$PATH" bash "$T/signed/install.sh" diagnose ) > "$T/out5.log" 2>&1 || true
+    grep -q 'подпись lib/common.sh валидна (локальный модуль)' "$T/out5.log" && ok_ "подписанные локальные модули приняты" || fail_ "подписанные локальные модули не приняты: $(tail -3 "$T/out5.log")"
+    echo '# tampered' >> "$T/signed/scripts/protect.sh"
+    ( cd "$T" && NA_REQUIRE_SIG=1 NA_MINISIGN_PUBKEY="$PUB" PATH="$T/bin:$BDIR:$PATH" bash "$T/signed/install.sh" diagnose ) > "$T/out5b.log" 2>&1 || true
+    grep -q 'подпись локального protect.sh НЕ прошла' "$T/out5b.log" && ok_ "подменённый локальный модуль отвергнут" || fail_ "подменённый локальный модуль НЕ отвергнут"
+else
+    echo "  skip (нет minisign)"
+fi
+
 echo
 echo "  прогон: $PASS ok, $FAIL fail"
 [[ "$FAIL" -eq 0 ]] || { echo "INSTALL-UNIT: FAIL"; exit 1; }
