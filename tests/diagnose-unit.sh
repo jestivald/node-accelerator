@@ -227,6 +227,8 @@ case "$1" in
   inspect)
     case "$*" in
       *LogConfig*) echo "/remnanode json-file "; exit 0 ;;
+      # mount'ы работающих контейнеров (сенсор сертов: кто обслуживает путь)
+      *Mounts*) [ -f "$NFTD/docker-mounts" ] && cat "$NFTD/docker-mounts"; exit 0 ;;
     esac
     name=""
     for a in "$@"; do name="$a"; done
@@ -245,7 +247,7 @@ case "$1" in
     # опубликованные порты (v4.2: сенсор DNAT мимо na_filter) и id для LogConfig
     case "$*" in
       *"{{.Ports}}"*) [ -f "$NFTD/docker-ports" ] && cat "$NFTD/docker-ports" ;;
-      "ps -q")        [ "${NA_TEST_DK_NOCAP:-0}" = 1 ] && echo abc123 ;;
+      "ps -q")        { [ "${NA_TEST_DK_NOCAP:-0}" = 1 ] || [ -f "$NFTD/docker-mounts" ]; } && echo abc123 ;;
     esac
     exit 0 ;;
 esac
@@ -305,14 +307,14 @@ cat > "$BIN/cscli" <<'CS'
 # `decisions list -o raw` печатает CSV С ЗАГОЛОВКОМ — он и завышал счёт на 1 (#32)
 # `-a` — вместе с CAPI/списками: NA_TEST_CAPI решений origin=CAPI и NA_TEST_LISTS — lists
 case "$*" in
-  "decisions list -o raw"|"decisions list -a -o raw")
+  "decisions list -o raw"|"decisions list -a -o raw"|"decisions list --limit 0 -o raw"|"decisions list -a --limit 0 -o raw")
     echo "id,source,ip,reason,action,country,as,events_count,expiration,simulated,alert_id"
     i=0
     while [ "$i" -lt "${NA_TEST_DECISIONS:-0}" ]; do
         i=$((i+1))
         echo "$i,crowdsec,Ip:203.0.113.$i,crowdsecurity/ssh-bf,ban,,\"64500 EXAMPLE, Inc\",3,3h,false,$i"
     done
-    if [ "$*" = "decisions list -a -o raw" ]; then
+    if [ "$*" = "decisions list -a -o raw" ] || [ "$*" = "decisions list -a --limit 0 -o raw" ]; then
         j=0
         while [ "$j" -lt "${NA_TEST_CAPI:-0}" ]; do
             j=$((j+1)); echo "$((1000+j)),CAPI,Ip:198.18.0.$j,crowdsecurity/http-probing,ban,,,0,160h,false,0"
@@ -427,6 +429,12 @@ cat > "$BIN/openssl" <<'SSL'
 #!/bin/sh
 # Снятый с renew серт истекает РАНЬШЕ живого: если сенсор его учтёт — увидим ✘ (#39)
 for a in "$@"; do last="$a"; done
+# CN: старая копия (*dup*) — тот же домен, что у живого серта; у прочих — свой
+case "$last" in
+  *dup*|*selfsteal*) echo "subject=CN=node.example.test" ;;
+  *expired*) echo "subject=CN=expired.example.test" ;;
+  *)         echo "subject=O=Example,CN=other.example.test" ;;
+esac
 case "$last" in
   *retired*) echo "notAfter=RETIRED" ;;
   *expired*) echo "notAfter=EXPIRED" ;;
@@ -1073,16 +1081,43 @@ grep_ok  "…именно ▲"                                         "▲  с�
 rm -f "$T/run/reboot-required" "$T/run/reboot-required.pkgs"
 
 echo "== 20. сертификаты: просроченный не маскируется, Caddy и nginx находятся (v4.2) =="
-mkdir -p "$T/etc/letsencrypt/live/expired.example.test"
+mkdir -p "$T/etc/letsencrypt/live/expired.example.test" "$T/etc/letsencrypt/renewal"
 printf 'x\n' > "$T/etc/letsencrypt/live/expired.example.test/fullchain.pem"
+# с renewal-конфигом certbot серт в работе — истёк, значит renewal сломан: ✘
+printf '[renewalparams]\n' > "$T/etc/letsencrypt/renewal/expired.example.test.conf"
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o20.json" 2>/dev/null || true
 check "json: просроченный серт: cert_min_days=-10" -10 "$(jget "$T/o20.json" cert_min_days)"
 check "json: cert_found=true"                     true "$(jget "$T/o20.json" cert_found)"
+check "json: обслуживаемый — не «брошенный»"      0 "$(jget "$T/o20.json" cert_stale_count)"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/o20.txt" 2>/dev/null || true
 grep_ok "текст: ✘ «ИСТЁК»"                          "✘  TLS-серт ИСТЁК 10 дн назад" "$T/o20.txt"
+# без renewal-конфига и без сервиса с этим путём — брошенный: не ✘, а ▲ и отдельное поле
+rm -f "$T/etc/letsencrypt/renewal/expired.example.test.conf"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o20s.json" 2>/dev/null || true
+check "json: брошенный не тянет cert_min_days вниз (живой 60)" 60 "$(jget "$T/o20s.json" cert_min_days)"
+check "json: cert_stale_count=1"                  1 "$(jget "$T/o20s.json" cert_stale_count)"
+check "json: cert_stale_file — брошенный"         "$T/etc/letsencrypt/live/expired.example.test/fullchain.pem" "$(jget "$T/o20s.json" cert_stale_file)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o20s.txt" 2>/dev/null || true
+grep_not "текст: брошенный — не ✘"                 "TLS-серт ИСТЁК" "$T/o20s.txt"
+grep_ok  "текст: брошенный — ▲ с подсказкой"       "▲  серт без обслуживающего сервиса: $T/etc/letsencrypt/live/expired.example.test/fullchain.pem (истёк 10 дн назад)" "$T/o20s.txt"
+# путь под mount работающего контейнера — обслуживается
+printf '%s\n' "$T/etc/letsencrypt" > "$NFTD/docker-mounts"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o20m.json" 2>/dev/null || true
+check "json: под mount контейнера → снова в счёте (-10)" "-10 0" "$(jget "$T/o20m.json" cert_min_days) $(jget "$T/o20m.json" cert_stale_count)"
+rm -f "$NFTD/docker-mounts"
+# NA_CERT_IGNORE — исключить совсем
+env TERM=dumb NA_CERT_IGNORE="$T/etc/letsencrypt/live/*" "$WBASH" "$DIAG" --json > "$T/o20i.json" 2>/dev/null || true
+check "json: NA_CERT_IGNORE — путь не смотрится" "60 0" "$(jget "$T/o20i.json" cert_min_days) $(jget "$T/o20i.json" cert_stale_count)"
 rm -rf "$T/etc/letsencrypt"
+# старая копия того же домена (CN как у живого) — молча мимо, даже без renewal
+mkdir -p "$T/opt/old/certs"; printf 'x\n' > "$T/opt/old/certs/fullchain-expired-dup.pem"
+NA_CERT_PATHS="$T/opt/old/certs/fullchain-expired-dup.pem"
+env TERM=dumb NA_CERT_PATHS="$NA_CERT_PATHS" "$WBASH" "$DIAG" --json > "$T/o20u.json" 2>/dev/null || true
+check "json: истёкшая копия при живом серте на тот же CN — не тревога" "60 0" "$(jget "$T/o20u.json" cert_min_days) $(jget "$T/o20u.json" cert_stale_count)"
+rm -rf "$T/opt/old"; unset NA_CERT_PATHS
 CADDY_D="$T/var/lib/docker/volumes/caddy_data/_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/panel.example.test"
 mkdir -p "$CADDY_D"; printf 'x\n' > "$CADDY_D/panel.example.test.crt"
+# 15 дн — вне зоны тревоги: обслуживание не проверяется
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o20b.json" 2>/dev/null || true
 check "json: серт Caddy в docker volume найден (15 дн)" 15 "$(jget "$T/o20b.json" cert_min_days)"
 rm -rf "$T/var/lib/docker/volumes"
@@ -1117,7 +1152,7 @@ d=json.load(open(sys.argv[1])); k=list(d)
 new=["udp_rcvbuf_errors_delta","softnet_drops_delta","time_squeeze_delta","listen_overflows_delta","delta_window_s",
      "cpu_steal_boot_pct","crowdsec_decisions_local","crowdsec_decisions_capi","crowdsec_scope",
      "whitelist_drift_crowdsec","dnat_ports","dnat_guard","xanmod_update","cert_found",
-     "portscan_log_lines_24h","portscan_log_share_pct"]
+     "portscan_log_lines_24h","portscan_log_share_pct","cert_stale_count","cert_stale_file"]
 i=k.index("dynset_no_timeout")
 print("ok" if k[i+1:]==new and k[0]=="kernel" else "keys after tail: %s" % k[i+1:])
 PYK

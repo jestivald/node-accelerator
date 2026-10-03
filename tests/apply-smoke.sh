@@ -347,6 +347,10 @@ ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.
 set -e
 grep -q 'tcp dport { 2200, 22 } ct state new update @ssh4' "$NFTF" || { echo "[x] v4.2: устаревший SSH_PORT из conf + детект — не оба порта"; fail=1; }
 grep -qF 'сохранён старой версией (автодетект)' "$T/apply-v42e.log" || { echo "[x] v4.2: нет warn про устаревший SSH_PORT"; fail=1; }
+# в conf остаётся исходный порт БЕЗ метки explicit — сверка (и warn) повторится на ре-ране,
+# а не «оба порта навсегда»
+grep -q 'SSH_PORT:=2200}' "$T/conf/protect.conf" && ! grep -qx '# explicit: SSH_PORT' "$T/conf/protect.conf" \
+    || { echo "[x] v4.2: устаревший SSH_PORT закреплён (ждём :=2200 без explicit)"; fail=1; }
 
 # ── timeout набора растёт с медленным rate; NA_RATE_TO_*=0 (вечные записи) отвергается ──
 reset_t

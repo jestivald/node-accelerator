@@ -14,7 +14,7 @@
 #      а на полном наборе — общий потолок, а не открытая дверь для перебора;
 #   7. опубликованный (DNAT) порт: забаненный адрес режется в forward, whitelist проходит;
 #   8. SYNPROXY: рукопожатие на защищённом порту завершается (v4.2: synproxy до invalid-drop
-#      + nf_conntrack_tcp_loose=0).
+#      + nf_conntrack_tcp_loose=0); SYN-rate, бан и whitelist решаются ДО synproxy.
 # Размер набора и пол timeout ужаты ручками NA_RATE_SET_SIZE/NA_RATE_TO_*, чтобы проверить
 # переполнение и истечение за секунды.
 #
@@ -58,6 +58,7 @@ cp "$F" "$T/ruleset.nft"; rm -f "$F"
 # вариант с SYNPROXY — отдельный ruleset (synproxy меняет путь рукопожатия на TCP_PORTS)
 OUT="$(TERM=dumb NA_NO_LOCK=1 DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 ENABLE_CROWDSEC=0 \
        TCP_PORTS=8443 UDP_PORTS=none NODE_PORT=none ENABLE_SYNPROXY=1 \
+       SYN_RATE=$RATE SYN_BURST=$BURST NA_RATE_TO_SEC=1s NA_RATE_TO_MIN=1s \
        bash "$T/scripts/protect.sh" 2>&1)" || { echo "$OUT" | tail -20; echo "[x] генерация SYNPROXY-варианта не прошла"; exit 1; }
 F="$(sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' <<<"$OUT" | sed -nE 's/.*Генерация nftables → (\/tmp\/na_filter\.[A-Za-z0-9]+\.nft).*/\1/p' | tail -1)"
 cp "$F" "$T/ruleset-sp.nft"; rm -f "$F"
@@ -218,6 +219,14 @@ if modprobe nft_synproxy 2>/dev/null || [[ -d /sys/module/nft_synproxy ]]; then
     if ip netns exec "$SRV" nft -f "$T/ruleset-sp.nft"; then
         ok_ "SYNPROXY-ruleset загружен"
         check "соединение через synproxy устанавливается (до v4.2 — нет)" 3 "$(connects 10.77.0.13 10.77.0.1 8443 3)"
+        # после synproxy соединение уже established: лимиты на `ct state new` и блок-листы ниже
+        # его не видят — всё, что решается до рукопожатия, стоит перед synproxy (ревью v4.2)
+        okr="$(connects 10.77.0.15 10.77.0.1 8443 10)"
+        [[ "$okr" -lt 10 ]] && ok_ "SYN-rate до synproxy: из 10 быстрых прошли не все ($okr)" || fail_ "SYN-rate до synproxy не сработал: прошло $okr из 10"
+        ip netns exec "$SRV" nft add element inet na_filter autoban_v4 '{ 10.77.0.16 timeout 5m }'
+        check "забаненный не завершает рукопожатие через synproxy" 0 "$(connects 10.77.0.16 10.77.0.1 8443 1)"
+        ip netns exec "$SRV" nft add element inet na_filter whitelist_v4 '{ 10.77.0.16 }'
+        check "whitelist сильнее бана и на synproxy-порту" 1 "$(connects 10.77.0.16 10.77.0.1 8443 1)"
     else
         fail_ "SYNPROXY-ruleset не загрузился"
     fi

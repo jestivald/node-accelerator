@@ -120,6 +120,27 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iproute2 python3
       - name: real nft in netns (timeout у наборов, fail-open на полном наборе, rate-limit)
         run: sudo bash tests/nft-behavior.sh
+      - name: правило CROWDSEC_SCOPE=ssh на настоящем nft (auto-merge, правка как в na-fw, ре-загрузка)
+        run: sudo bash tests/cs-scope-nft.sh
+
+  # ── CROWDSEC_SCOPE на НАСТОЯЩЕМ crowdsec-firewall-bouncer ───────────────────
+  # Блокер ревью v4.2: restart bouncer'а после наших таблиц — старый процесс на выходе
+  # удалял таблицу, новый в set-only не стартовал, и CrowdSec не блокировал ничего. Юнит
+  # подменяет systemctl/nft; здесь bouncer настоящий (репо packagecloud, как в protect.sh).
+  crowdsec-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-пин: плавающий тег v4 может быть перенесён на другой коммит
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install CrowdSec + nftables bouncer (packagecloud any/any, ключ — в keyring)
+        run: |
+          curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/crowdsec.gpg
+          echo "deb [signed-by=/usr/share/keyrings/crowdsec.gpg] https://packagecloud.io/crowdsec/crowdsec/any any main" \
+            | sudo tee /etc/apt/sources.list.d/crowdsec.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nftables crowdsec crowdsec-firewall-bouncer-nftables
+      - name: ssh ↔ all на настоящем bouncer'е (не падает, решения доезжают)
+        run: sudo bash tests/crowdsec-e2e.sh
 
   # ── Smoke-тесты на матрице дистрибутивов ────────────────────────────────────
   # Ловит ровно тот класс регрессий, из-за которых появился этот PR: установка
@@ -130,6 +151,8 @@ jobs:
       fail-fast: false
       matrix:
         image:
+          - "debian:bullseye"   # nft 0.9.8 — в README заявлен, в матрице не было
+          - "ubuntu:20.04"      # focal, nft 0.9.3 — то же
           - "debian:bookworm"
           - "debian:trixie"
           - "ubuntu:22.04"   # jammy → подменяется на bookworm
@@ -154,6 +177,8 @@ jobs:
             bash curl gnupg nftables iproute2 gawk procps kmod coreutils irqbalance ethtool jq
       - name: Syntax (bash -n)
         run: bash -n install.sh scripts/*.sh scripts/lib/*.sh
+      - name: правило CROWDSEC_SCOPE=ssh грузится nft этой ОС (whitelist с auto-merge)
+        run: bash tests/cs-scope-nft.sh
       - name: protect.sh DRY_RUN (дефолты — генерация + nft -c)
         run: DRY_RUN=1 REMNAWAVE_NONINTERACTIVE=1 bash scripts/protect.sh
       - name: protect.sh DRY_RUN (full-feature — blocklists/fleet/whitelist-only/ban-once → nft -c)

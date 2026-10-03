@@ -108,7 +108,7 @@ crowdsec_count() {
     local all="" c
     [[ "${1:-}" == -a ]] && all=-a
     command -v cscli >/dev/null 2>&1 || { [[ -n "$all" ]] && echo -1 || echo 0; return; }
-    c="$(cscli decisions list $all -o raw 2>/dev/null | awk -F, '$1 ~ /^[0-9]+$/ {c++} END {print c+0}')"
+    c="$(cscli decisions list $all --limit 0 -o raw 2>/dev/null | awk -F, '$1 ~ /^[0-9]+$/ {c++} END {print c+0}')"
     [[ "$c" =~ ^[0-9]+$ ]] || c=0
     echo "$c"
 }
@@ -232,20 +232,22 @@ emit_json() {
     # сортирует (TSV), JSON собирает bash через json_escape: имя AS приходит из whois/DNS
     # как есть, и экранирования одних \ и " (как было) не хватало на управляющие символы.
     local asn_json="" an anm acc apct
-    while IFS=$'\t' read -r an apct acc anm; do
+    # разделитель \x1f, а не таб: `IFS=$'\t' read` склеивает подряд идущие пустые поля
+    # (таб — «пробельный» разделитель), и при пустой стране имя AS уезжало в country
+    while IFS=$'\x1f' read -r an apct acc anm; do
         [[ -n "$an" ]] || continue
         asn_json+="${asn_json:+,}{\"asn\":\"$(json_str "$an")\",\"name\":\"$(json_str "$anm")\",\"country\":\"$(json_str "$acc")\",\"pct\":$apct}"
     done < <(
         for i in "${!ips[@]}"; do
-            ip="${ips[$i]}"; printf '%s\t%s\t%s\t%s\n' "${ASN[$ip]:-?}" "${hitsarr[$i]}" "${CC[$ip]:-}" "${ANAME[$ip]:-}"
-        done | awk -F'\t' '
+            ip="${ips[$i]}"; printf '%s\x1f%s\x1f%s\x1f%s\n' "${ASN[$ip]:-?}" "${hitsarr[$i]}" "${CC[$ip]:-}" "${ANAME[$ip]:-}"
+        done | awk -F'\037' '
             $1!="?"{ hit[$1]+=$2; cc[$1]=$3; nm[$1]=$4; tot+=$2 }
             END{
                 if(tot<1) exit
                 n=0; for(a in hit){ arr[n++]=a }
                 # простая сортировка по hit desc
                 for(i=0;i<n;i++) for(j=i+1;j<n;j++) if(hit[arr[j]]>hit[arr[i]]){t=arr[i];arr[i]=arr[j];arr[j]=t}
-                for(i=0;i<n && i<8;i++){ a=arr[i]; printf "%s\t%d\t%s\t%s\n", a, int(hit[a]*100/tot+0.5), cc[a], nm[a] }
+                for(i=0;i<n && i<8;i++){ a=arr[i]; printf "%s\037%d\037%s\037%s\n", a, int(hit[a]*100/tot+0.5), cc[a], nm[a] }
             }'
     )
 

@@ -61,11 +61,11 @@ NF
 cat > "$BIN/cscli" <<'CS'
 #!/bin/sh
 case "$*" in
-  "decisions list -o raw"|"decisions list -a -o raw")
+  "decisions list -o raw"|"decisions list -a -o raw"|"decisions list --limit 0 -o raw"|"decisions list -a --limit 0 -o raw")
     echo "id,source,ip,reason,action,country,as,events_count,expiration,simulated,alert_id"
     echo '1,crowdsec,Ip:203.0.113.10,crowdsecurity/ssh-bf,ban,ZZ,"64500 EXAMPLE, Inc",5,3h,false,1'
     echo '2,cscli,Ip:203.0.113.20,manual,ban,ZZ,,0,24h,false,2'
-    if [ "$*" = "decisions list -a -o raw" ]; then
+    if [ "$*" = "decisions list -a -o raw" ] || [ "$*" = "decisions list -a --limit 0 -o raw" ]; then
         i=0; while [ "$i" -lt 33 ]; do i=$((i+1)); echo "$((100+i)),CAPI,Ip:198.18.0.$i,crowdsecurity/http-probing,ban,,,0,160h,false,0"; done
     fi ;;
   "decisions list -o json")
@@ -85,7 +85,12 @@ n=0
 for ip in $(printf '%s\n' "$in" | grep -E '^[0-9]+\.'); do
     n=$((n+1))
     [ "$mode" = first ] && [ "$n" -gt 1 ] && break
-    printf '64500   | %s | 203.0.113.0/24 | ZZ | arin | 2000-01-01 | EXAMPLE\001NET\tSUB, ZZ\n' "$ip"
+    if [ "$mode" = nocc ]; then
+        # страна пустая — поле между разделителями пустое (так бывает у Cymru)
+        printf '64500   | %s | 203.0.113.0/24 |  | arin | 2000-01-01 | EXAMPLE-NET\n' "$ip"
+    else
+        printf '64500   | %s | 203.0.113.0/24 | ZZ | arin | 2000-01-01 | EXAMPLE\001NET\tSUB, ZZ\n' "$ip"
+    fi
 done
 WH
 printf '#!/bin/sh\nexit 1\n' > "$BIN/dig"
@@ -122,6 +127,10 @@ check "unique_src_5m = 2"                                2 "$(jget "$T/o1.json" 
 check "asn_enrichment = ok"                              ok "$(jget "$T/o1.json" asn_enrichment)"
 check "top_asn: имя без управляющего символа, таб не рвёт строку" "EXAMPLE" \
       "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["top_asn"][0]["name"].split("\t")[0][:7])' "$T/o1.json")"
+# пустая страна: имя AS не должно уехать в country (`IFS=$'\t' read` склеивал пустые поля)
+NA_TEST_WHOIS=nocc TERM=dumb "$WBASH" "$R" --json > "$T/o1n.json" 2>/dev/null || true
+check "top_asn: при пустой стране country пуст, имя на месте" "|EXAMPLE-NET" \
+      "$(python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["top_asn"][0]; print(a["country"]+"|"+a["name"])' "$T/o1n.json" 2>&1)"
 check "новые поля — строго в хвосте, после top_ips" ok "$(python3 - "$T/o1.json" <<'PY'
 import json, sys
 k = list(json.load(open(sys.argv[1])))

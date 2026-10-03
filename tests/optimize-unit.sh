@@ -141,7 +141,8 @@ awk '/^# ─── 3\. Sysctl/{f=1} /^# ─── 4\. Лимиты/{f=0} f' "$OP
                 -e "s# /lib/sysctl\.d# $T/lib/sysctl.d#g" \
                 -e "s#/etc/modules-load\.d#$T/etc/modules-load.d#g" \
                 -e "s#/proc/sys/#$T/proc/sys/#g" \
-                -e "s#/proc/meminfo#$T/proc/meminfo#g" > "$T/sysctl-section.sh"
+                -e "s#/proc/meminfo#$T/proc/meminfo#g" \
+                -e "s#/proc/net/snmp6#$T/proc/net/snmp6#g" > "$T/sysctl-section.sh"
 [ -s "$T/sysctl-section.sh" ] || { echo "[x] не смог извлечь секцию 3 из optimize.sh"; exit 1; }
 cat > "$T/wrap-sysctl.sh" <<WRAP
 #!/usr/bin/env bash
@@ -209,6 +210,47 @@ expect "rc=0" test "$rc" -eq 0
 expect "снимок не перезаписан ре-раном" cmp -s "$T/orig.first" "$T/state/sysctl.orig"
 expect "резерв: 10085 снят, 10086 добавлен, оператор сохранён" grep -qE '^net.ipv4.ip_local_reserved_ports = 10086,20000-20010$' "$F"
 expect "без перебивающего файла и RO-ключей — «действуют»" grep -q 'значения наших файлов действуют' "$T/out"
+
+echo "== 1b2. ядро склеило наш порт с операторским в диапазон — наш не застревает =="
+# прошлый прогон резервировал 10086 (state), оператор — 10087; ядро печатает «10086-10087».
+# xray ушёл на 10090: 10086 должен уйти, 10087 (оператор) — остаться.
+printf '10086\n' > "$T/state/reserved-ports.na"
+kset net.ipv4.ip_local_reserved_ports "10086-10087,20000-20010"
+"$REAL_SED" -e 's/:10086 /:10090 /' "$T/ss-t" > "$T/ss-t.new" && mv "$T/ss-t.new" "$T/ss-t"
+run_sysctl
+expect "rc=0" test "$rc" -eq 0
+expect "резерв: 10086 снят из склейки, операторский 10087 и наш 10090" grep -qE '^net.ipv4.ip_local_reserved_ports = 10087,10090,20000-20010$' "$F"
+expect "состояние: наши порты = 10090" grep -qx 10090 "$T/state/reserved-ports.na"
+# склейка внутри широкого диапазона оператора: наш порт вырезается, края остаются
+printf '10090\n' > "$T/state/reserved-ports.na"
+kset net.ipv4.ip_local_reserved_ports "10087,10089-10095,20000-20010"
+run_sysctl
+expect "резерв: из 10089-10095 вырезан только наш 10090 (и снова добавлен — xray там)" \
+    grep -qE '^net.ipv4.ip_local_reserved_ports = 10087,10089,10090,10091-10095,20000-20010$' "$F"
+"$REAL_SED" -e 's/:10090 /:10086 /' "$T/ss-t" > "$T/ss-t.new" && mv "$T/ss-t.new" "$T/ss-t"
+printf '10086\n' > "$T/state/reserved-ports.na"
+kset net.ipv4.ip_local_reserved_ports "10086,20000-20010"
+
+echo "== 1b3. IPv6-форвардинг: оставляем, если нода уже маршрутизирует v6 (апгрейд с ≤4.1) =="
+mkdir -p "$T/proc/net"
+# прошлая версия ставила форвардинг нашим файлом; через ноду шли v6-пакеты (WireGuard)
+printf 'net.ipv6.conf.all.forwarding      = 1\n' >> "$F"
+kset net.ipv6.conf.all.forwarding 1
+printf 'Ip6InReceives                   	1000\nIp6OutForwDatagrams             	42\n' > "$T/proc/net/snmp6"
+run_sysctl
+expect "rc=0" test "$rc" -eq 0
+expect "v6 маршрутизируется → форвардинг остаётся в файле" grep -qE '^net\.ipv6\.conf\.all\.forwarding[[:space:]]+= 1$' "$F"
+expect "…и сказано, почему (NA_IPV6_FORWARD=1)" grep -q 'через ноду уже прошло 42 v6-пакетов' "$T/out"
+# пакетов не было, а форвардинг включал наш старый файл — не ставим, но предупреждаем
+printf 'Ip6InReceives                   	1000\nIp6OutForwDatagrams             	0\n' > "$T/proc/net/snmp6"
+run_sysctl
+expect_not "без v6-трафика через ноду — не ставим" grep -qE '^net\.ipv6\.conf\.all\.forwarding' "$F"
+expect "…и предупреждаем: после ребута будет 0" grep -q 'После ребута будет 0' "$T/out"
+# явный выбор оператора сильнее авто
+printf 'Ip6InReceives                   	1000\nIp6OutForwDatagrams             	42\n' > "$T/proc/net/snmp6"
+NA_IPV6_FORWARD=0 run_sysctl
+expect_not "NA_IPV6_FORWARD=0 — не ставим даже при трафике" grep -qE '^net\.ipv6\.conf\.all\.forwarding' "$F"
+kset net.ipv6.conf.all.forwarding 0; rm -f "$T/proc/net/snmp6"
 
 echo "== 1c. сверка через systemd-analyze cat-config =="
 printf 'net.core.wmem_max = 4194304\n' > "$T/etc/sysctl.d/99-zz-ops.conf"

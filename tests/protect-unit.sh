@@ -327,8 +327,10 @@ nftables:
     chain: crowdsec6-chain
     priority: -10
 YML
-printf '#!/bin/sh\nexit 0\n' > "$CS/bin/nft"
-printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\ncase "$*" in "is-enabled --quiet crowdsec-nft-scope.service") exit 1;; esac\nexit 0\n' "$CS" > "$CS/bin/systemctl"
+printf '#!/bin/sh\necho "$*" >> "%s/nft.log"\nexit 0\n' "$CS" > "$CS/bin/nft"
+# NA_TEST_BOUNCER_DOWN=1 — bouncer не поднимается (set-only без таблицы): is-active ≠ 0
+printf '#!/bin/sh\necho "$*" >> "%s/systemctl.log"\ncase "$*" in "is-enabled --quiet crowdsec-nft-scope.service") exit 1;; "is-active --quiet crowdsec-firewall-bouncer") [ "${NA_TEST_BOUNCER_DOWN:-0}" = 1 ] && exit 3;; esac\nexit 0\n' "$CS" > "$CS/bin/systemctl"
+printf '#!/bin/sh\nexit 0\n' > "$CS/bin/sleep"
 chmod +x "$CS/bin"/*
 sed -n '/^# ─── Область действия блок-листов CrowdSec/,/^# ─── Сейфти-таймер/p' "$PROTECT" | sed '$d' \
     | sed -e "s#/etc/systemd/system/#$CS/sys/#g" > "$CS/scope.sh"
@@ -347,17 +349,36 @@ crowdsec_scope_apply" 2>&1
     check "ssh: bouncer переведён в set-only (обе семьи)" 2 "$(grep -c 'set-only: true' "$CS/bouncer.yaml")"
     check "ssh: правило дропа — только на SSH-портах" 1 \
           "$(grep -c 'tcp dport { 22, 2200 } ip saddr @crowdsec-blacklists counter drop' "$CS/conf/na-crowdsec-scope.nft")"
-    check "ssh: whitelist исключён раньше дропа (CAPI-адрес админа не режет SSH)" 1 \
-          "$(grep -c 'ip saddr { 203.0.113.7, 198.51.100.0/29 } return # na-wl4' "$CS/conf/na-crowdsec-scope.nft")"
-    check "ssh: пустой v6-whitelist — метка-заглушка для na-fw" 1 "$(grep -c '# na-wl6 (whitelist пуст)' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: whitelist — именованный интервальный набор (auto-merge)" 1 \
+          "$(grep -c 'set na_wl4 { type ipv4_addr; flags interval; auto-merge; elements = { 203.0.113.7, 198.51.100.0/29 } } # na-wl4' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: whitelist исключён раньше дропа (CAPI-адрес админа не режет SSH)" 1 "$(grep -c 'ip saddr @na_wl4 return' "$CS/conf/na-crowdsec-scope.nft")"
+    check "ssh: пустой v6-whitelist — пустой набор с меткой для na-fw" 1 "$(grep -c 'set na_wl6 { type ipv6_addr; flags interval; auto-merge; } # na-wl6' "$CS/conf/na-crowdsec-scope.nft")"
     check "ssh: таблица/набор из конфига bouncer'а" 2 \
           "$(grep -cE '^table ip crowdsec \{$|set crowdsec-blacklists \{' "$CS/conf/na-crowdsec-scope.nft")"
     check "ssh: юнит грузит правила ДО bouncer'а" 1 "$(grep -c 'Before=crowdsec-firewall-bouncer.service' "$CS/sys/na-crowdsec-scope.service")"
-    check "ssh: bouncer перезапущен (заполнит наборы)" 1 "$(grep -c 'restart crowdsec-firewall-bouncer' "$CS/systemctl.log")"
-    : > "$CS/systemctl.log"
+    # порядок: stop bouncer → свои таблицы → start (рестарт ПОСЛЕ таблиц убивал их на выходе
+    # старого процесса, и bouncer в set-only не стартовал — CrowdSec не блокировал ничего)
+    check "ssh: bouncer остановлен ДО загрузки таблиц и запущен после" "stop start" \
+          "$(grep -oE '^(stop|start|restart) crowdsec-firewall-bouncer' "$CS/systemctl.log" | cut -d' ' -f1 | paste -sd' ' -)"
+    : > "$CS/systemctl.log"; : > "$CS/nft.log"
     OUT="$(cs_run all)"
     check "all: set-only снят" 0 "$(grep -c 'set-only: true' "$CS/bouncer.yaml")"
     check "all: наш юнит и правила убраны" 0 "$(ls "$CS/sys/na-crowdsec-scope.service" "$CS/conf/na-crowdsec-scope.nft" 2>/dev/null | wc -l | tr -d ' ')"
+    check "all: наши таблицы удалены (цепочка na-scope-input не висит)" 2 \
+          "$(grep -cE '^delete table ip6? crowdsec6?$' "$CS/nft.log")"
+    check "all: stop → start (не restart)" "stop start" \
+          "$(grep -oE '^(stop|start|restart) crowdsec-firewall-bouncer' "$CS/systemctl.log" | cut -d' ' -f1 | paste -sd' ' -)"
+    : > "$CS/systemctl.log"
+    OUT="$(cs_run all)"
+    check "all на обычном bouncer'е — без лишнего stop/start (окна без блок-листов)" 0 \
+          "$(grep -cE '^(stop|start|restart) crowdsec-firewall-bouncer' "$CS/systemctl.log")"
+    # bouncer не поднялся в set-only (нет таблицы, старый процесс снёс и т.п.) — назад на all
+    : > "$CS/systemctl.log"
+    OUT="$(NA_TEST_BOUNCER_DOWN=1 cs_run ssh)"
+    check "ssh, bouncer не поднялся → предупреждение и откат на all" 1 \
+          "$(printf '%s\n' "$OUT" | grep -c 'возвращаю CROWDSEC_SCOPE=all')"
+    check "…set-only снят, наш юнит убран" "0 0" \
+          "$(grep -c 'set-only: true' "$CS/bouncer.yaml") $(ls "$CS/sys/na-crowdsec-scope.service" 2>/dev/null | wc -l | tr -d ' ')"
     sed -i.bak '/set-only/d' "$CS/bouncer.yaml"; rm -f "$CS/bouncer.yaml.bak"
     OUT="$(cs_run ssh)"
     check "старый bouncer без set-only → честный откат на all" 1 "$(printf '%s\n' "$OUT" | grep -c 'без опции set-only')"
@@ -386,6 +407,13 @@ table inet na_filter {
 NF
     printf 'nft_sha256=old\n' > "$F/state/protect.installed"
     fw() { PATH="$F/bin:$PATH" "$WBASH" "$F/na-fw" "$@" 2>&1; }
+    # только v4 при пустом v6-whitelist: под pipefail grep по пустой семье ронял na-fw посередине
+    # (живой сет и v4-строка изменены, conf/CrowdSec/маркер — нет)
+    rc=0; fw allow add 198.51.100.8 >/dev/null || rc=$?
+    check "allow add только v4 (v6 пуст) — rc=0" 0 "$rc"
+    check "…и conf обновлён (не оборвалось посередине)" 1 "$(grep -c 'WHITELIST:=203.0.113.7,198.51.100.8}' "$F/etc/protect.conf")"
+    fw allow del 198.51.100.8 >/dev/null
+    check "отказ на /0" 1 "$(fw allow add 0.0.0.0/0 | grep -c 'слишком широко')"
     fw allow add 198.51.100.9 2001:db8::5 >/dev/null
     check "allow add: protect.conf дополнен" 1 "$(grep -c 'WHITELIST:=203.0.113.7,198.51.100.9,2001:db8::5}' "$F/etc/protect.conf")"
     check "allow add: v4 в na_filter.nft" 1 "$(grep -c 'elements = { 198.51.100.9, 203.0.113.7 }' "$F/etc/na_filter.nft")"

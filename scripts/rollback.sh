@@ -72,6 +72,17 @@ rollback_optimize() {
         while IFS= read -r line; do
             k="${line%%$'\t'*}"; v="${line#*$'\t'}"
             [[ "$k" =~ ^[a-z0-9_.-]+$ ]] || continue
+            # Форвардинг НЕ возвращаем: снимок снят до Docker (штатный порядок раскатки), там
+            # 0, а `conf.all.forwarding=0` выключил бы его на всех интерфейсах — bridge-
+            # контейнеры (Caddy панели, второй тенант) потеряли бы сеть до рестарта Docker.
+            case "$k" in
+                net.ipv4.ip_forward|net.ipv4.conf.*.forwarding|net.ipv6.conf.*.forwarding) continue ;;
+            esac
+            # потолок conntrack ниже текущего числа записей — «table full», дроп новых соединений
+            if [[ "$k" == net.netfilter.nf_conntrack_max && "$v" =~ ^[0-9]+$ ]]; then
+                local cnt; cnt="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
+                [[ "$cnt" =~ ^[0-9]+$ ]] && (( v < cnt * 2 )) && v=$(( cnt * 2 ))
+            fi
             p="/proc/sys/${k//.//}"
             [[ -w "$p" ]] || continue
             printf '%s\n' "$v" > "$p" 2>/dev/null && n=$((n+1))
@@ -183,19 +194,34 @@ rollback_protect() {
         rm -f /etc/sysctl.d/99-na-synproxy.conf
         sysctl -q -w net.netfilter.nf_conntrack_tcp_loose=1 2>/dev/null || true
     fi
-    # CROWDSEC_SCOPE=ssh: наш юнит/правила снимаем, bouncer возвращаем к своим правилам на
-    # всех портах (set-only: false) — иначе он только наполнял бы наборы, которые никто не читает
+    # CROWDSEC_SCOPE=ssh: наш юнит/правила снимаем. Порядок как в protect: bouncer в set-only
+    # таблицу на остановке не трогает — stop → режим/таблицы → start. Если protect выключал
+    # ручной crowdsec-nft-scope.service оператора (флаг) — возвращаем его вместе с set-only:
+    # откат не должен снова включить community-лист на всех портах, который оператор сузил сам.
     if [[ -f /etc/systemd/system/na-crowdsec-scope.service ]]; then
+        local _by=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml _legacy=crowdsec-nft-scope.service
+        systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
         systemctl disable na-crowdsec-scope.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/na-crowdsec-scope.service "$CONF_DIR/na-crowdsec-scope.nft"
         systemctl daemon-reload 2>/dev/null || true
-        _by=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
-        if [[ -f "$_by" ]]; then
-            sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*true[[:space:]]*$/\1 false/' "$_by" && rm -f "$_by.na-tmp"
-            systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+        if [[ -f "$STATE_DIR/crowdsec-legacy-scope.disabled" ]] && systemctl cat "$_legacy" >/dev/null 2>&1; then
+            systemctl enable "$_legacy" >/dev/null 2>&1 || true
+            systemctl restart "$_legacy" >/dev/null 2>&1 || true
+            info "CrowdSec scope: возвращён ручной $_legacy (как было до protect)"
+        else
+            if [[ -f "$_by" ]]; then
+                sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*true[[:space:]]*$/\1 false/' "$_by" && rm -f "$_by.na-tmp"
+            fi
+            local _t
+            for _t in "ip $(awk '/^nftables:/{n=1} n && $1=="ipv4:"{f=1} f && $1=="table:"{print $2; exit}' "$_by" 2>/dev/null)" \
+                      "ip6 $(awk '/^nftables:/{n=1} n && $1=="ipv6:"{f=1} f && $1=="table:"{print $2; exit}' "$_by" 2>/dev/null)"; do
+                [[ "$_t" == *" " ]] && continue
+                nft delete table $_t 2>/dev/null || true
+            done
+            info "CrowdSec scope снят: bouncer снова ставит свои правила (на всех портах)"
         fi
-        unset _by
-        info "CrowdSec scope снят: bouncer снова ставит свои правила (на всех портах)"
+        rm -f "$STATE_DIR/crowdsec-legacy-scope.disabled"
+        systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
     fi
     rm -f "$STATE_DIR/safety-fired.last" "$STATE_DIR/protect.lock"
     # nftables.service до v4.1.2 включал сам protect (boot-persist), но выключать не будем: он

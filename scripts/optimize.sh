@@ -19,6 +19,8 @@
 #   NA_JOURNAL_MAX_USE=300M  потолок journald (публичную ноду 300M держат <суток)
 #   ENABLE_PSI=0      дописать psi=1 в cmdline → /proc/pressure (нужен reboot; 1 = вкл)
 #   NA_XPS=0          XPS (раскладка TX-очередей по CPU): 0 — не трогать, её задаёт драйвер
+#   NA_IPV6_FORWARD=  net.ipv6.conf.all.forwarding: пусто — авто (оставить, если нода уже
+#                     маршрутизирует v6: WireGuard/relay), 1 — ставить, 0 — не ставить
 #   NA_BOOT_MIN_MB=200  минимум свободного места в /boot для установки ядра XanMod
 
 set -euo pipefail
@@ -513,14 +515,27 @@ na_node_listen_ports() {
 # бы вечно) + порты ноды в эфемерном диапазоне. В NA_RESV_OURS — только наши. Зовётся
 # БЕЗ $(…): обе переменные — результат, подоболочка их бы потеряла.
 NA_RESV_OURS=""; NA_RESV_LIST=""
+# _resv_minus <a|a-b> <наши порты через запятую> — токен без наших портов (по токену на
+# строку). Ядро склеивает соседние порты в диапазон: наш 10085 и операторский 10086 читаются
+# как «10085-10086», и сравнение токенов целиком записывало наш порт в операторские навсегда.
+_resv_minus() {
+    local t="$1" a b q
+    a="${t%-*}"; b="${t#*-}"
+    for q in $(tr ',' '\n' <<<"$2" | grep -E '^[0-9]+$' | sort -un || true); do
+        (( q < a || q > b )) && continue
+        (( q > a )) && { if (( q - 1 > a )); then echo "$a-$((q - 1))"; else echo "$a"; fi; }
+        a=$(( q + 1 ))
+    done
+    (( a > b )) && return 0
+    if (( b > a )); then echo "$a-$b"; else echo "$a"; fi
+}
 na_reserved_ports() {
-    local prev="" cur t p list=""
+    local prev="" cur t r p list=""
     prev="$(cat "$NA_RESV_STATE" 2>/dev/null || true)"
     cur="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
     for t in ${cur//,/ }; do
         [[ "$t" =~ ^[0-9]+(-[0-9]+)?$ ]] || continue
-        [[ ",$prev," == *",$t,"* ]] && continue
-        list+="${list:+,}$t"
+        for r in $(_resv_minus "$t" "$prev"); do list+="${list:+,}$r"; done
     done
     NA_RESV_OURS=""
     for p in $(na_node_listen_ports | sort -un); do
@@ -535,6 +550,29 @@ na_reserved_ports() {
     return 0
 }
 na_reserved_ports
+
+# IPv6-форвардинг. С v4.2 по умолчанию не ставим (см. комментарий в файле ниже), но до v4.2
+# его ставил наш же файл — нода, которая маршрутизирует v6 (WireGuard, v6-relay), после
+# апгрейда и ребута молча теряла бы маршрутизацию. Авто: форвардинг включён и через ноду
+# уже прошли v6-пакеты → оставляем и закрепляем 1 в optimize.conf (после ребута счётчик
+# с нуля — без закрепления решение скакало бы). Не было пакетов, а включал его наш старый
+# файл — предупреждаем: после ребута будет 0.
+NA_IPV6_FORWARD="${NA_IPV6_FORWARD:-}"
+if [[ -z "$NA_IPV6_FORWARD" && "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)" == 1 ]]; then
+    _v6n="$(awk '$1=="Ip6OutForwDatagrams"{print $2}' /proc/net/snmp6 2>/dev/null || true)"
+    if [[ "$_v6n" =~ ^[0-9]+$ ]] && (( _v6n > 0 )); then
+        NA_IPV6_FORWARD=1
+        info "IPv6-форвардинг включён, через ноду уже прошло $_v6n v6-пакетов (WireGuard/relay?) — оставляю net.ipv6.conf.all.forwarding=1 (NA_IPV6_FORWARD=1 в optimize.conf; 0 — снять)"
+    elif grep -sqE '^[[:space:]]*net\.ipv6\.conf\.all\.forwarding[[:space:]]*=[[:space:]]*1' "$SYSCTL_FILE"; then
+        warn "IPv6-форвардинг включён — его ставила прошлая версия node-accelerator; с v4.2 не ставим (режим роутера глушит RA, на SLAAC-хостах уходит v6 default route). После ребута будет 0. Нода маршрутизирует IPv6? — NA_IPV6_FORWARD=1 ре-ран"
+    fi
+    unset _v6n
+fi
+[[ -z "$NA_IPV6_FORWARD" || "$NA_IPV6_FORWARD" =~ ^[01]$ ]] || { warn "NA_IPV6_FORWARD='$NA_IPV6_FORWARD' — ожидается 0|1|пусто, беру авто"; NA_IPV6_FORWARD=""; }
+NA_V6FWD_LINE="# net.ipv6.conf.all.forwarding — не ставим (NA_IPV6_FORWARD=${NA_IPV6_FORWARD:-авто})"
+# sysctl не понимает комментарий в строке значения — пометка отдельной строкой
+[[ "$NA_IPV6_FORWARD" == 1 ]] && NA_V6FWD_LINE="# NA_IPV6_FORWARD=1: нода маршрутизирует IPv6
+net.ipv6.conf.all.forwarding      = 1"
 
 backup_file "$SYSCTL_FILE" "$BACKUP"
 backup_file "$SYSCTL_CT_FILE" "$BACKUP"
@@ -601,6 +639,7 @@ net.ipv4.udp_wmem_min             = 16384
 # не нужен вовсе, а Docker с IPv6 включает v6-форвардинг сам при старте демона.
 net.ipv4.ip_forward               = 1
 net.ipv4.conf.all.forwarding      = 1
+$NA_V6FWD_LINE
 
 # --- Conntrack: timeout здесь (tunable CT_EST_TIMEOUT); ёмкость (max/buckets) —
 # отдельным drop-in ниже, масштабируется от RAM (99-node-accelerator-conntrack.conf),
@@ -1485,7 +1524,7 @@ save_conf "$CONF_DIR/optimize.conf" \
     ENABLE_XANMOD XANMOD_FLAVOR REMNAWAVE_SWAP_SIZE \
     DISABLE_TFO TCP_ECN_MODE ENABLE_MSS_CLAMP SETUP_NO_ZRAM CT_EST_TIMEOUT QDISC \
     ENABLE_LOGROTATE NA_LOG_PATHS NA_LOG_MAXSIZE NA_LOG_ROTATE NA_LOG_INTERVAL \
-    ENABLE_PSI NA_JOURNAL_MAX_USE NA_XPS
+    ENABLE_PSI NA_JOURNAL_MAX_USE NA_XPS NA_IPV6_FORWARD
 
 title "ГОТОВО"
 ok "Оптимизатор применён."

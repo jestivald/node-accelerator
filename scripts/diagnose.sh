@@ -12,6 +12,7 @@
 #   NA_NODE_CONTAINER=<имя>   — контейнер node-агента (дефолт remnanode); на панели/
 #                               CDN-origin контейнер зовётся иначе или его нет вовсе
 #   NA_CERT_PATHS='<p1> <p2>' — доп. пути к fullchain для сенсора сроков TLS
+#   NA_CERT_IGNORE='<глоб> …' — пути сертов, которые сенсор сроков не смотрит (брошенные)
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -262,8 +263,8 @@ dynset_fill() {
 # ─── v4.2: хелперы сенсоров по аудиту флота ──────────────────────────────────
 
 # conf_val <файл> <КЛЮЧ> — значение из сохранённого conf модуля. save_conf пишет
-# `: "${KEY:=v}"`, protect v4.2 — `: "${KEY=v}"` (пустое ENV очищает значение): понимаем
-# обе идиомы, последняя строка выигрывает (как при source).
+# `: "${KEY:=v}"`; руками нередко правят в `: "${KEY=v}"` — понимаем обе идиомы,
+# последняя строка выигрывает (как при source).
 conf_val() {
     [[ -r "$1" ]] || return 0
     sed -nE 's/^[[:space:]]*:[[:space:]]+"\$\{'"$2"':?=([^}]*)\}"[[:space:]]*$/\1/p' "$1" 2>/dev/null | tail -1
@@ -489,7 +490,9 @@ dnat_ports() {
 cs_decisions() {
     command -v cscli >/dev/null 2>&1 || return 1
     local out
-    out="$(_to 30 cscli decisions list -a -o raw 2>/dev/null)" || return 1
+    # --limit 0: по умолчанию cscli отдаёт 100 последних алертов — при потоке локальных
+    # CAPI-алерты выпадали, и счёт CAPI (а с ним ▲ «режет все порты») занижался
+    out="$(_to 15 cscli decisions list -a --limit 0 -o raw 2>/dev/null)" || return 1
     # строки данных начинаются с числового id (заголовок CSV — нет); 2-я колонка — origin
     awk -F, '$1 ~ /^[0-9]+$/ { s = tolower($2); if (s ~ /^(capi|lists)/) c++; else l++ }
              END { printf "%d %d\n", l, c }' <<<"$out"
@@ -613,31 +616,96 @@ nginx_cert_paths() {
         done < <(sed -nE "s/^[[:space:]]*ssl_certificate[[:space:]]+[\"']?([^\"'; ]+)[\"']?[[:space:]]*;.*/\1/p" "$f" 2>/dev/null)
     done < <(find -L /etc/nginx -type f \( -path '*/sites-enabled/*' -o \( -name '*.conf' ! -path '*/sites-available/*' \) \) 2>/dev/null)
 }
-cert_candidates() {
+cert_candidates() {   # → «<x|g>\t<путь>»: x — явно задан (nginx, NA_CERT_PATHS), g — найден глобом
     local cf
     # shellcheck disable=SC2086  # глобы и NA_CERT_PATHS обязаны раскрыться
-    for cf in $NA_CERT_GLOBS ${NA_CERT_PATHS:-}; do [[ -f "$cf" ]] && printf '%s\n' "$cf"; done
-    nginx_cert_paths
+    for cf in ${NA_CERT_PATHS:-}; do [[ -f "$cf" ]] && printf 'x\t%s\n' "$cf"; done
+    nginx_cert_paths | sed 's/^/x\t/'
+    # shellcheck disable=SC2086
+    for cf in $NA_CERT_GLOBS; do [[ -f "$cf" ]] && printf 'g\t%s\n' "$cf"; done
+}
+# cert_served <путь> — найденный глобом серт кто-то обслуживает или продлевает (rc=0).
+# Глобы цепляют и брошенное: каталог letsencrypt/live после смены домена, серт в хранилище
+# Caddy, который больше не поднимается, старый /opt/<стек>/certs. Их срок — не повод для ✘
+# «клиенты получают ошибку TLS». Обслуживается = renewal-конфиг certbot/acme.sh, путь
+# упомянут в conf acme.sh (--install-cert) или Caddyfile, лежит под mount работающего
+# контейнера (volume Caddy, bind /opt/<стек>/certs) или это хранилище активного caddy.
+CERT_MOUNTS=""; CERT_MOUNTS_DONE=0
+cert_served() {
+    local f="$1" d m
+    case "$f" in
+        /etc/letsencrypt/live/*)
+            d="${f#/etc/letsencrypt/live/}"; d="${d%%/*}"
+            [[ -f "/etc/letsencrypt/renewal/$d.conf" ]] && return 0 ;;
+        /root/.acme.sh/*)
+            compgen -G "$(dirname "$f")/*.conf" >/dev/null 2>&1 && return 0 ;;
+    esac
+    grep -lsF -- "$f" /root/.acme.sh/*/*.conf >/dev/null 2>&1 && return 0
+    grep -sF -- "$f" /etc/caddy/Caddyfile >/dev/null 2>&1 && return 0
+    if [[ "$CERT_MOUNTS_DONE" == 0 ]]; then
+        CERT_MOUNTS_DONE=1
+        if command -v docker >/dev/null 2>&1; then
+            local ids; ids="$(_to 5 docker ps -q 2>/dev/null)" || ids=""
+            # shellcheck disable=SC2086  # список id — нарочно словами
+            [[ -n "$ids" ]] && CERT_MOUNTS="$(_to 5 docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' $ids 2>/dev/null)" || true
+        fi
+    fi
+    while IFS= read -r m; do
+        [[ -n "$m" && ( "$f" == "$m" || "$f" == "${m%/}"/* ) ]] && return 0
+    done <<<"$CERT_MOUNTS"
+    [[ "$f" == /var/lib/caddy/* ]] && systemctl is-active --quiet caddy 2>/dev/null && return 0
+    return 1
 }
 # cert_scan — ближайший к истечению серт: CERT_FOUND (0|1), CERT_MIN (дни, ≤0 = истёк или
 # истекает в ближайшие сутки), CERT_MIN_F. Раньше −1 значил «не найдено», и просроченный
 # серт (−10 дней) терялся: следующий живой (30) его «перекрывал».
-CERT_FOUND=0; CERT_MIN=-1; CERT_MIN_F=""
+# v4.2: серт в зоне тревоги (< 14 дн), найденный глобом, считается, только если его кто-то
+# обслуживает (cert_served); иначе — «брошенный»: CERT_STALE (сколько), CERT_STALE_F/_D
+# (ближайший). Старая копия, у которой есть живой серт на тот же CN, пропускается молча.
+# NA_CERT_IGNORE='<глоб> …' — исключить пути совсем.
+CERT_FOUND=0; CERT_MIN=-1; CERT_MIN_F=""; CERT_STALE=0; CERT_STALE_F=""; CERT_STALE_D=0
 cert_scan() {
-    CERT_FOUND=0; CERT_MIN=-1; CERT_MIN_F=""
+    CERT_FOUND=0; CERT_MIN=-1; CERT_MIN_F=""; CERT_STALE=0; CERT_STALE_F=""; CERT_STALE_D=0
     command -v openssl >/dev/null 2>&1 || return 1
-    local cf cend cends now df d
+    local src cf out cend cn cends now df d ig i skip
+    local -a P=() S=() D=() C=()
+    local -A OKCN=()
+    local -a IGN=()
+    read -ra IGN <<<"${NA_CERT_IGNORE:-}"
     now="$(date +%s)"
-    while IFS= read -r cf; do
+    while IFS=$'\t' read -r src cf; do
         [[ -f "$cf" ]] || continue
+        skip=0
+        # глоб — шаблон сравнения, а не путь: раскрытие в `for` дало бы имя каталога
+        for ig in ${IGN[@]+"${IGN[@]}"}; do
+            # shellcheck disable=SC2053  # правая часть — нарочно шаблон
+            [[ "$cf" == $ig ]] && { skip=1; break; }
+        done
+        [[ "$skip" == 1 ]] && continue
         cert_retired "$cf" && continue
-        cend="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"; [[ -n "$cend" ]] || continue
+        out="$(openssl x509 -noout -enddate -subject -nameopt RFC2253 -in "$cf" 2>/dev/null)"
+        cend="$(sed -n 's/^notAfter=//p' <<<"$out")"; [[ -n "$cend" ]] || continue
+        cn="$(sed -nE 's/^subject=.*CN=([^,]+).*/\1/p' <<<"$out")"
         cends="$(date -d "$cend" +%s 2>/dev/null)" || continue; [[ "$cends" =~ ^[0-9]+$ ]] || continue
         df=$(( cends - now ))
         if (( df >= 0 )); then d=$(( df / 86400 )); else d=$(( -((-df + 86399) / 86400) )); fi
+        P+=("$cf"); S+=("$src"); D+=("$d"); C+=("$cn")
+        [[ -n "$cn" ]] && (( d >= 14 )) && OKCN[$cn]=1
+    done < <(cert_candidates | awk -F'\t' '!seen[$2]++')
+    for i in "${!P[@]}"; do
+        d="${D[$i]}"; cf="${P[$i]}"
+        if (( d < 14 )); then
+            # старая копия: на тот же CN есть живой серт — в работе он, а не эта
+            [[ -n "${C[$i]}" && -n "${OKCN[${C[$i]}]:-}" ]] && continue
+            if [[ "${S[$i]}" == g ]] && ! cert_served "$cf"; then
+                if [[ "$CERT_STALE" == 0 ]] || (( d < CERT_STALE_D )); then CERT_STALE_D="$d"; CERT_STALE_F="$cf"; fi
+                CERT_STALE=$(( CERT_STALE + 1 ))
+                continue
+            fi
+        fi
         if [[ "$CERT_FOUND" == 0 ]] || (( d < CERT_MIN )); then CERT_MIN="$d"; CERT_MIN_F="$cf"; fi
         CERT_FOUND=1
-    done < <(cert_candidates | awk '!seen[$0]++')
+    done
     return 0
 }
 # docker_nocap — работающие контейнеры с json-file БЕЗ max-size: их лог растёт без предела
@@ -657,9 +725,9 @@ portscan_24h() {
     local help n tot rc
     help="$(_to 5 journalctl --help 2>/dev/null)"
     [[ "$help" == *--grep* ]] || return 1
-    n="$(_to 15 journalctl -q --no-pager --since -24h _TRANSPORT=kernel -g '\[na portscan\]' 2>/dev/null | wc -l | tr -d ' ')"; rc=$?
+    n="$(_to 10 journalctl -q --no-pager --since -24h _TRANSPORT=kernel -g '\[na portscan\]' 2>/dev/null | wc -l | tr -d ' ')"; rc=$?
     [[ "$rc" -eq 124 || ! "$n" =~ ^[0-9]+$ ]] && return 1
-    tot="$(_to 20 journalctl -q --no-pager --since -24h -o cat 2>/dev/null | wc -l | tr -d ' ')"; rc=$?
+    tot="$(_to 10 journalctl -q --no-pager --since -24h -o cat 2>/dev/null | wc -l | tr -d ' ')"; rc=$?
     [[ "$rc" -eq 124 || ! "$tot" =~ ^[0-9]+$ ]] && tot=-1
     echo "$n $tot"
 }
@@ -727,7 +795,7 @@ emit_json() {
     collapsed="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
     # CPU steal: окно 3 с + среднее с загрузки (секундный семпл был шумом)
     steal=0; stealb=0
-    [[ -r /proc/stat ]] && read -r steal stealb <<<"$(cpu_steal_measure 3)"
+    [[ -r /proc/stat ]] && read -r steal stealb <<<"$(cpu_steal_measure "$( [[ "$NA_FAST" == 1 ]] && echo 1 || echo 3)")"
     [[ "$steal" =~ ^[0-9]+$ ]] || steal=0; [[ "$stealb" =~ ^[0-9]+$ ]] || stealb=0
     # дельты счётчиков к прошлому запуску (diag-counters.last)
     delta_load
@@ -826,10 +894,11 @@ emit_json() {
     fi
     # глубина журнала и объём лога анти-скана (−1 = не измерено)
     jsp=-1; tmpv="$(journal_span_h)" && [[ "$tmpv" =~ ^[0-9]+$ ]] && jsp="$tmpv"
-    psl=-1; tmpv="$(portscan_log_lines)" && [[ "$tmpv" =~ ^[0-9]+$ ]] && psl="$tmpv"
+    # --fast: проходы по журналу пропускаются (−1 = не измерено) — для частого опроса
+    psl=-1; [[ "$NA_FAST" == 1 ]] || { tmpv="$(portscan_log_lines)" && [[ "$tmpv" =~ ^[0-9]+$ ]] && psl="$tmpv"; }
     # за сутки по всем загрузкам + доля от всех строк журнала за сутки (−1 = не измерено)
     ps24=-1; psh=-1
-    if tmpv="$(portscan_24h)"; then
+    if [[ "$NA_FAST" != 1 ]] && tmpv="$(portscan_24h)"; then
         read -r ps24 pst <<<"$tmpv"
         [[ "$pst" =~ ^[0-9]+$ ]] && (( pst > 0 )) && psh=$(( ps24 * 100 / pst ))
     fi
@@ -877,7 +946,7 @@ emit_json() {
 
     # v4.2: CrowdSec по источникам решений (−1 = нет cscli / не ответил) и область действия
     csl=-1; csc=-1
-    if tmpv="$(cs_decisions)"; then read -r csl csc <<<"$tmpv"; fi
+    if [[ "$NA_FAST" != 1 ]] && tmpv="$(cs_decisions)"; then read -r csl csc <<<"$tmpv"; fi
     [[ "$csl" =~ ^-?[0-9]+$ ]] || csl=-1; [[ "$csc" =~ ^-?[0-9]+$ ]] || csc=-1
     csscope="$(cs_live_scope 2>/dev/null || mark_val crowdsec_scope)"
     # живой whitelist, не прикрытый ЭФФЕКТИВНЫМ allowlist CrowdSec (−1 = сверять не с чем):
@@ -897,7 +966,7 @@ emit_json() {
     dnp="$(dnat_ports)"
     dng="$(mark_val dnat_guard)"; [[ "$dng" =~ ^[01]$ ]] || dng=-1
     # доступное обновление XanMod (по кэшу apt; пусто = нет/не знаем)
-    xmu=""; tmpv="$(xanmod_update)" && xmu="${tmpv#* }"
+    xmu=""; [[ "$NA_FAST" == 1 ]] || { tmpv="$(xanmod_update)" && xmu="${tmpv#* }"; }
 
     # Каждое строковое значение — через json_escape. Раньше каждое поле полагалось на то,
     # что источник «и так чистый», и одного сырого перевода строки из docker хватило,
@@ -945,8 +1014,15 @@ emit_json() {
         "$stealb" "$csl" "$csc" "$csscope"
     printf '"whitelist_drift_crowdsec":%s,"dnat_ports":"%s","dnat_guard":%s,"xanmod_update":"%s","cert_found":%s,' \
         "$wdcs" "$dnp" "$dng" "$xmu" "$cfound"
-    printf '"portscan_log_lines_24h":%s,"portscan_log_share_pct":%s}\n' "$ps24" "$psh"
+    printf '"portscan_log_lines_24h":%s,"portscan_log_share_pct":%s,"cert_stale_count":%s,"cert_stale_file":"%s"}\n' \
+        "$ps24" "$psh" "$CERT_STALE" "$(json_escape "$CERT_STALE_F")"
 }
+# --json --fast (или NA_DIAG_FAST=1) — для частого опроса мониторингом: без проходов по
+# журналу, без `cscli -a` (десятки тысяч решений), без apt-cache, steal окном 1 с. Поля
+# остаются на местах, неизмеренные — −1/пусто. Полный --json на ноде с большим журналом
+# и одним vCPU занимает десятки секунд.
+NA_FAST=0
+[[ "${NA_DIAG_FAST:-0}" == 1 || "${2:-}" == "--fast" ]] && NA_FAST=1
 if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
 
 # ─── Глубокий разбор retrans (`--retrans [--window N]`) ───────────────────────
@@ -1434,8 +1510,7 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
         [[ -n "$FBACK" ]] && info "в $NFT_FILE, но не в живом whitelist_v4: $FBACK (вернутся после ребута/reload na-firewall)"
     fi
     if [[ -f "$CONF_DIR/protect.conf" ]]; then
-        # conf пишется идиомой `: "${WHITELIST:=…}"` (protect v4.2 — `=`) — наивный
-        # `^WHITELIST=` не матчит
+        # conf пишется идиомой `: "${WHITELIST:=…}"` — наивный `^WHITELIST=` не матчит
         CONF_WL="$(conf_val "$CONF_DIR/protect.conf" WHITELIST \
                    | tr ',' '\n' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
         CDRIFT_L="$(comm -23 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$CONF_WL" | grep -v '^$' | sort -u) 2>/dev/null)"
@@ -1898,6 +1973,11 @@ if command -v openssl >/dev/null 2>&1; then
     elif [[ "$CERT_MIN" -lt 7 ]];  then bad  "TLS-серт истекает через ${CERT_MIN} дн ($CERT_MIN_F) — renewal сломан?"
     elif [[ "$CERT_MIN" -lt 14 ]]; then wrn  "TLS-серт истекает через ${CERT_MIN} дн ($CERT_MIN_F) — проверь авто-renew"
     else pass "ближайший TLS-серт: ${CERT_MIN} дн до истечения ($CERT_MIN_F)"; fi
+    if [[ "$CERT_STALE" -gt 0 ]]; then
+        if [[ "$CERT_STALE_D" -lt 0 ]]; then _sd="истёк $(( -CERT_STALE_D )) дн назад"; else _sd="истекает через ${CERT_STALE_D} дн"; fi
+        wrn "серт без обслуживающего сервиса: $CERT_STALE_F ($_sd$( [[ "$CERT_STALE" -gt 1 ]] && echo ", всего таких: $CERT_STALE")) — не нашёл ни renewal-конфига, ни контейнера/сервиса с этим путём. Брошенный — удали или NA_CERT_IGNORE='<глоб>'; если домен обслуживается — renewal сломан"
+        unset _sd
+    fi
 else
     info "openssl не установлен — проверка сроков сертификатов пропущена"
 fi

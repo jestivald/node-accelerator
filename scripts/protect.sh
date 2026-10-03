@@ -73,13 +73,15 @@ load_conf "$CONF_DIR/protect.conf"
 # детект: сменил порт sshd — strict открывал старый). Такой сверяем с фактом: совпал —
 # дальше не храним; расходится — открываем ОБА и предупреждаем.
 NA_SSH_DETECTED="$(detect_ssh_port)"
-NA_EXPLICIT_KEYS=""
+NA_EXPLICIT_KEYS=""; NA_SSH_SAVE=""
 if [[ -n "$NA_SSH_PORT_ENV" ]] || conf_is_explicit "$CONF_DIR/protect.conf" SSH_PORT; then
     NA_EXPLICIT_KEYS+=" SSH_PORT"
 elif [[ -n "${SSH_PORT:-}" && "$SSH_PORT" != "$NA_SSH_DETECTED" ]]; then
+    # В conf остаётся ИСХОДНОЕ значение без метки explicit: сверка (и это предупреждение) идёт
+    # на каждом прогоне, пока оператор не закрепит порт, — а не «оба порта навсегда».
     warn "SSH_PORT=$SSH_PORT в protect.conf сохранён старой версией (автодетект), а sshd сейчас слушает $NA_SSH_DETECTED — открываю ОБА; закрепи нужный: SSH_PORT=<порт> ре-ран"
+    NA_SSH_SAVE="$SSH_PORT"
     for _p in ${NA_SSH_DETECTED//,/ }; do [[ ",$SSH_PORT," == *",$_p,"* ]] || SSH_PORT+=",$_p"; done
-    NA_EXPLICIT_KEYS+=" SSH_PORT"
     unset _p
 else
     SSH_PORT=""
@@ -522,8 +524,42 @@ _cs_yaml_get() {   # _cs_yaml_get <ключ верхнего уровня> | <ip
             in_nft && in_fam && $1==k":" {v=$2; gsub(/"/,"",v); print v; exit}' "$CS_BOUNCER_YAML" 2>/dev/null
     fi
 }
+CS_LEGACY_FLAG="$STATE_DIR/crowdsec-legacy-scope.disabled"
+# Порядок переключения важен: bouncer в обычном режиме на ОСТАНОВКЕ удаляет свою таблицу, а в
+# set-only при старте ищет готовую. Рестарт «после» наших таблиц убивал бы их на выходе
+# старого процесса — новый не находил таблицу и не стартовал (CrowdSec не блокировал вообще
+# ничего). Поэтому: stop → свои таблицы/режим → start → проверка; не поднялся — назад на all.
+_cs_bouncer_up() {   # _cs_bouncer_up [<таблица> <набор>] — bouncer active (и набор на месте)
+    local n=0
+    until systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null; do
+        (( ++n > 10 )) && return 1
+        sleep 1
+    done
+    [[ -z "${1:-}" ]] || nft list set ip "$1" "$2" >/dev/null 2>&1
+}
+_cs_tables() {   # → «t4 t6 s4 s6» из конфига bouncer'а
+    local t4 t6 s4 s6
+    t4="$(_cs_yaml_get ipv4 table)"; t6="$(_cs_yaml_get ipv6 table)"
+    s4="$(_cs_yaml_get blacklists_ipv4)"; s6="$(_cs_yaml_get blacklists_ipv6)"
+    echo "${t4:-crowdsec} ${t6:-crowdsec6} ${s4:-crowdsec-blacklists} ${s6:-crowdsec6-blacklists}"
+}
+_cs_to_all() {   # bouncer снова сам ставит правила (на всех портах)
+    local t4 t6 _s4 _s6
+    read -r t4 t6 _s4 _s6 <<<"$(_cs_tables)"
+    systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*true[[:space:]]*$/\1 false/' "$CS_BOUNCER_YAML" && rm -f "$CS_BOUNCER_YAML.na-tmp"
+    if [[ -f "$CS_SCOPE_UNIT" ]]; then
+        systemctl disable na-crowdsec-scope.service >/dev/null 2>&1 || true
+        rm -f "$CS_SCOPE_UNIT" "$CS_SCOPE_NFT"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    # наши таблицы (bouncer в обычном режиме создаст свои заново)
+    nft delete table ip "$t4" 2>/dev/null || true
+    nft delete table ip6 "$t6" 2>/dev/null || true
+    systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+}
 crowdsec_scope_apply() {
-    local want="$CROWDSEC_SCOPE" t4 t6 s4 s6 wl4="" wl6="" legacy=crowdsec-nft-scope.service
+    local want="$CROWDSEC_SCOPE" t4 t6 s4 s6 wl4 wl6 legacy=crowdsec-nft-scope.service
     [[ -f "$CS_BOUNCER_YAML" ]] || { info "CrowdSec scope: конфига bouncer'а нет ($CS_BOUNCER_YAML) — пропуск"; return 0; }
     if [[ "$want" == ssh ]] && ! grep -qE '^[[:space:]]+set-only:' "$CS_BOUNCER_YAML"; then
         warn "CrowdSec scope: bouncer без опции set-only (старая версия) — блок-листы остаются на ВСЕХ портах (как CROWDSEC_SCOPE=all)"
@@ -531,27 +567,27 @@ crowdsec_scope_apply() {
     fi
     backup_file "$CS_BOUNCER_YAML" "$BACKUP"
     if [[ "$want" == all ]]; then
-        sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*true[[:space:]]*$/\1 false/' "$CS_BOUNCER_YAML" && rm -f "$CS_BOUNCER_YAML.na-tmp"
-        if [[ -f "$CS_SCOPE_UNIT" ]]; then
-            systemctl disable na-crowdsec-scope.service >/dev/null 2>&1 || true
-            rm -f "$CS_SCOPE_UNIT" "$CS_SCOPE_NFT"
-            systemctl daemon-reload 2>/dev/null || true
+        # уже в обычном режиме и без нашего юнита — менять нечего; лишний stop/start на каждом
+        # ре-ране оставлял окно без блок-листов и перегружал все решения из LAPI
+        if grep -qE '^[[:space:]]+set-only:[[:space:]]*true[[:space:]]*$' "$CS_BOUNCER_YAML" || [[ -f "$CS_SCOPE_UNIT" ]]; then
+            _cs_to_all
         fi
-        systemctl is-enabled --quiet "$legacy" 2>/dev/null \
-            && warn "CrowdSec scope: найден ручной $legacy (сужает блок-листы до SSH) — CROWDSEC_SCOPE=all его не трогает; сними сам, если нужно"
-        systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+        if systemctl is-enabled --quiet "$legacy" 2>/dev/null; then
+            warn "CrowdSec scope: найден ручной $legacy (сужает блок-листы до SSH) — CROWDSEC_SCOPE=all его не трогает; сними сам, если нужно"
+        fi
+        rm -f "$CS_LEGACY_FLAG"   # оператор явно выбрал all — ручной юнит при откате не возвращаем
+        _cs_bouncer_up || warn "CrowdSec scope: bouncer не active после переключения на all — проверь: systemctl status crowdsec-firewall-bouncer"
         CROWDSEC_SCOPE_EFF=all
         info "CrowdSec: блок-листы действуют на ВСЕХ портах (CROWDSEC_SCOPE=all)"
         return 0
     fi
-    t4="$(_cs_yaml_get ipv4 table)"; t4="${t4:-crowdsec}"
-    t6="$(_cs_yaml_get ipv6 table)"; t6="${t6:-crowdsec6}"
-    s4="$(_cs_yaml_get blacklists_ipv4)"; s4="${s4:-crowdsec-blacklists}"
-    s6="$(_cs_yaml_get blacklists_ipv6)"; s6="${s6:-crowdsec6-blacklists}"
-    # строки с меткой na-wl4/na-wl6 переписывает `na-fw allow` — не трогать руками
-    wl4="        # na-wl4 (whitelist пуст)"; wl6="        # na-wl6 (whitelist пуст)"
-    [[ -n "$WL4" ]] && wl4="        ip saddr { $WL4 } return # na-wl4"
-    [[ -n "$WL6" ]] && wl6="        ip6 saddr { $WL6 } return # na-wl6"
+    read -r t4 t6 s4 s6 <<<"$(_cs_tables)"
+    # whitelist — именованные интервальные наборы (auto-merge: IP админа внутри CIDR из
+    # WHITELIST не ломает загрузку); строки с меткой na-wl4/na-wl6 переписывает `na-fw allow`
+    wl4="    set na_wl4 { type ipv4_addr; flags interval; auto-merge; } # na-wl4"
+    wl6="    set na_wl6 { type ipv6_addr; flags interval; auto-merge; } # na-wl6"
+    [[ -n "$WL4" ]] && wl4="    set na_wl4 { type ipv4_addr; flags interval; auto-merge; elements = { $WL4 } } # na-wl4"
+    [[ -n "$WL6" ]] && wl6="    set na_wl6 { type ipv6_addr; flags interval; auto-merge; elements = { $WL6 } } # na-wl6"
     cat > "$CS_SCOPE_NFT.new" <<CSN
 #!/usr/sbin/nft -f
 # node-accelerator: блок-листы CrowdSec только на SSH (CROWDSEC_SCOPE=ssh).
@@ -560,9 +596,10 @@ table ip $t4 {}
 delete table ip $t4
 table ip $t4 {
     set $s4 { type ipv4_addr; flags timeout; }
+$wl4
     chain na-scope-input {
         type filter hook input priority filter - 10; policy accept;
-$wl4
+        ip saddr @na_wl4 return
         tcp dport { ${SSH_NFT} } ip saddr @$s4 counter drop
     }
 }
@@ -570,9 +607,10 @@ table ip6 $t6 {}
 delete table ip6 $t6
 table ip6 $t6 {
     set $s6 { type ipv6_addr; flags timeout; }
+$wl6
     chain na-scope-input {
         type filter hook input priority filter - 10; policy accept;
-$wl6
+        ip6 saddr @na_wl6 return
         tcp dport { ${SSH_NFT} } ip6 saddr @$s6 counter drop
     }
 }
@@ -582,6 +620,7 @@ CSN
         warn "CrowdSec scope: сгенерированные правила не прошли nft -c — оставляю как было"
         return 0
     fi
+    systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
     mv -f "$CS_SCOPE_NFT.new" "$CS_SCOPE_NFT"
     sed -i.na-tmp -E 's/^([[:space:]]+set-only:)[[:space:]]*false[[:space:]]*$/\1 true/' "$CS_BOUNCER_YAML" && rm -f "$CS_BOUNCER_YAML.na-tmp"
     cat > "$CS_SCOPE_UNIT" <<CSU
@@ -600,13 +639,19 @@ WantedBy=multi-user.target
 CSU
     if systemctl is-enabled --quiet "$legacy" 2>/dev/null; then
         systemctl disable "$legacy" >/dev/null 2>&1 || true
-        info "CrowdSec scope: ручной $legacy выключен из автозагрузки — его роль теперь у na-crowdsec-scope.service (файл оставлен)"
+        mkdir -p "$STATE_DIR" 2>/dev/null && : > "$CS_LEGACY_FLAG"
+        info "CrowdSec scope: ручной $legacy выключен из автозагрузки — его роль теперь у na-crowdsec-scope.service (файл оставлен; rollback вернёт его)"
     fi
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable na-crowdsec-scope.service >/dev/null 2>&1 || true
     nft -f "$CS_SCOPE_NFT" 2>/dev/null || warn "CrowdSec scope: nft -f $CS_SCOPE_NFT не прошёл"
-    # bouncer в set-only заполняет уже существующие наборы — перезапуск после таблиц
-    systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    if ! _cs_bouncer_up "$t4" "$s4"; then
+        warn "CrowdSec scope: bouncer не поднялся в set-only (или нет набора $s4) — возвращаю CROWDSEC_SCOPE=all, чтобы CrowdSec не остался без правил"
+        _cs_to_all
+        CROWDSEC_SCOPE_EFF=all
+        return 0
+    fi
     CROWDSEC_SCOPE_EFF=ssh
     ok "CrowdSec: блок-листы — только на SSH (:${SSH_EFF}); whitelist исключён; клиентские порты их не видят (CROWDSEC_SCOPE=all — как раньше)"
 }
@@ -1132,7 +1177,10 @@ fi
 # fail-loud (маркер degraded + warn), БЕЗ тихой деградации; synproxy-правила не ставятся.
 SYNPROXY_PRE=""; SYNPROXY_IN=""; SP_MODPROBE=""; SYNPROXY_OK=0
 rm -f "$STATE_DIR/.synproxy-degraded" 2>/dev/null || true
-if [[ "$ENABLE_SYNPROXY" == "1" ]]; then
+if [[ "$ENABLE_SYNPROXY" == "1" && -z "$TCP_PORTS" ]]; then
+    # пустой TCP_PORTS дал бы `tcp dport {  }` — nft -c падает и прерывает весь прогон
+    warn "SYNPROXY запрошен, но TCP_PORTS пуст — защищать нечего, synproxy не ставлю"
+elif [[ "$ENABLE_SYNPROXY" == "1" ]]; then
     _kmaj="$(uname -r | cut -d. -f1)"; _kmin="$(uname -r | cut -d. -f2)"
     [[ "$_kmaj" =~ ^[0-9]+$ ]] || _kmaj=0; [[ "$_kmin" =~ ^[0-9]+$ ]] || _kmin=0
     if { [[ "$_kmaj" -gt 5 ]] || { [[ "$_kmaj" -eq 5 ]] && [[ "$_kmin" -ge 14 ]]; }; } && modprobe nft_synproxy 2>/dev/null; then
@@ -1150,12 +1198,24 @@ if [[ "$ENABLE_SYNPROXY" == "1" ]]; then
         # synproxy, ставится ниже) третий ACK рукопожатия conntrack видит как invalid, и до
         # v4.2 его съедал invalid-drop раньше synproxy — новые TCP на TCP_PORTS не
         # устанавливались вовсе (а при loose=1 ACK шёл мимо synproxy в сокет и получал RST).
-        # Забаненных режем раньше: иначе synproxy дописал бы им рукопожатие, а дальше
-        # established прошёл бы мимо autoban.
-        SYNPROXY_IN="        # SYNPROXY (до invalid-drop; забаненные — раньше него)
-        tcp dport { ${SP_SET} } ip  saddr @autoban_v4 counter name c_autoban drop
-        tcp dport { ${SP_SET} } ip6 saddr @autoban_v6 counter name c_autoban drop
+        # Всё, что должно решиться ДО рукопожатия, стоит здесь же: после synproxy соединение
+        # уже established, и автобан/блок-листы/per-IP лимиты ниже (они на `ct state new`) его
+        # не увидят. Whitelist сильнее бана (как в основной цепочке). ct count для этих
+        # портов не действует — у untracked SYN ещё нет состояния; SYN-rate — своим набором.
+        _sp_bl=""
+        [[ "$ENABLE_BLOCKLISTS" == "1" ]] && _sp_bl="
+        tcp dport { ${SP_SET} } ip  saddr @blocklist_v4 ip  saddr != @whitelist_v4 counter name c_blocklist drop
+        tcp dport { ${SP_SET} } ip6 saddr @blocklist_v6 ip6 saddr != @whitelist_v6 counter name c_blocklist drop"
+        SYNPROXY_IN="        # SYNPROXY (до invalid-drop; бан/блок-листы/SYN-rate — раньше него, whitelist сильнее бана)
+        tcp dport { ${SP_SET} } ip  saddr @autoban_v4 ip  saddr != @whitelist_v4 counter name c_autoban drop
+        tcp dport { ${SP_SET} } ip6 saddr @autoban_v6 ip6 saddr != @whitelist_v6 counter name c_autoban drop$_sp_bl
+        tcp dport { ${SP_SET} } ct state untracked ip  saddr != @whitelist_v4 update @spsyn4 { ip saddr limit rate over ${SYN_RATE}/second burst ${SYN_BURST} packets } jump synflood_drop
+        tcp dport { ${SP_SET} } ct state untracked ip6 saddr != @whitelist_v6 update @spsyn6 { ip6 saddr limit rate over ${SYN_RATE}/second burst ${SYN_BURST} packets } jump synflood_drop
         tcp dport { ${SP_SET} } ct state invalid,untracked synproxy mss ${SP_MSS} wscale 7 timestamp sack-perm"
+        unset _sp_bl
+        rate_set spsyn4 ipv4_addr "$SYN_RATE" "$SYN_BURST" second
+        rate_set spsyn6 ipv6_addr "$SYN_RATE" "$SYN_BURST" second
+        warn "SYNPROXY: nf_conntrack_tcp_loose=0 действует на ВЕСЬ хост — TCP-сессии, пережившие сброс conntrack или простоявшие дольше CT_EST_TIMEOUT без пакетов (SSH без keepalive), будут сброшены как invalid"
         ok "SYNPROXY: ядро $(uname -r) ок, mss ${SP_MSS} wscale 7 (notrack только host-local)"
     else
         warn "SYNPROXY запрошен, но недоступен (нужно ядро ≥5.14 + модуль nft_synproxy). Защита БЕЗ synproxy."
@@ -1544,9 +1604,14 @@ check_journal_budget() {
     local cap day pct
     cap="$(journald_cap_bytes)"
     (( cap > 0 )) || return 0
-    day=$(( PORTSCAN_LOG_RATE * 1440 * NA_JOURNAL_LINE_BYTES ))
+    # лог-правил анти-скана несколько (v4/v6 × suspect/бан) и у каждого свой лимит — это
+    # потолок сверху; на деле переходов в suspect/бан на порядки меньше одного в секунду
+    local nrules=2; [[ "${ENABLE_BANONCE:-1}" == "1" ]] && nrules=4
+    day=$(( PORTSCAN_LOG_RATE * 1440 * NA_JOURNAL_LINE_BYTES * nrules ))
     pct=$(( day * 100 / cap ))
-    (( pct > 30 )) || return 0
+    # с v4.2 строки пишутся только на переходах — предупреждаем, лишь если даже теоретический
+    # потолок съедает весь кап журнала за сутки (иначе дефолт 60/мин давал бы ложный warn)
+    (( pct > 100 )) || return 0
     warn "журнал: лог анти-скана при PORTSCAN_LOG_RATE=$PORTSCAN_LOG_RATE даёт ~$(_hbytes "$day")/сутки при капе journald $(_hbytes "$cap") (${pct}% в сутки) — история в журнале проживёт меньше $(( 100 / pct )) суток и вытеснит логи входов/сервисов"
     warn "снизь PORTSCAN_LOG_RATE (0 = не логировать, на бан не влияет) или подними NA_JOURNAL_MAX_USE (optimize)"
     return 0
@@ -2173,6 +2238,7 @@ fam_of() {   # fam_of <адрес> → 4|6; rc=1 — не адрес
     else return 1; fi
 }
 norm() { local a="$1"; a="${a%/32}"; [[ "$a" == *:* ]] && a="${a%/128}"; printf '%s' "$a"; }
+nonempty() { grep -v '^$' || true; }   # под pipefail пустой вход — не ошибка
 conf_list() { sed -nE 's/^: "\$\{WHITELIST:?=([^}]*)\}".*/\1/p' "$CONF" 2>/dev/null | tail -1; }
 conf_set() {   # conf_set <csv> — переписать WHITELIST= в protect.conf (none = пусто)
     local v="${1:-none}" tmp
@@ -2186,49 +2252,14 @@ conf_set() {   # conf_set <csv> — переписать WHITELIST= в protect.c
     chmod 0600 "$tmp"; mv -f "$tmp" "$CONF"
 }
 file_elems() {   # file_elems 4|6 — элементы whitelist_vN из na_filter.nft
-    sed -nE "s/.*set whitelist_v$1 \\{.*elements = \\{ ([^}]*) \\}.*/\\1/p" "$NFT_FILE" 2>/dev/null | tr -d ' ' | tr ',' '\n' | grep -v '^$' || true
+    sed -nE "s/.*set whitelist_v$1 \\{.*elements = \\{ ([^}]*) \\}.*/\\1/p" "$NFT_FILE" 2>/dev/null | tr -d ' ' | tr ',' '\n' | nonempty
 }
-file_set() {   # file_set 4|6 <элементы через перевод строки>
-    local fam="$1" list="$2" typ=ipv4_addr line tmp
-    [[ "$fam" == 6 ]] && typ=ipv6_addr
-    list="$(printf '%s\n' "$list" | grep -v '^$' | sort -u | paste -sd, - | sed 's/,/, /g')"
-    if [[ -n "$list" ]]; then line="    set whitelist_v$fam { type $typ; flags interval; auto-merge; elements = { $list } }"
-    else line="    set whitelist_v$fam { type $typ; flags interval; auto-merge;  }"; fi
-    tmp="$(mktemp "$NFT_FILE.XXXXXX")"
-    awk -v fam="$fam" -v line="$line" '$0 ~ "^[[:space:]]*set whitelist_v" fam " \\{" {print line; next} {print}' "$NFT_FILE" > "$tmp"
-    nft -c -f "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "изменённый na_filter.nft не прошёл nft -c — ничего не тронуто"; }
-    chmod 0644 "$tmp"; mv -f "$tmp" "$NFT_FILE"
-}
-sync_aux() {   # CrowdSec-yaml, правило scope, хэш в маркере — из итогового файла
-    local w4 w6 ip="" cidr="" x
-    w4="$(file_elems 4)"; w6="$(file_elems 6)"
-    for x in $w4 $w6; do
-        if [[ "$x" == */* ]]; then cidr+="    - \"$x\""$'\n'; else ip+="    - \"$x\""$'\n'; fi
-    done
-    if [[ -d "$(dirname "$CS_YAML")" ]]; then
-        if [[ -n "$ip$cidr" ]]; then
-            { echo "name: node-accelerator/whitelist"; echo "description: never ban admin/panel"; echo "whitelist:"
-              echo "  reason: node-accelerator trusted"
-              [[ -n "$ip"   ]] && { echo "  ip:";   printf "%s" "$ip"; }
-              [[ -n "$cidr" ]] && { echo "  cidr:"; printf "%s" "$cidr"; }; } > "$CS_YAML"
-        else rm -f "$CS_YAML"; fi
-        systemctl reload crowdsec >/dev/null 2>&1 || true
-    fi
-    if [[ -f "$SCOPE_NFT" ]]; then
-        local l4="        # na-wl4 (whitelist пуст)" l6="        # na-wl6 (whitelist пуст)" tmp
-        [[ -n "$w4" ]] && l4="        ip saddr { $(paste -sd, - <<<"$w4" | sed 's/,/, /g') } return # na-wl4"
-        [[ -n "$w6" ]] && l6="        ip6 saddr { $(paste -sd, - <<<"$w6" | sed 's/,/, /g') } return # na-wl6"
-        tmp="$(mktemp "$SCOPE_NFT.XXXXXX")"
-        awk -v l4="$l4" -v l6="$l6" '/na-wl4/{print l4; next} /na-wl6/{print l6; next} {print}' "$SCOPE_NFT" > "$tmp"
-        if nft -c -f "$tmp" >/dev/null 2>&1; then
-            mv -f "$tmp" "$SCOPE_NFT"; nft -f "$SCOPE_NFT" 2>/dev/null || true
-            systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
-        else rm -f "$tmp"; echo "[!] правило CrowdSec scope не обновлено (nft -c)" >&2; fi
-    fi
-    if [[ -f "$STATE_DIR/protect.installed" ]]; then
-        local sha; sha="$(sha256sum "$NFT_FILE" | awk '{print $1}')"
-        sed -i.na-tmp -E "s/^nft_sha256=.*/nft_sha256=$sha/" "$STATE_DIR/protect.installed" && rm -f "$STATE_DIR/protect.installed.na-tmp"
-    fi
+set_line() {   # set_line <4|6> <имя набора> <отступ> <элементы через \n> [хвост]
+    local typ=ipv4_addr list
+    [[ "$1" == 6 ]] && typ=ipv6_addr
+    list="$(printf '%s\n' "$4" | nonempty | sort -u | paste -sd, - | sed 's/,/, /g')"
+    if [[ -n "$list" ]]; then printf '%sset %s { type %s; flags interval; auto-merge; elements = { %s } }%s' "$3" "$2" "$typ" "$list" "${5:-}"
+    else printf '%sset %s { type %s; flags interval; auto-merge; }%s' "$3" "$2" "$typ" "${5:-}"; fi
 }
 cmd="${1:-}"; sub="${2:-}"
 case "$cmd" in
@@ -2236,34 +2267,95 @@ case "$cmd" in
         [[ -f "$NFT_FILE" ]] || die "нет $NFT_FILE — protect не ставился (или FW_MODE=skip)"
         case "$sub" in
             list)
-                echo "живой сет v4: $(nft list set inet na_filter whitelist_v4 2>/dev/null | sed -n '/elements = {/,/}/p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | paste -sd' ' -)"
-                echo "живой сет v6: $(nft list set inet na_filter whitelist_v6 2>/dev/null | sed -n '/elements = {/,/}/p' | grep -oE '[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}(/[0-9]+)?' | paste -sd' ' -)"
+                echo "живой сет v4: $(nft list set inet na_filter whitelist_v4 2>/dev/null | sed -n '/elements = {/,/}/p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | paste -sd' ' - || true)"
+                echo "живой сет v6: $(nft list set inet na_filter whitelist_v6 2>/dev/null | sed -n '/elements = {/,/}/p' | grep -oE '[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}(/[0-9]+)?' | paste -sd' ' - || true)"
                 echo "protect.conf: $(conf_list)"; exit 0 ;;
             add|del) ;;
             *) die "использование: na-fw allow add|del|list <ip|cidr>…" ;;
         esac
         shift 2; [[ $# -gt 0 ]] || die "не указан адрес"
+        # один исполнитель на файрвол: параллельный прогон protect перезаписал бы файл
+        if command -v flock >/dev/null 2>&1; then
+            mkdir -p "$STATE_DIR"; exec 9>"$STATE_DIR/protect.lock"
+            flock -n 9 || die "идёт прогон protect (лок $STATE_DIR/protect.lock) — повтори после него"
+        fi
         cur="$(conf_list)"; [[ "$cur" == none ]] && cur=""
         e4="$(file_elems 4)"; e6="$(file_elems 6)"
+        live_add=(); live_del=()
         for a in "$@"; do
             fam="$(fam_of "$a")" || die "'$a' — не IPv4/IPv6/CIDR"
             a="$(norm "$a")"
+            if [[ "$a" == */* ]]; then
+                pfx="${a#*/}"; deny_lt=8; warn_lt=29
+                [[ "$fam" == 6 ]] && { deny_lt=16; warn_lt=64; }
+                (( pfx >= deny_lt )) || die "'$a' — слишком широко для whitelist (полный обход защиты для огромного диапазона)"
+                (( pfx >= warn_lt )) || echo "[!] $a — это ПОЛНЫЙ обход защиты для всего диапазона; сузь до хостов, если можно" >&2
+            fi
             if [[ "$sub" == add ]]; then
                 [[ ",$cur," == *",$a,"* ]] || cur+="${cur:+,}$a"
                 if [[ "$fam" == 4 ]]; then e4+=$'\n'"$a"; else e6+=$'\n'"$a"; fi
-                nft add element inet na_filter "whitelist_v$fam" "{ $a }" 2>/dev/null || true
-                nft delete element inet na_filter "autoban_v$fam" "{ $a }" 2>/dev/null || true
-                say "allow $a"
+                live_add+=("$fam $a")
             else
                 cur="$(tr ',' '\n' <<<"$cur" | grep -vxF -- "$a" | paste -sd, - || true)"
                 if [[ "$fam" == 4 ]]; then e4="$(grep -vxF -- "$a" <<<"$e4" || true)"; else e6="$(grep -vxF -- "$a" <<<"$e6" || true)"; fi
-                nft delete element inet na_filter "whitelist_v$fam" "{ $a }" 2>/dev/null || true
-                say "deny $a (снят из whitelist)"
+                live_del+=("$fam $a")
             fi
         done
-        file_set 4 "$e4"; file_set 6 "$e6"
+        # 1) файл автозагрузки: обе строки сразу, nft -c ДО замены — не прошло, ничего не тронуто
+        tmp="$(mktemp "$NFT_FILE.XXXXXX")"
+        l4="$(set_line 4 whitelist_v4 '    ' "$e4")"; l6="$(set_line 6 whitelist_v6 '    ' "$e6")"
+        awk -v l4="$l4" -v l6="$l6" '/^[[:space:]]*set whitelist_v4 \{/{print l4; next} /^[[:space:]]*set whitelist_v6 \{/{print l6; next} {print}' "$NFT_FILE" > "$tmp"
+        nft -c -f "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "изменённый na_filter.nft не прошёл nft -c — ничего не тронуто"; }
+        chmod 0644 "$tmp"; mv -f "$tmp" "$NFT_FILE"
+        # 2) живые наборы
+        for x in ${live_add[@]+"${live_add[@]}"}; do
+            nft add element inet na_filter "whitelist_v${x%% *}" "{ ${x#* } }" 2>/dev/null || true
+            nft delete element inet na_filter "autoban_v${x%% *}" "{ ${x#* } }" 2>/dev/null || true
+            say "allow ${x#* }"
+        done
+        for x in ${live_del[@]+"${live_del[@]}"}; do
+            nft delete element inet na_filter "whitelist_v${x%% *}" "{ ${x#* } }" 2>/dev/null \
+                || echo "[!] ${x#* } не удалён из живого сета (слит с соседним интервалом?) — уйдёт при ребуте/ре-ране protect" >&2
+            say "deny ${x#* } (снят из whitelist)"
+        done
+        # 3) protect.conf — ре-ран protect применит то же самое
         conf_set "$cur"
-        sync_aux
+        # 4) CrowdSec-парсер: из итогового файла
+        if [[ -d "$(dirname "$CS_YAML")" ]]; then
+            ip=""; cidr=""
+            for x in $(file_elems 4) $(file_elems 6); do
+                if [[ "$x" == */* ]]; then cidr+="    - \"$x\""$'\n'; else ip+="    - \"$x\""$'\n'; fi
+            done
+            if [[ -n "$ip$cidr" ]]; then
+                { echo "name: node-accelerator/whitelist"; echo "description: never ban admin/panel"; echo "whitelist:"
+                  echo "  reason: node-accelerator trusted"
+                  [[ -n "$ip"   ]] && { echo "  ip:";   printf "%s" "$ip"; }
+                  [[ -n "$cidr" ]] && { echo "  cidr:"; printf "%s" "$cidr"; }; } > "$CS_YAML"
+            else rm -f "$CS_YAML"; fi
+            systemctl reload crowdsec >/dev/null 2>&1 || true
+        fi
+        # 5) правило CROWDSEC_SCOPE=ssh: строки-наборы в файле + живые наборы (без рестарта bouncer'а)
+        if [[ -f "$SCOPE_NFT" ]]; then
+            t4="$(awk '$1=="table" && $2=="ip" {print $3; exit}' "$SCOPE_NFT")"
+            t6="$(awk '$1=="table" && $2=="ip6" {print $3; exit}' "$SCOPE_NFT")"
+            s4l="$(set_line 4 na_wl4 '    ' "$(file_elems 4)" ' # na-wl4')"
+            s6l="$(set_line 6 na_wl6 '    ' "$(file_elems 6)" ' # na-wl6')"
+            tmp="$(mktemp "$SCOPE_NFT.XXXXXX")"
+            awk -v l4="$s4l" -v l6="$s6l" '/# na-wl4$/{print l4; next} /# na-wl6$/{print l6; next} {print}' "$SCOPE_NFT" > "$tmp"
+            mv -f "$tmp" "$SCOPE_NFT"
+            for f in 4 6; do
+                tb="$t4"; fm=ip; [[ "$f" == 6 ]] && { tb="$t6"; fm=ip6; }
+                [[ -n "$tb" ]] || continue
+                el="$(file_elems "$f" | paste -sd, - | sed 's/,/, /g')"
+                { echo "flush set $fm $tb na_wl$f"; [[ -n "$el" ]] && echo "add element $fm $tb na_wl$f { $el }"; } \
+                    | nft -f - 2>/dev/null || echo "[!] живой набор na_wl$f правила CrowdSec не обновлён — применится при ребуте" >&2
+            done
+        fi
+        # 6) хэш файла в маркере: правка через na-fw — не «ручная»
+        if [[ -f "$STATE_DIR/protect.installed" ]]; then
+            sha="$(sha256sum "$NFT_FILE" | awk '{print $1}')"
+            sed -i.na-tmp -E "s/^nft_sha256=.*/nft_sha256=$sha/" "$STATE_DIR/protect.installed" && rm -f "$STATE_DIR/protect.installed.na-tmp"
+        fi
         say "whitelist обновлён во всех слоях (сет, na_filter.nft, protect.conf, CrowdSec)" ;;
     unban)
         shift; [[ $# -gt 0 ]] || die "не указан адрес"
@@ -2341,6 +2433,7 @@ EOF
 # SSH_PORT пишем, только если он задан оператором — автодетект каждый прогон делает заново.
 for _k in $NA_NONE_KEYS; do printf -v "$_k" '%s' none; done
 _ssh_key=""; [[ " $NA_EXPLICIT_KEYS " == *" SSH_PORT "* ]] && _ssh_key=SSH_PORT
+[[ -n "$NA_SSH_SAVE" && -z "$_ssh_key" ]] && { _ssh_key=SSH_PORT; SSH_PORT="$NA_SSH_SAVE"; }
 export NA_EXPLICIT_KEYS
 save_conf "$CONF_DIR/protect.conf" \
     FW_MODE $_ssh_key TCP_PORTS UDP_PORTS NODE_PORT WHITELIST CROWDSEC_SCOPE DNAT_GUARD UDP_AMP_DROP \

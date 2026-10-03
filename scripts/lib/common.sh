@@ -266,7 +266,8 @@ detect_ssh_port() {
         [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]] && sshd_bin=/usr/sbin/sshd
         [[ -n "$sshd_bin" ]] && p="$("$sshd_bin" -T 2>/dev/null | awk '$1=="port"{print $2}' | _ports_csv)"
     fi
-    [[ -z "$p" ]] && p="$(ss -tnlp 2>/dev/null | awk '/sshd|"ssh"|ssh\.socket/{n=split($4,a,":"); print a[n]}' | _ports_csv)"
+    # loopback не в счёт: sshd держит там X11-форвардинг сессий (127.0.0.1:6010+)
+    [[ -z "$p" ]] && p="$(ss -tnlp 2>/dev/null | awk '/sshd|"ssh"|ssh\.socket/ && $4 !~ /^(127\.|\[::1\])/ {n=split($4,a,":"); print a[n]}' | _ports_csv)"
     [[ -z "$p" ]] && p="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config 2>/dev/null | _ports_csv)"
     [[ "$p" =~ ^[0-9]+(,[0-9]+)*$ ]] || p=""
     echo "${p:-22}"
