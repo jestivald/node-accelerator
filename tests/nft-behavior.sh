@@ -211,8 +211,10 @@ ip netns exec "$SRV" nft add element inet na_filter whitelist_v4 '{ 10.77.0.18 }
 check "DNAT: whitelist сильнее autoban" 1 "$(connects 10.77.0.18 10.77.0.1 9090 1)"
 
 echo "== 8. SYNPROXY: рукопожатие на защищённом порту завершается =="
-if modprobe nf_synproxy 2>/dev/null || [[ -d /sys/module/nf_synproxy_core ]]; then
+if modprobe nft_synproxy 2>/dev/null || [[ -d /sys/module/nft_synproxy ]]; then
     ip netns exec "$SRV" sysctl -q -w net.netfilter.nf_conntrack_tcp_loose=0
+    grep -q 'synproxy mss' "$T/ruleset-sp.nft" && ok_ "SYNPROXY в ruleset (не degraded: до v4.2 проверялся несуществующий модуль nf_synproxy)" \
+        || fail_ "SYNPROXY-вариант сгенерирован без synproxy (degraded)"
     if ip netns exec "$SRV" nft -f "$T/ruleset-sp.nft"; then
         ok_ "SYNPROXY-ruleset загружен"
         check "соединение через synproxy устанавливается (до v4.2 — нет)" 3 "$(connects 10.77.0.13 10.77.0.1 8443 3)"
@@ -220,7 +222,7 @@ if modprobe nf_synproxy 2>/dev/null || [[ -d /sys/module/nf_synproxy_core ]]; th
         fail_ "SYNPROXY-ruleset не загрузился"
     fi
 else
-    echo "  skip (нет nf_synproxy в ядре раннера)"
+    echo "  skip (нет nft_synproxy в ядре раннера)"
 fi
 
 echo

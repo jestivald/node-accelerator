@@ -1125,20 +1125,23 @@ fi
 #
 # notrack ТОЛЬКО для трафика к самому хосту (fib daddr type local): иначе правило в
 # prerouting цепляет conntrack/NAT ТРАНЗИТА (Docker-контейнер панели → удалённая нода)
-# и ломает его. Требует ядро ≥5.14 + модуль nf_synproxy. Запрошен, но недоступен →
+# и ломает его. Требует ядро ≥5.14 + модуль nft_synproxy (тянет nf_synproxy_core). Модуля
+# с именем nf_synproxy в современных ядрах нет вовсе — до v4.2 проверка `modprobe nf_synproxy`
+# проваливалась на любом ядре флота (сток 6.12, XanMod 6.18), и ENABLE_SYNPROXY=1 всегда
+# уходил в degraded. Запрошен, но недоступен →
 # fail-loud (маркер degraded + warn), БЕЗ тихой деградации; synproxy-правила не ставятся.
 SYNPROXY_PRE=""; SYNPROXY_IN=""; SP_MODPROBE=""; SYNPROXY_OK=0
 rm -f "$STATE_DIR/.synproxy-degraded" 2>/dev/null || true
 if [[ "$ENABLE_SYNPROXY" == "1" ]]; then
     _kmaj="$(uname -r | cut -d. -f1)"; _kmin="$(uname -r | cut -d. -f2)"
     [[ "$_kmaj" =~ ^[0-9]+$ ]] || _kmaj=0; [[ "$_kmin" =~ ^[0-9]+$ ]] || _kmin=0
-    if { [[ "$_kmaj" -gt 5 ]] || { [[ "$_kmaj" -eq 5 ]] && [[ "$_kmin" -ge 14 ]]; }; } && modprobe nf_synproxy 2>/dev/null; then
+    if { [[ "$_kmaj" -gt 5 ]] || { [[ "$_kmaj" -eq 5 ]] && [[ "$_kmin" -ge 14 ]]; }; } && modprobe nft_synproxy 2>/dev/null; then
         SYNPROXY_OK=1
         SP_SET="$TCP_PORTS"
         # mss из MTU аплинка (−40Б IPv4+TCP), wscale 7 (дефолт Linux); клампим в 536..1460.
         _mtu="$(cat /sys/class/net/"$WAN"/mtu 2>/dev/null || echo 1500)"; [[ "$_mtu" =~ ^[0-9]+$ ]] || _mtu=1500
         SP_MSS=$(( _mtu - 40 )); { [[ "$SP_MSS" -gt 1460 ]] || [[ "$SP_MSS" -lt 536 ]]; } && SP_MSS=1460
-        SP_MODPROBE="ExecStartPre=/bin/sh -c 'modprobe nf_synproxy 2>/dev/null || true'"
+        SP_MODPROBE="ExecStartPre=/bin/sh -c 'modprobe nft_synproxy 2>/dev/null || true'"
         SYNPROXY_PRE="    chain prerouting {
         type filter hook prerouting priority -300; policy accept;
         fib daddr type local tcp dport { ${SP_SET} } tcp flags syn notrack
@@ -1155,8 +1158,8 @@ if [[ "$ENABLE_SYNPROXY" == "1" ]]; then
         tcp dport { ${SP_SET} } ct state invalid,untracked synproxy mss ${SP_MSS} wscale 7 timestamp sack-perm"
         ok "SYNPROXY: ядро $(uname -r) ок, mss ${SP_MSS} wscale 7 (notrack только host-local)"
     else
-        warn "SYNPROXY запрошен, но недоступен (нужно ядро ≥5.14 + модуль nf_synproxy). Защита БЕЗ synproxy."
-        mkdir -p "$STATE_DIR"; echo "kernel=$(uname -r) reason=no_nf_synproxy at=$(date -Is)" > "$STATE_DIR/.synproxy-degraded"
+        warn "SYNPROXY запрошен, но недоступен (нужно ядро ≥5.14 + модуль nft_synproxy). Защита БЕЗ synproxy."
+        mkdir -p "$STATE_DIR"; echo "kernel=$(uname -r) reason=no_nft_synproxy at=$(date -Is)" > "$STATE_DIR/.synproxy-degraded"
     fi
 fi
 
@@ -1642,12 +1645,12 @@ ExecReload=/usr/sbin/nft -f $NFT_FILE
 [Install]
 WantedBy=multi-user.target
 EOF
-# nf_synproxy грузим на boot (на стоковых ядрах модульный; на XanMod встроен — no-op).
+# nft_synproxy грузим на boot (и на стоковых, и на XanMod — модуль, CONFIG_NFT_SYNPROXY=m).
 # SYNPROXY требует nf_conntrack_tcp_loose=0: при loose=1 conntrack «подхватывает» третий
 # ACK как новое соединение, synproxy его не видит, и сокет отвечает RST. Плата: после
 # сброса conntrack (ребут модуля, failover) уже установленные соединения не подхватываются.
 if [[ "$SYNPROXY_OK" == "1" ]]; then
-    echo "nf_synproxy" > /etc/modules-load.d/na-synproxy.conf
+    echo "nft_synproxy" > /etc/modules-load.d/na-synproxy.conf
     printf '# node-accelerator: SYNPROXY (ENABLE_SYNPROXY=1)\nnet.netfilter.nf_conntrack_tcp_loose = 0\n' > /etc/sysctl.d/99-na-synproxy.conf
     sysctl -q -w net.netfilter.nf_conntrack_tcp_loose=0 2>/dev/null || warn "не смог выставить nf_conntrack_tcp_loose=0 — SYNPROXY не будет завершать рукопожатия"
 else
