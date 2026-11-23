@@ -670,5 +670,61 @@ rc=0; NA_TEST_APT_FAIL_ONCE=1 "$WBASH" "$T/wrap-common.sh" apt > "$T/out" 2>&1 |
 expect "ретрай после неудачи тоже с таймаутом лока" test "$(grep -c 'DPkg::Lock::Timeout=120 install -y -qq --no-install-recommends foo bar' "$REC/apt")" -eq 2
 expect_not "ни одного вызова apt-get без таймаута лока" grep -qv 'DPkg::Lock::Timeout=120' "$REC/apt"
 
+# ════════════════════════════════════════════════════════════════════════════
+echo "== 7. итог THP и irqbalance: ✔ только по факту (1 vCPU, контейнер) =="
+# ════════════════════════════════════════════════════════════════════════════
+{ awk '/^# ─── 9\. THP off/{f=1} /^# ─── 10\./{f=0} f' "$OPT"
+  awk '/^# ─── 11\. irqbalance/{f=1} /^# ─── 12\./{f=0} f' "$OPT"; } \
+  | "$REAL_SED" -e "s#/sys/kernel/mm#$T/sys7/kernel/mm#g" -e "s#/etc/systemd/system/#$T/units7/#g" > "$T/fin-section.sh"
+grep -q 'title "irqbalance"' "$T/fin-section.sh" || { echo "  ✘ не смог извлечь секции 9/11 из optimize.sh"; fail=1; }
+THP7="$T/sys7/kernel/mm/transparent_hugepage"
+# systemctl: `enable --now na-thp-off` исполняет ExecStart (sysfs только на чтение — запись
+# молча не проходит, как в контейнере); `is-active irqbalance` — по NA_TEST_IRQ
+cat > "$BIN/systemctl" <<'SC'
+#!/bin/sh
+echo "systemctl $*" >> "$REC/calls"
+case "$*" in
+  "enable --now na-thp-off.service")
+    [ "${NA_TEST_THP_RO:-0}" = 1 ] || [ ! -d "$NA_T/sys7/kernel/mm/transparent_hugepage" ] \
+      || echo 'always madvise [never]' > "$NA_T/sys7/kernel/mm/transparent_hugepage/enabled" ;;
+  "is-active --quiet irqbalance") [ "${NA_TEST_IRQ:-active}" = active ] || exit 3 ;;
+esac
+exit 0
+SC
+printf '#!/bin/sh\necho "${NA_TEST_NCPU:-4}"\n' > "$BIN/nproc"
+printf '#!/bin/sh\necho "${NA_TEST_VIRT:-kvm}"\n' > "$BIN/systemd-detect-virt"
+chmod +x "$BIN/systemctl" "$BIN/nproc" "$BIN/systemd-detect-virt"
+cat > "$T/wrap-fin.sh" <<WRAP
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/scripts/lib/common.sh"
+STATE_DIR="$T/state7"
+. "$T/fin-section.sh"
+WRAP
+fin() { rc=0; : > "$REC/calls"; rm -rf "$T/state7" "$T/units7"; mkdir -p "$T/state7" "$T/units7"
+        "$WBASH" "$T/wrap-fin.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
+mkdir -p "$THP7"; echo 'always [madvise] never' > "$THP7/enabled"
+fin
+expect "VM: rc=0" test "$rc" -eq 0
+expect "VM: THP реально never → ✔ «THP отключён»" grep -q '\[+\].*THP отключён' "$T/out"
+expect "4 vCPU, демон работает → ✔ «irqbalance запущен»" grep -q '\[+\].*irqbalance запущен' "$T/out"
+echo 'always [madvise] never' > "$THP7/enabled"
+NA_TEST_VIRT=lxc NA_TEST_THP_RO=1 NA_TEST_IRQ=inactive fin
+expect "контейнер: rc=0" test "$rc" -eq 0
+expect_not "контейнер: sysfs только на чтение — ✔ «THP отключён» не печатается" grep -q 'THP отключён' "$T/out"
+expect "…сказано, что THP задаёт хост" grep -q 'THP: madvise — контейнер' "$T/out"
+expect_not "контейнер: ConditionVirtualization — ✔ «irqbalance запущен» не печатается" grep -q 'irqbalance запущен' "$T/out"
+NA_TEST_THP_RO=1 NA_TEST_IRQ=inactive fin
+expect "VM: THP не переключился — warn с текущим режимом" grep -q '\[!\].*THP не отключился (сейчас: madvise)' "$T/out"
+expect "VM 4 vCPU: демон не поднялся — warn" grep -q '\[!\].*irqbalance не запустился' "$T/out"
+NA_TEST_NCPU=1 NA_TEST_IRQ=inactive fin
+expect_not "1 vCPU: ✔ «irqbalance запущен» не печатается" grep -q 'irqbalance запущен' "$T/out"
+expect "…сказано, что на 1 vCPU он не нужен" grep -q 'irqbalance: 1 vCPU' "$T/out"
+rm -rf "$THP7"
+fin
+expect "THP в ядре нет: rc=0" test "$rc" -eq 0
+expect_not "THP в ядре нет — ✔ не печатается" grep -q 'THP отключён' "$T/out"
+expect "…сказано, что отключать нечего" grep -q 'THP в этом ядре нет' "$T/out"
+
 if [ "$fail" -ne 0 ]; then echo "OPTIMIZE-UNIT: FAIL"; exit 1; fi
 echo "OPTIMIZE-UNIT: OK (sysctl: виновник назван, резерв портов, снимок только при первом прогоне; journald 10-*, persistent; откат runtime; XanMod: Secure Boot//boot/initrd/драйвер NIC; default_iface после dev; apt ждёт лок)"

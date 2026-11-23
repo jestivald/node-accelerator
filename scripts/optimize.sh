@@ -1534,7 +1534,20 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now na-thp-off.service >/dev/null 2>&1 || true
-ok "THP отключён"
+# ✔ — по факту, а не по тому, что юнит записан: в контейнере (LXC/OpenVZ) sysfs только на
+# чтение и режим THP задаёт хост, ExecStart молча глотает отказ записи, а итог печатал
+# «THP отключён» при живом [madvise]/[always].
+_thp="$(grep -oE '\[[a-z+]+\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]' || true)"
+if [[ "$_thp" == never ]]; then
+    ok "THP отключён"
+elif [[ -z "$_thp" ]]; then
+    info "THP в этом ядре нет — отключать нечего"
+elif is_container; then
+    info "THP: $_thp — контейнер, режим THP задаёт хост (наш юнит его не меняет)"
+else
+    warn "THP не отключился (сейчас: $_thp) — systemctl status na-thp-off.service"
+fi
+unset _thp
 
 # ─── 10. CPU governor ────────────────────────────────────────────────────────
 title "CPU governor → performance"
@@ -1562,7 +1575,19 @@ fi
 # ─── 11. irqbalance ──────────────────────────────────────────────────────────
 title "irqbalance"
 systemctl enable --now irqbalance >/dev/null 2>&1 || true
-ok "irqbalance запущен"
+# ✔ — только если демон реально работает. На 1 vCPU он не нужен и не держится (юнит с
+# ConditionCPUs=>1 не стартует, сам irqbalance на одном CPU завершается), в контейнере
+# юнит отсекает ConditionVirtualization=!container — а `enable --now` при этом успешен,
+# и итог печатал «irqbalance запущен» про остановленный демон.
+if [[ "$(nproc 2>/dev/null || echo 2)" -le 1 ]]; then
+    info "irqbalance: 1 vCPU — распределять прерывания не по чему, демон не нужен"
+elif systemctl is-active --quiet irqbalance 2>/dev/null; then
+    ok "irqbalance запущен"
+elif is_container; then
+    info "irqbalance не запущен: контейнер — прерываниями управляет хост"
+else
+    warn "irqbalance не запустился — systemctl status irqbalance"
+fi
 
 # ─── 12. Маркер ──────────────────────────────────────────────────────────────
 mkdir -p "$STATE_DIR"
