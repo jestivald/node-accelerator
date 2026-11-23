@@ -64,11 +64,11 @@ S
 done
 cat > "$SB/bin/hostname" <<'S'
 #!/bin/sh
-echo vne-de1
+echo node-1
 S
 cat > "$SB/bin/uname" <<'S'
 #!/bin/sh
-case "$1" in -r) echo 6.18.64-x64v3-xanmod1;; -m) echo x86_64;; -n) echo vne-de1;; *) echo Linux;; esac
+case "$1" in -r) echo 6.18.64-x64v3-xanmod1;; -m) echo x86_64;; -n) echo node-1;; *) echo Linux;; esac
 S
 cat > "$SB/bin/sysctl" <<'S'
 #!/bin/sh
