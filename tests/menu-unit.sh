@@ -169,6 +169,11 @@ has "тюнинг: дата, версия маркера и подсказка �
 has "та же загрузка, что при установке, — нужна перезагрузка" "нужна перезагрузка" "$T/o6b"
 has "защита работает, CrowdSec с областью" "strict · na_filter работает · CrowdSec (ssh)" "$T/o6b"
 has "взведённый сейфти-таймер виден" "сейфти-таймер взведён" "$T/o6b"
+printf 'reboot_risk=нет /boot/initrd.img-6.18.64-x64v3-xanmod1\n' >> "$SB/state/optimize.installed"
+menu "$T/o6r" 0
+has "ядро не готово к загрузке — ✘ «НЕ перезагружайся», а не «нужна перезагрузка»" "НЕ перезагружайся" "$T/o6r"
+has "…с причиной из optimize" "нет /boot/initrd.img-6.18.64-x64v3-xanmod1" "$T/o6r"
+hasnt "…и без призыва к перезагрузке" "нужна перезагрузка" "$T/o6r"
 echo "boot-later" > "$SB/boot_id"
 sleep 1; date +%s > "$SB/state/safety-fired.last"
 STUB_NFT=0 STUB_CC=cubic menu "$T/o6c" 0

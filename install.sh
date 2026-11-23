@@ -418,7 +418,17 @@ menu_status() {
     else
         M_ST+=("NONE|Тюнинг|не применялся — пункт 1")
     fi
-    if reboot_pending; then M_ST+=("WARN||нужна перезагрузка: новое ядро или параметры загрузки"); fi
+    if reboot_pending; then
+        # optimize проверил новое ядро и нашёл, что оно не поднимется с сетью (нет initrd,
+        # драйвера NIC) — «нужна перезагрузка» тут толкала бы оператора в ядро без сети
+        t="$(_m_kv reboot_risk "$STATE_DIR/optimize.installed")"
+        if [[ -n "$t" ]]; then
+            M_ST+=("FAIL||НЕ перезагружайся: новое ядро не готово к загрузке")
+            M_ST+=("||$t")
+        else
+            M_ST+=("WARN||нужна перезагрузка: новое ядро или параметры загрузки")
+        fi
+    fi
 
     f="$STATE_DIR/protect.installed"
     if [[ -f "$f" ]]; then
