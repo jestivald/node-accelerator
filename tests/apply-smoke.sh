@@ -425,6 +425,82 @@ grep -q 'table inet na_filter {' "$NFTF" || { echo "[x] nft-ok: новый rules
 grep -qx '# OLD-WORKING-RULESET' "$T/backup/na_filter.nft" 2>/dev/null || { echo "[x] nft-ok: прошлый ruleset не попал в бэкап"; fail=1; }
 ls "$T/conf"/.na_filter.nft.* >/dev/null 2>&1 && { echo "[x] nft-ok: остался временный кандидат"; fail=1; }
 
+# ── v4.3: интерактивный прогон на НАСТОЯЩЕМ pty (stdin — терминал, как из меню) ──
+# В v4.3 меню install.sh запускает модули со stdin = терминал даже при `curl | bash`, и
+# интерактивная ветка становится основной. Здесь она исполняется как есть: -t 0 истинно,
+# read читает с терминала, Ctrl+D — настоящий EOF терминала. pty даёт python3 (он уже нужен
+# diagnose-unit/na-report-unit); 6 пустых ответов — режим, SSH, TCP, UDP, node-agent,
+# whitelist по умолчанию, дальше — ответ на «Соединение работает?».
+cat > "$T/pty-run.py" <<'PY'
+import os, pty, select, signal, sys, time
+# pty-run.py <файл с вводом> <таймаут, с> <команда> [аргументы…] — вывод ребёнка в stdout, его код
+inp = open(sys.argv[1], 'rb').read()
+limit = float(sys.argv[2])
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        os.execvp(sys.argv[3], sys.argv[3:])
+    finally:
+        os._exit(127)
+os.write(fd, inp)   # строки ждут в очереди терминала; ^D в начале строки — EOF для read
+out = bytearray()
+end = time.time() + limit
+while True:
+    left = end - time.time()
+    if left <= 0:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        sys.stdout.buffer.write(bytes(out) + b'\n[pty-run] timeout\n')
+        sys.exit(124)
+    r, _, _ = select.select([fd], [], [], left)
+    if not r:
+        continue
+    try:
+        chunk = os.read(fd, 65536)
+    except OSError:   # Linux: EIO, когда ребёнок закрыл терминал
+        break
+    if not chunk:     # macOS: EOF
+        break
+    out += chunk
+_, st = os.waitpid(pid, 0)
+sys.stdout.buffer.write(bytes(out))
+sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 128 + os.WTERMSIG(st))
+PY
+pty_protect() {   # pty_protect <ответ на «Соединение работает?» (байты)> <лог> [VAR=знач…]
+    local ans="$1" log="$2"; shift 2
+    printf '\n\n\n\n\n\n%s' "$ans" > "$T/pty.in"
+    : > "$NA_TEST_SYSTEMCTL_LOG"
+    python3 "$T/pty-run.py" "$T/pty.in" 120 \
+        env -u REMNAWAVE_NONINTERACTIVE ENABLE_CROWDSEC=0 DRY_RUN=0 "$@" bash "$T/scripts/protect.sh" >"$log" 2>&1
+}
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[x] нужен python3 (pty для интерактивного прогона)"; fail=1
+else
+    # C-локаль: LC_CTYPE=UTF-8, который macOS передаёт по SSH, на Linux не существует → bash
+    # в C, а там скобочное выражение — набор БАЙТОВ: «д» = D0 B4, «н» = D0 BD, и ответ
+    # «нет» (или «н» — клавиша Y в русской раскладке) снимал сейфти, хотя вход НЕ работает.
+    # EOF (Ctrl+D): под set -e голый read ронял скрипт молча — с ВЗВЕДЁННЫМ сейфти.
+    i=0
+    for ans in $'нет\n' $'н\n' $'\x04' $'y\n' $'д\n' $'Да\n'; do
+        i=$((i+1)); reset_t; L="$T/apply-pty-$i.log"
+        set +e; pty_protect "$ans" "$L" LC_ALL=C; rc=$?; set -e
+        case "$ans" in $'\x04') what='EOF (Ctrl+D)';; *) what="«${ans%$'\n'}»";; esac
+        grep -qF 'Режим файрвола' "$L" || { echo "[x] pty $what: интерактивная ветка не исполнялась"; tail -5 "$L"; fail=1; }
+        [ "$rc" -eq 0 ] || { echo "[x] pty $what: прогон упал (exit $rc) — без слова о взведённом сейфти"; tail -5 "$L"; fail=1; }
+        grep -qF 'Готово' "$L" || { echo "[x] pty $what: прогон не дошёл до «Готово»"; fail=1; }
+        n="$(grep -c 'stop na-fw-safety.timer' "$NA_TEST_SYSTEMCTL_LOG" || true)"
+        case "$ans" in
+            $'нет\n'|$'н\n'|$'\x04')
+                # взвод гасит прошлый таймер (1 stop); второй stop — это снятие сейфти
+                [ "$n" -eq 1 ] || { echo "[x] pty LC_ALL=C $what: сейфти СНЯТ, хотя вход не подтверждён"; fail=1; }
+                grep -qF 'Сейфти оставлен' "$L" || { echo "[x] pty LC_ALL=C $what: нет сообщения, что сейфти остался взведённым"; fail=1; } ;;
+            *)
+                [ "$n" -eq 2 ] || { echo "[x] pty LC_ALL=C $what: подтверждение не сняло сейфти"; fail=1; }
+                grep -qF 'Сейфти-таймер снят' "$L" || { echo "[x] pty LC_ALL=C $what: нет сообщения о снятии сейфти"; fail=1; } ;;
+        esac
+    done
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
     echo "APPLY-SMOKE: FAIL"; exit 1
