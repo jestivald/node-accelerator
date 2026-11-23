@@ -84,6 +84,11 @@ jobs:
         # ban_rate_5m был числом строк лога — рядом events_5m/unique_src_5m; флаг
         # ok|partial|unavailable для ASN; управляющий символ из whois не ломает JSON.
         run: bash tests/na-report-unit.sh
+      - name: rollback unit (ИСПОЛНЯЕТ rollback.sh целиком в песочнице)
+        # v4.3: таймеры снимаются раньше сервисов (таймер успевал перезапустить fleet-sync/
+        # blocklist в удаляемую таблицу); после отката нет наших артефактов, чужое на месте;
+        # повторный откат и откат на пустом хосте — rc 0; метка XanMod снимается после purge.
+        run: bash tests/rollback-unit.sh
       - name: lint — никаких `cmd | grep -q` под pipefail (SIGPIPE → ложное «нет»)
         # grep -q закрывает пайп на первом совпадении; дописывающая команда ловит SIGPIPE,
         # пайплайн под pipefail отдаёт 141. В v4.1.2 так через раз гас сенсор лога

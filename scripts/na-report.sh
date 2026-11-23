@@ -340,14 +340,7 @@ focus_ip() {
 # ─── Человекочитаемый отчёт ─────────────────────────────────────────────────────
 human() {
     collect_events; load_autoban
-    clear 2>/dev/null || true
-    printf "%b" "$BOLD"
-    cat <<'B'
-  ┌────────────────────────────────────────────┐
-  │   🔥  node-accelerator — форензика атак     │
-  └────────────────────────────────────────────┘
-B
-    printf "%b" "$NC"
+    na_banner "🔥" "форензика атак"
     local total rate usrc; total="$(events_total)"; rate="$(ban_rate_5m)"; usrc="$(unique_src_5m)"
     info "Окно: последние ${HOURS}ч   ·   событий в drop-логе: $total   ·   за 5 мин: $rate от $usrc адрес(ов)"
     if [[ "$JSPAN" -ge 0 && "$JSPAN" -lt "$HOURS" ]]; then
@@ -497,14 +490,7 @@ pw_section() {
 }
 
 proxyware_audit() {
-    clear 2>/dev/null || true
-    printf "%b" "$BOLD"
-    cat <<'B'
-  ┌────────────────────────────────────────────┐
-  │  🕵  node-accelerator — proxyware self-audit │
-  └────────────────────────────────────────────┘
-B
-    printf "%b" "$NC"
+    na_banner "🕵" "proxyware self-audit"
     info "Read-only проверка на residential-proxy / bandwidth-SDK (для abuse-тикетов)."
 
     local hit=0
