@@ -162,7 +162,11 @@ ver_ge() {
 
 require_root() {
     if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-        err "Запусти от root: sudo bash $0"
+        # под curl|bash $0 — сам интерпретатор: «sudo bash $0» выходило «sudo bash bash»
+        case "$0" in
+            bash|-bash|*/bash) err "Запусти от root: curl -fsSL ${REPO_URL:-https://raw.githubusercontent.com/jestivald/node-accelerator/main}/install.sh | sudo bash" ;;
+            *) err "Запусти от root: sudo bash $0" ;;
+        esac
         exit 1
     fi
 }

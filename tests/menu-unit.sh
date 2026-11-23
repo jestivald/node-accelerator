@@ -176,7 +176,7 @@ has "ядро и BBR" "6.18.64-x64v3-xanmod1 · bbr + fq" "$T/o6"
 printf 'installed_at=2026-11-20T12:34:56+03:00\nna_version=4.2\nreboot_needed=1\nboot_id=boot-now\n' > "$SB/state/optimize.installed"
 printf 'installed_at=2026-11-21T10:00:00+03:00\nfw_mode=strict\ncrowdsec=1\ncrowdsec_scope=ssh\n' > "$SB/state/protect.installed"
 STUB_ACTIVE="crowdsec na-fw-safety.timer" menu "$T/o6b" 0
-has "тюнинг: дата, версия маркера и подсказка ре-рана" "применён 20.11.2026 · v4.2 · ре-ран →" "$T/o6b"
+has "тюнинг: дата, версия маркера и что делать" "применён 20.11.2026 · v4.2 · пункт 1 обновит до v" "$T/o6b"
 has "та же загрузка, что при установке, — нужна перезагрузка" "нужна перезагрузка" "$T/o6b"
 has "защита работает, CrowdSec с областью" "strict · na_filter работает · CrowdSec (ssh)" "$T/o6b"
 has "взведённый сейфти-таймер виден" "сейфти-таймер взведён" "$T/o6b"
@@ -203,7 +203,7 @@ sed -i.bak '/^reboot_risk=/d' "$SB/state/optimize.installed" && rm -f "$SB/state
 sed -i.bak 's/^na_version=4.2$/na_version=9.9/' "$SB/state/optimize.installed" && rm -f "$SB/state/optimize.installed.bak"
 menu "$T/o6v" 0
 has "маркер новее: запущен старый тулкит" "запущен v" "$T/o6v"
-hasnt "маркер новее: без «ре-ран →» (откатил бы версию)" "ре-ран →" "$T/o6v"
+hasnt "маркер новее: без «обновит до» (ре-ран откатил бы версию)" "обновит до" "$T/o6v"
 sed -i.bak 's/^na_version=9.9$/na_version=4.2/' "$SB/state/optimize.installed" && rm -f "$SB/state/optimize.installed.bak"
 # фолбэк-таймер сейфти (pid-файл): наш процесс — «взведён» с подсказкой kill; чужой PID — нет
 ( exec -a "sh -c sleep 30; /usr/local/sbin/na-fw-safety-revert" sleep 30 ) & sp=$!
@@ -234,6 +234,34 @@ has "причина — сработавший сейфти" "сработал �
 has "CrowdSec не запущен — отдельной строкой" "CrowdSec не запущен" "$T/o6c"
 has "без BBR — предупреждение" "cubic + fq — без BBR" "$T/o6c"
 rm -f "$SB/state/"*
+
+echo "== 6b. ввод и подменю (по UX-тесту) =="
+menu "$T/u1" "привет" 0
+has "кириллица в неверном вводе показана, с подсказкой про раскладку" "«привет» — нет такого пункта (русская раскладка?)" "$T/u1"
+menu "$T/u2" $'3\e[D' "" 0
+grep -q 'MODULE:diagnose' "$SB/calls.log" && ok_ "стрелка (ESC[D) в строке выбора не мешает: «3←» — это 3" || fail_ "«3←» не распознан: $(calls)"
+menu "$T/u3" 5 2 yy 0 0 0
+[[ -z "$(calls)" ]] && ok_ "откат: «yy» — отказ (только y/yes/д/да целиком)" || fail_ "откат на «yy»: $(calls)"
+menu "$T/u3b" 5 2 yes "" 0
+grep -q 'MODULE:rollback args=\[protect\]' "$SB/calls.log" && ok_ "откат: «yes» — подтверждение" || fail_ "откат на «yes»: $(calls)"
+menu "$T/u4" 6 2 "" 3 0 q 0
+[[ -z "$(calls)" ]] && ok_ "вложенные вопросы: Enter и 0 — назад без действия" || fail_ "$(calls)"
+hasnt "…и без ругани «окно — целое число»" "целое число" "$T/u4"
+hasnt "q в подменю — назад, а не «нет такого пункта»" "нет такого пункта" "$T/u4"
+rm -f "$SB/sbin/na-fw-status" "$SB/sbin/na-fw-top-talkers"
+menu "$T/u5" 7 1 6 0 0
+has "нет na-fw-status — подсказка, а не «код 127»" "na-fw-status не установлен" "$T/u5"
+has "нет na-fw-top-talkers — подсказка" "na-fw-top-talkers не установлен" "$T/u5"
+menu "$T/u6" h "" 0
+if [[ "$(sed -n '/Справка/,/Enter — в меню/p' "$T/u6" | wc -l | tr -d ' ')" -le 22 ]]; then ok_ "справка помещается в 24 строки"
+else fail_ "справка длиннее 22 строк"; fi
+has "справка — про меню, а не копия --help" "Меню: номер и Enter" "$T/u6"
+# сейфти взведён, а таблицы нет: «снимется сама» противоречило бы «НЕ загружена»
+printf 'installed_at=2026-11-21T10:00:00+03:00\nfw_mode=strict\n' > "$SB/state/protect.installed"
+STUB_NFT=0 STUB_ACTIVE="na-fw-safety.timer" menu "$T/u7" 0
+has "таблицы нет — ✘" "НЕ загружена" "$T/u7"
+hasnt "…и без «снимется сама»" "снимется сама" "$T/u7"
+rm -f "$SB/state/protect.installed"
 
 echo "== 7. curl | sudo bash: stdin — пайп со скриптом, ввод меню — терминал =="
 printf '%s\n' 3 "" 0 > "$T/answers"; : > "$SB/calls.log"
@@ -311,6 +339,12 @@ PY
     if grep -qE $'\033\\[[0-9;]*m' "$T/o9c"; then fail_ "NO_COLOR: в выводе коды цвета (SGR)"
     elif grep -q '│' "$T/o9c"; then ok_ "NO_COLOR: рамка есть, кодов цвета нет"
     else fail_ "NO_COLOR: пустой экран"; fi
+    # откат на 40 колонках: подпись справа не влезает — отдельной строкой, а не CHA ≤ 0 («──1»)
+    pty_run 40 "[[\"$P\",\"5\r\",0],[\"$P\",\"0\r\",0],[\"$P\",\"0\r\",0]]" "$T/o9g" "$WBASH" "$SB/install.sh"
+    if grep -qE $'\033\\[(-|0G)' "$T/o9g"; then fail_ "40 колонок: колонка CHA ≤ 0 в выводе"
+    elif grep -q 'бэкапы: /var/backups/node-accelerator' "$T/o9g"; then ok_ "40 колонок: подпись отката отдельной строкой, без мусора"
+    else fail_ "40 колонок: подписи отката нет"; fi
+    hasnt "40 колонок: описания пунктов отката не рвутся посреди слова" "THP — с" "$T/o9g"
     # Ctrl+C на приглашении — выход 130 (сам read на трапе не прерывается — выходим из трапа)
     pty_run 100 "[[\"$P\",\"\u0003\",0]]" "$T/o9d" "$WBASH" "$SB/install.sh"
     has "Ctrl+C на приглашении — выход с кодом 130" "[exit=130]" "$T/o9d"

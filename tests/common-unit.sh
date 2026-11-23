@@ -228,6 +228,15 @@ check "ok/warn в пайп — без ESC" "" "$(TERM=xterm run 'ok x; warn y' |
 check "na_banner в пайп: одна строка без ESC и без clear" "🩺  node-accelerator ${NA_V} — диагностика ноды" \
       "$(TERM=xterm run 'na_banner 🩺 "диагностика ноды"')"
 
+echo "== 12. require_root под curl|bash — осмысленная подсказка (v4.3) =="
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    out="$(printf '. %s/scripts/lib/common.sh; require_root\n' "$REPO_ROOT" | "$WBASH" -s 2>&1 || true)"
+    check "из пайпа — подсказка curl … | sudo bash" 1 "$(grep -c 'curl -fsSL .*install.sh | sudo bash' <<<"$out")"
+    check "…а не «sudo bash bash»" 0 "$(grep -c 'sudo bash bash' <<<"$out")"
+else
+    echo "  skip (тест запущен от root)"
+fi
+
 echo
 echo "итого: ok=$PASS fail=$FAIL"
 [[ "$FAIL" -eq 0 ]]

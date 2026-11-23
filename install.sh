@@ -217,7 +217,7 @@ NA_FW=/usr/local/sbin/na-fw
 NA_FW_STATUS=/usr/local/sbin/na-fw-status
 NA_FW_TOP=/usr/local/sbin/na-fw-top-talkers
 M_IN=""; M_PROMPT=0; MENU_NOTE=""; REPLY=""
-M_ST=(); M_ADDRS=(); M_WRAP=()
+M_ST=(); M_ADDRS=(); M_WRAP=(); M_LEN=0; M_BYTES=0
 
 menu_open_input() {
     if [[ -z "$NA_TTY_SET" ]] && [[ -t 0 || -n "$NA_SELF" ]]; then M_IN=0; return 0; fi
@@ -237,11 +237,32 @@ menu_ask() {
     IFS= read -r -u "$M_IN" REPLY || rc=$?
     M_PROMPT=0
     (( rc == 0 )) || { printf '\n'; return 1; }
+    # стрелки/Home/End без readline приходят в строку как ESC [ D и т.п. — «3←» был бы «3^[[D»
+    while [[ "$REPLY" =~ $'\e'(\[|O)[0-9\;]*[A-Za-z~] ]]; do REPLY="${REPLY/"${BASH_REMATCH[0]}"/}"; done
+    REPLY="${REPLY//[[:cntrl:]]/}"
     REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
     REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
     return 0
 }
-menu_yes() { menu_ask " $1 [y/N] › " && is_yes "$REPLY"; }
+# подтверждение разрушительного действия (откат) — только y/yes/д/да целиком: у is_yes любое
+# слово на y/д — «да», а здесь «yy», «дубль» запускать откат не должны
+menu_yes() {
+    menu_ask " $1 [y/N] › " || return 1
+    case "$REPLY" in y|Y|yes|Yes|YES|д|Д|да|Да|ДА) return 0 ;; esac
+    return 1
+}
+# _m_echo <ввод> [где] — набранное в подсказке «нет такого пункта»: кириллица сохраняется
+# (раньше её вырезал _m_clip — ««» — нет такого пункта»), длинное обрезается, не-ASCII —
+# подсказка про раскладку
+_m_echo() {
+    local s="$1" lay=""
+    [[ "$s" == *[![:ascii:]]* ]] && lay=" (русская раскладка?)"
+    _m_len "$s"
+    if (( M_LEN > 16 )); then
+        if (( M_BYTES )) && [[ -n "$lay" ]]; then s="…"; else s="${s:0:15}…"; fi
+    fi
+    printf '«%s» — %sнет такого пункта%s' "$s" "${2:+$2 }" "$lay"
+}
 
 # menu_exec <заголовок> <команда> [арг…] — действие из меню. Ошибки — как в CLI: подоболочка
 # с set -e (функция в контексте `||`/`if` выполнялась бы без errexit целиком, и упавший
@@ -294,9 +315,10 @@ menu_done() {
 # строке с эмодзи. Уже 80 колонок (SSH с телефона) — без рамки и описаний; не терминал —
 # без цвета и escape-кодов вообще.
 menu_style() {
-    local cols
+    local cols s='ё'
     M_R='' M_BOLD='' M_DIM='' M_FR='' M_NUM='' M_OK='' M_WARN='' M_FAIL=''
-    M_CHA=0 M_BOX=0 M_W=76 M_TXT=59
+    M_CHA=0 M_BOX=0 M_W=76 M_TXT=59 M_BYTES=0
+    if (( ${#s} != 1 )); then M_BYTES=1; fi   # bash считает байты (C/битая локаль) — см. _m_len
     is_tty && [[ "${TERM:-dumb}" != dumb ]] || return 0
     M_CHA=1
     if [[ -z "${NO_COLOR:-}" ]]; then
@@ -308,9 +330,9 @@ menu_style() {
     cols="${cols##* }"
     [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]] || cols="$(tput cols 2>/dev/null || true)"
     [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]] || cols=80
-    # без рамки справа резать незачем — длинная строка состояния просто переносится
+    # без рамки — перенос по словам под ширину экрана (текст состояния — с колонки 15)
     if (( cols >= 80 )); then M_BOX=1
-    else M_W=$(( cols > 30 ? cols - 2 : 28 )); M_TXT=999; fi
+    else M_W=$(( cols > 30 ? cols - 2 : 28 )); M_TXT=$(( cols > 36 ? cols - 15 : 21 )); fi
     return 0
 }
 
@@ -345,8 +367,14 @@ _m_line() {
     if (( M_BOX )); then printf ' %s%s%s%s%s' "$M_FR" "$1" "$l" "$2" "$M_R"
     else printf ' %s%s%s' "$M_FR" "$l" "$M_R"; fi
     if [[ -n "$3" ]]; then printf '\r\033[%dG %s%s%s ' $(( M_BOX ? 4 : 2 )) "$M_BOLD" "$3" "$M_R"; fi
-    if [[ -n "$4" ]]; then printf '\033[%dG %s%s%s ' $(( M_W - ${#4} - 2 )) "$M_DIM" "$4" "$M_R"; fi
+    # подпись справа: не влезает в линию (узкий экран) — отдельной строкой под ней; колонка
+    # CHA ≤ 0 давала мусор вида «──1» и «G подпись» на следующей строке
+    local c=0
+    if [[ -n "$4" ]]; then _m_len "$4"; c=$(( M_W - M_LEN - 2 )); fi
+    if [[ -n "$4" ]] && (( c >= 2 )); then printf '\033[%dG %s%s%s ' "$c" "$M_DIM" "$4" "$M_R"; fi
     printf '\n'
+    if [[ -n "$4" ]] && (( c < 2 )); then printf ' %s%s%s\n' "$M_DIM" "$4" "$M_R"; fi
+    return 0
 }
 _m_top() { _m_line ╭ ╮ "${1:-}" "${2:-}"; }
 _m_mid() { _m_line ├ ┤ "" ""; }
@@ -358,11 +386,12 @@ _m_item() {
     (( M_BOX )) || d=""
     _m_row 2 "${M_NUM}$1${M_R}" 5 "$2" 9 "${M_BOLD}$3${M_R}" 24 "${d:+$M_DIM$d$M_R}"
 }
-# _m_sub <клавиша> <название> [подсказка] — пункт подменю; подсказка — та же операция без меню
+# _m_sub <клавиша> <название> [подсказка] [колонка=37] — пункт подменю; подсказка (та же
+# операция без меню или описание) — только в рамке: на узком экране она рвалась посреди слова
 _m_sub() {
     local d="${3:-}"
     (( M_BOX )) || d=""
-    _m_row 2 "${M_NUM}$1${M_R}" 6 "$2" 37 "${d:+$M_DIM$d$M_R}"
+    _m_row 2 "${M_NUM}$1${M_R}" 6 "$2" "${4:-37}" "${d:+$M_DIM$d$M_R}"
 }
 _m_note() {   # строка-подсказка под меню после неверного ввода и т.п.
     if [[ -n "$MENU_NOTE" ]]; then printf ' %s▲%s %s\n' "$M_WARN" "$M_R" "$MENU_NOTE"; MENU_NOTE=""; fi
@@ -385,6 +414,14 @@ _m_clip() {
     (( ${#s} <= $2 )) || s="${s:0:$(( $2 > 1 ? $2 - 1 : 1 ))}~"
     printf '%s' "$s"
 }
+# _m_len <строка> — длина в СИМВОЛАХ в M_LEN. В C-локали (macOS шлёт по SSH LC_CTYPE=UTF-8,
+# которой на Linux нет) ${#} считает байты — кириллица вдвое «длиннее», и строки шапки
+# переносились на половине ширины. Там считаем байты, кроме продолжений UTF-8 (0x80–0xBF).
+_m_len() {
+    if (( M_BYTES )); then local s="${1//[$'\x80'-$'\xbf']/}"; M_LEN=${#s}; else M_LEN=${#1}; fi
+    return 0
+}
+
 # _m_wrap <текст> <ширина> — строки не длиннее ширины, по словам, в массив M_WRAP. Перенос,
 # а не обрезка: в подсказках вся соль в хвосте (команда, путь). Слова — через read -a, без
 # раскрытия глобов (`/boot/initrd.img-*` в причине из optimize остаётся текстом). В C-локали
@@ -394,13 +431,16 @@ _m_wrap() {
     local line="" x
     M_WRAP=()
     read -r -a w <<<"$1"
+    local lx ll
     for x in "${w[@]}"; do
-        while (( ${#x} > $2 )); do
+        _m_len "$x"; lx=$M_LEN
+        while (( lx > $2 )); do
             [[ -n "$line" ]] && { M_WRAP+=("$line"); line=""; }
-            M_WRAP+=("${x:0:$2}"); x="${x:$2}"
+            M_WRAP+=("${x:0:$2}"); x="${x:$2}"; _m_len "$x"; lx=$M_LEN
         done
+        _m_len "$line"; ll=$M_LEN
         if [[ -z "$line" ]]; then line="$x"
-        elif (( ${#line} + 1 + ${#x} <= $2 )); then line+=" $x"
+        elif (( ll + 1 + lx <= $2 )); then line+=" $x"
         else M_WRAP+=("$line"); line="$x"; fi
     done
     M_WRAP+=("$line")
@@ -445,7 +485,7 @@ menu_status() {
         if [[ -n "$ver" && "$ver" != "${NA_VERSION:-}" ]]; then
             # маркер новее запущенного (старый NA_REF): «ре-ран» откатил бы ноду на старую версию
             if ver_ge "$ver" "${NA_VERSION:-0}"; then g=WARN; t+=" · запущен v${NA_VERSION:-?} — старее"
-            else t+=" · ре-ран → v${NA_VERSION:-?}"; fi
+            else t+=" · пункт 1 обновит до v${NA_VERSION:-?}"; fi
         fi
         M_ST+=("$g|Тюнинг|$t")
     else
@@ -492,7 +532,10 @@ menu_status() {
             M_ST+=("||сработал сейфти-таймер: доступ не подтвердили — пункт 2")
         fi
         if (( ! cs )); then M_ST+=("WARN||CrowdSec не запущен: systemctl status crowdsec"); fi
-        if systemctl is-active --quiet na-fw-safety.timer 2>/dev/null; then
+        # «снимется сама» — только про загруженную таблицу: при ✘ «НЕ загружена» снимать нечего
+        if [[ "$g" == FAIL ]]; then
+            :
+        elif systemctl is-active --quiet na-fw-safety.timer 2>/dev/null; then
             M_ST+=("WARN||сейфти-таймер взведён — na_filter снимется сама")
             M_ST+=("||подтвердить доступ: systemctl stop na-fw-safety.timer")
         elif _m_safety_pid "$STATE_DIR/na-fw-safety.pid"; then
@@ -550,10 +593,10 @@ menu_rollback() {
     menu_style
     na_clear
     _m_top "⏪ Откат"
-    _m_row 2 "${M_NUM}1${M_R}" 6 "⚡ Тюнинг" 20 "${M_DIM}sysctl, RPS, THP — сразу, лимиты — после ребута${M_R}"
-    _m_row 2 "${M_NUM}2${M_R}" 6 "🛡 Защиту" 20 "${M_DIM}файрвол na_filter, таймеры; CrowdSec остаётся${M_R}"
-    _m_row 2 "${M_NUM}3${M_R}" 6 "Всё"       20 "${M_DIM}защиту, затем тюнинг${M_R}"
-    _m_row 2 "${M_NUM}0${M_R}" 6 "Назад"
+    _m_sub 1 "⚡ Тюнинг" "sysctl, RPS, THP — сразу, лимиты — после ребута" 20
+    _m_sub 2 "🛡 Защиту" "файрвол na_filter, таймеры; CrowdSec остаётся" 20
+    _m_sub 3 "Всё"       "защиту, затем тюнинг" 20
+    _m_sub 0 "Назад"
     _m_bot "бэкапы: /var/backups/node-accelerator"
     menu_ask " Что откатить › " || return 0
     local what="" q=""
@@ -561,8 +604,8 @@ menu_rollback() {
         1) what=optimize; q="Откатить тюнинг? Ядро XanMod останется (снять — NA_REMOVE_XANMOD=1)" ;;
         2) what=protect;  q="Откатить защиту? Файрвол и баны снимутся, порты откроются" ;;
         3) what=all;      q="Откатить защиту и тюнинг?" ;;
-        0|"") return 0 ;;
-        *) MENU_NOTE="«$(_m_clip "$REPLY" 16)» — в откате нет такого пункта, ничего не тронуто"; return 0 ;;
+        0|q|Q|"") return 0 ;;
+        *) MENU_NOTE="$(_m_echo "$REPLY" "в откате") — ничего не тронуто"; return 0 ;;
     esac
     if menu_yes "$q"; then menu_exec "⏪ Откат: $what" run_rollback "$what"
     else MENU_NOTE="откат отменён — ничего не тронуто"; fi
@@ -594,21 +637,24 @@ menu_report() {
         menu_ask " Выбор › " || return 0
         case "$REPLY" in
             1) menu_exec "🔥 Атаки за 24 часа" run_report ;;
-            2) menu_ask " Окно, часов (1–720) › " || continue
-               if [[ "$REPLY" =~ ^[0-9]{1,3}$ ]] && (( 10#$REPLY >= 1 && 10#$REPLY <= 720 )); then
+            2) menu_ask " Окно, часов (1–720; Enter — назад) › " || continue
+               [[ -z "$REPLY" || "$REPLY" == 0 ]] && continue
+               if [[ "$REPLY" =~ ^[0-9]{1,6}$ ]] && (( 10#$REPLY >= 1 && 10#$REPLY <= 720 )); then
                    menu_exec "🔥 Атаки за $(( 10#$REPLY )) ч" run_report --hours "$(( 10#$REPLY ))"
                else MENU_NOTE="окно — целое число часов от 1 до 720"; fi ;;
-            3) menu_ask " IP-адрес › " || continue
+            3) menu_ask " IP-адрес (Enter — назад) › " || continue
+               [[ -z "$REPLY" || "$REPLY" == 0 ]] && continue
                if _m_addrs && (( ${#M_ADDRS[@]} == 1 )); then
                    menu_exec "🔥 Разбор ${M_ADDRS[0]}" run_report --ip "${M_ADDRS[0]}"
                else MENU_NOTE="нужен один IPv4/IPv6-адрес"; fi ;;
-            4) menu_ask " Порт › " || continue
+            4) menu_ask " Порт (Enter — назад) › " || continue
+               [[ -z "$REPLY" || "$REPLY" == 0 ]] && continue
                if [[ "$REPLY" =~ ^[0-9]{1,5}$ ]] && (( 10#$REPLY >= 1 && 10#$REPLY <= 65535 )); then
                    menu_exec "🔥 Порт $(( 10#$REPLY ))" run_report --port "$(( 10#$REPLY ))"
                else MENU_NOTE="порт — число от 1 до 65535"; fi ;;
             5) menu_exec "🔥 Самопроверка на proxyware" run_report --proxyware ;;
-            0|"") return 0 ;;
-            *) MENU_NOTE="«$(_m_clip "$REPLY" 16)» — нет такого пункта" ;;
+            0|q|Q|"") return 0 ;;
+            *) MENU_NOTE="$(_m_echo "$REPLY")" ;;
         esac
     done
 }
@@ -632,38 +678,47 @@ menu_firewall() {
         _m_note
         menu_ask " Выбор › " || return 0
         case "$REPLY" in
-            1) menu_exec "🧱 Статус файрвола" "$NA_FW_STATUS" ;;
+            1) if [[ -x "$NA_FW_STATUS" ]]; then menu_exec "🧱 Статус файрвола" "$NA_FW_STATUS"
+               else MENU_NOTE="na-fw-status не установлен — ре-ран пункта 2 (Защита)"; fi ;;
             2) menu_exec "🧱 Whitelist" "$NA_FW" allow list ;;
             3|4|5)
                local act="$REPLY"
-               menu_ask " Адреса через пробел (IP или CIDR) › " || continue
+               menu_ask " Адреса через пробел (IP или CIDR; Enter — назад) › " || continue
+               [[ -z "$REPLY" || "$REPLY" == 0 ]] && continue
                if ! _m_addrs; then MENU_NOTE="только IPv4/IPv6-адреса и CIDR"; continue; fi
                case "$act" in
                    3) menu_exec "🧱 Whitelist: добавить" "$NA_FW" allow add "${M_ADDRS[@]}" ;;
                    4) menu_exec "🧱 Whitelist: убрать" "$NA_FW" allow del "${M_ADDRS[@]}" ;;
                    5) menu_exec "🧱 Разбан" "$NA_FW" unban "${M_ADDRS[@]}" ;;
                esac ;;
-            6) menu_exec "🧱 Топ источников" "$NA_FW_TOP" ;;
-            0|"") return 0 ;;
-            *) MENU_NOTE="«$(_m_clip "$REPLY" 16)» — нет такого пункта" ;;
+            6) if [[ -x "$NA_FW_TOP" ]]; then menu_exec "🧱 Топ источников" "$NA_FW_TOP"
+               else MENU_NOTE="na-fw-top-talkers не установлен — ре-ран пункта 2 (Защита)"; fi ;;
+            0|q|Q|"") return 0 ;;
+            *) MENU_NOTE="$(_m_echo "$REPLY")" ;;
         esac
     done
 }
 
 menu_help() {
     menu_style
+    M_BOX=0   # текст справки шире содержимого рамки — линейками сверху и снизу, без боков
     na_clear
     _m_top "❓ Справка"
-    usage
     cat <<'H'
+ Меню: номер и Enter. 0 или q — выход (в подменю — назад), h — эта справка.
+ Ctrl+C во время действия прерывает его и возвращает в меню.
 
-Без меню — для скриптов, панелей и Ansible: параметры защиты через ENV, без вопросов
-  sudo SSH_PORT=22 TCP_PORTS=443 UDP_PORTS=443 WHITELIST=1.2.3.4 \
-       REMNAWAVE_NONINTERACTIVE=1 bash install.sh protect
+ Без меню — для скриптов, панелей и Ansible:
+   install.sh optimize | protect | diagnose | report | all
+   install.sh rollback [optimize|protect|all]     install.sh --help — всё
+ Защита без вопросов — параметры через ENV:
+   SSH_PORT=22 TCP_PORTS=443 UDP_PORTS=443 WHITELIST=1.2.3.4 \
+   REMNAWAVE_NONINTERACTIVE=1 bash install.sh protect
 
-После установки на ноде остаются команды:
-  na-diagnose [--json]   na-report [--json]   na-fw allow|unban   na-fw-status
+ Команды на ноде: na-diagnose [--json] · na-report · na-fw · na-fw-status
+ Документация: github.com/jestivald/node-accelerator
 H
+    _m_bot
     menu_ask " ${M_DIM}Enter — в меню${M_R} › " || exit 0
     return 0
 }
@@ -689,7 +744,7 @@ show_menu() {
             h|H|'?'|help) menu_help ;;
             0|q|Q|exit|quit) exit 0 ;;
             "") ;;
-            *) MENU_NOTE="«$(_m_clip "$REPLY" 16)» — нет такого пункта" ;;
+            *) MENU_NOTE="$(_m_echo "$REPLY")" ;;
         esac
     done
 }
