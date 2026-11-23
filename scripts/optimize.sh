@@ -137,10 +137,14 @@ xanmod_import_key() {
     # рядом с настоящим ключом может приехать чужой. apt по signed-by= доверяет КАЖДОМУ
     # ключу keyring'а, поэтому кладём туда ровно наш отпечаток (import_pinned_key),
     # а не «всё, что прислали».
-    if ! import_pinned_key "$tmpkey" "$XANMOD_FP" "$keyring"; then
+    # В keyring — только прошедший проверку: import_pinned_key при отказе удаляет файл
+    # назначения, и на ре-ране ответ-заглушка вместо ключа (прокси, страница-капча с 200)
+    # сносил уже проверенный keyring — apt переставал верить репо, обновления ядра вставали.
+    if ! import_pinned_key "$tmpkey" "$XANMOD_FP" "$keyring.na-new"; then
         warn "Ключ XanMod не сошёлся с отпечатком $XANMOD_FP — отказываюсь использовать"
         rm -f "$tmpkey"; return 1
     fi
+    mv -f "$keyring.na-new" "$keyring"
     rm -f "$tmpkey"
     return 0
 }
@@ -173,15 +177,31 @@ setup_xanmod_repo() {
     # ситуация на съёмных VPS. Без скоупа живой XanMod-репо ложно объявлялся мёртвым,
     # фоллбэк на bookworm падал так же, и ядро молча не ставилось «репо недоступен».
     local -a UPDSC=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0)
+    # Прежний list (ре-ран на ноде, где ядро уже стоит): если репо не поднялось, возвращаем
+    # его и сборку, а не удаляем. Временный отказ deb.xanmod.org иначе молча выключал
+    # обновления уже стоящего ядра до следующего ре-рана (итог: «репозиторий не обновлён
+    # (само ядро не тронуто)»), а lts от провалившегося фолбэка закреплял save_conf.
+    # list'а не было (первая установка) — битый источник не оставляем, как раньше.
+    local prev_list="" prev_flv="$XANMOD_FLAVOR" up=0
+    [[ -s "$list" ]] && prev_list="$(cat "$list")"
     echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
     if ! apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null; then
         if [[ "$codename" != "bookworm" ]]; then
             warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
             codename="bookworm"; XANMOD_FLAVOR="lts"
             echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-            apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
-        else
-            warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
+            apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null && up=1
+        fi
+        if [[ "$up" != 1 ]]; then
+            warn "XanMod-репо ('$codename') недоступен"
+            XANMOD_FLAVOR="$prev_flv"
+            if [[ -n "$prev_list" ]]; then
+                printf '%s\n' "$prev_list" > "$list"
+                warn "прежний $list оставлен как был — обновления уже стоящего ядра не выключаю"
+            else
+                rm -f "$list"
+            fi
+            return 1
         fi
     fi
     # общий кэш (чтобы apt-cache/install видели пакеты); чужие битые источники не фатальны

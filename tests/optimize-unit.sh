@@ -476,6 +476,65 @@ expect "пересборка initrd удалась → READY" grep -qx READY "$T
 expect "установка ядра идёт только после предполётной проверки" grep -q 'elif xanmod_preflight; then' "$OPT"
 expect "риск печатается до рапорта «нужна перезагрузка»" grep -q 'НЕ ПЕРЕЗАГРУЖАЙСЯ, пока не исправлено' "$OPT"
 
+echo "== 5b. XanMod: сбой репо на ре-ране не сносит рабочий list и проверенный ключ =="
+# Ре-ран на ноде, где ядро XanMod уже стоит («обновляю только репозиторий»): временный
+# отказ deb.xanmod.org или ответ-заглушка вместо ключа не должны выключать обновления ядра.
+awk '/^xanmod_import_key\(\) \{/{f=1} /^# Список пакетов-кандидатов/{f=0} f' "$OPT" \
+  | "$REAL_SED" -e "s#/etc/apt/keyrings#$T/etc/apt/keyrings#g" \
+                -e "s#/etc/apt/sources\.list\.d#$T/etc/apt/sources.list.d#g" > "$T/xm-repo.sh"
+[ -s "$T/xm-repo.sh" ] || { echo "  ✘ не смог извлечь функции репо XanMod из optimize.sh"; fail=1; }
+cat > "$BIN/curl" <<'CU'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do [ "$1" = -o ] && { out="$2"; shift; }; shift; done
+[ "${NA_TEST_CURL:-ok}" = ok ] || exit 22
+echo KEY > "$out"
+CU
+# apt-get: скоупленный update по list'у XanMod падает при NA_TEST_XM_UPD=fail
+cat > "$BIN/apt-get" <<'AG'
+#!/bin/sh
+echo "apt-get $*" >> "$REC/apt-xm"
+case "$*" in *" update "*"Dir::Etc::sourcelist="*) [ "${NA_TEST_XM_UPD:-ok}" = fail ] && exit 100 ;; esac
+exit 0
+AG
+chmod +x "$BIN/curl" "$BIN/apt-get"
+cat > "$T/wrap-xmrepo.sh" <<WRAP
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/scripts/lib/common.sh"
+APT_LOCK=(-o DPkg::Lock::Timeout=300)
+XANMOD_FP="D38D7D1DA1349567ADED882D86F7D09EE734E623"
+XANMOD_FLAVOR="\${XANMOD_FLAVOR:-lts}"
+OS_CODENAME=trixie
+# как настоящий import_pinned_key: при ЛЮБОМ отказе удаляет файл назначения
+import_pinned_key() { if [ "\${NA_TEST_KEY_OK:-1}" = 1 ]; then echo pinned > "\$3"; return 0; fi; rm -f "\$3"; return 1; }
+. "$T/xm-repo.sh"
+rc=0; setup_xanmod_repo || rc=\$?
+echo "RC=\$rc FLAVOR=\$XANMOD_FLAVOR"
+WRAP
+xmrepo() { rc=0; "$WBASH" "$T/wrap-xmrepo.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
+XKR="$T/etc/apt/keyrings/xanmod-archive-keyring.gpg"; XL="$T/etc/apt/sources.list.d/xanmod-release.list"
+mkdir -p "$T/etc/apt/keyrings" "$T/etc/apt/sources.list.d"
+printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] https://deb.xanmod.org trixie main\n' > "$XL"
+cp "$XL" "$T/xl.first"; echo old-pinned > "$XKR"
+XANMOD_FLAVOR=main NA_TEST_XM_UPD=fail xmrepo
+expect "сбой репо: rc=1 (вызывающий скажет «не обновлён»)" grep -q '^RC=1 ' "$T/out"
+expect "рабочий list не удалён и не переписан на bookworm" cmp -s "$T/xl.first" "$XL"
+expect "сборка не подменена на lts провалившимся фолбэком (иначе save_conf её закрепит)" grep -q 'FLAVOR=main$' "$T/out"
+echo old-pinned > "$XKR"
+NA_TEST_KEY_OK=0 xmrepo
+expect "ключ не сошёлся с отпечатком: rc=1" grep -q '^RC=1 ' "$T/out"
+expect "…прежний проверенный keyring не удалён" grep -qx old-pinned "$XKR"
+expect "…list не тронут" cmp -s "$T/xl.first" "$XL"
+expect_not "…временный файл ключа не остался" compgen -G "$T/etc/apt/keyrings/*.na-*"
+# первая установка: list'а не было — при отказе битый источник не оставляем (как раньше)
+rm -f "$XL"
+NA_TEST_XM_UPD=fail xmrepo
+expect "первая установка + сбой репо: list не оставлен" test ! -e "$XL"
+xmrepo
+expect "первая установка: list записан" grep -q 'deb.xanmod.org trixie main' "$XL"
+expect "…и ключ из проверки на месте" grep -qx pinned "$XKR"
+
 # ════════════════════════════════════════════════════════════════════════════
 echo "== 6. common: default_iface и apt_install =="
 # ════════════════════════════════════════════════════════════════════════════
