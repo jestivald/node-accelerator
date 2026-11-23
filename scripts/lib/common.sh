@@ -6,7 +6,7 @@
 # Версия тулкита — ЕДИНСТВЕННЫЙ источник. Пишется в installed-маркеры и отдаётся
 # в na-diagnose/na-report --json, чтобы флот-мониторинг видел version-drift по нодам.
 # shellcheck disable=SC2034
-NA_VERSION="4.2"
+NA_VERSION="4.3"
 
 # Числа — только с десятичной ТОЧКОЙ, сообщения утилит — на C. На ноде с LANG/LC_ALL=
 # de_DE.UTF-8 mawk читал «0.35» из /proc/loadavg как 0 (в JSON уезжал "load1":0), printf
@@ -23,9 +23,17 @@ case "${LC_ALL:-}" in
         export LC_NUMERIC=C LC_MESSAGES=C ;;
 esac
 
+# Цвета — только в терминал. Под `nohup … > log` / `curl | bash > log` / `na-diagnose > f`
+# коды цвета уезжали в файл так же, как курсорные до issue #28: `grep '\[+\]'` по логу
+# раскатки спотыкался о `\033[0;32m[+]`. NO_COLOR (no-color.org) и TERM=dumb выключают их
+# и в терминале. Решение принимается один раз, при подключении — по stdout вызывающего.
 # shellcheck disable=SC2034
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
+fi
 
 info()  { printf "%b[*]%b %s\n" "$BLUE"   "$NC" "$*"; }
 ok()    { printf "%b[+]%b %s\n" "$GREEN"  "$NC" "$*"; }
@@ -51,6 +59,34 @@ status_line() {
 # grep по логам раскатки (issue #28). Всё «курсорное» — только когда stdout терминал.
 is_tty()   { [[ -t 1 ]]; }
 tty_tput() { if is_tty; then tput "$@" 2>/dev/null || true; fi; return 0; }
+
+# na_banner <эмодзи> <что за модуль> — шапка отчёта модуля. Экран чистится и рамка
+# рисуется только в терминале: голый `clear` пишет ESC[3J ESC[H ESC[2J и в файл, поэтому
+# `na-diagnose > report.txt` начинался с мусора. Правую границу ставит CHA (ESC[<n>G —
+# «курсор в колонку n»), а не пробелы: ширину эмодзи терминалы считают по-разному, и рамка
+# из пробелов до v4.3 «плыла» на колонку. Не терминал — одна строка без escape-кодов.
+na_banner() {
+    local t="$2" w
+    t="node-accelerator ${NA_VERSION:-?} — $t"
+    if ! is_tty || [[ "${TERM:-dumb}" == dumb ]]; then
+        printf '%s  %s\n' "$1" "$t"; return 0
+    fi
+    # NA_NO_CLEAR=1 — модуль в цепочке (install.sh all): экран не чистим, чтобы отчёт не
+    # стирал вывод предыдущих модулей
+    [[ "${NA_NO_CLEAR:-0}" == 1 ]] || tty_tput clear
+    # ширина: ${#t} — символы в UTF-8-локали (в C — байты, рамка выйдет шире, но ровной)
+    w=$(( ${#t} + 10 )); (( w > 76 )) && w=76
+    local line; printf -v line '%*s' $(( w - 2 )) ''; line="${line// /─}"
+    printf '%b  ╭%s╮\n  │  %s  %s\033[%dG│\n  ╰%s╯%b\n' \
+        "$BOLD" "$line" "$1" "$t" $(( w + 2 )) "$line" "$NC"
+}
+
+# is_yes <ответ> — «да» в подтверждениях: y/Y/д/Д в начале. Глобом, а не `=~ ^[yYдД]`:
+# в C-локали (macOS шлёт по SSH LC_CTYPE=UTF-8, которой на Linux нет) скобка — набор
+# БАЙТОВ, «д» кладёт туда 0xD0, с которого начинается почти вся кириллица, — и «нет»
+# или «н» (клавиша Y в русской раскладке) засчитывались как «да». Глоб сравнивает «д»
+# целиком в любой локали.
+is_yes() { [[ "$1" == [yY]* || "$1" == д* || "$1" == Д* ]]; }
 
 # ─── JSON ────────────────────────────────────────────────────────────────────
 # json_escape <строка> — значение для вставки внутрь JSON-строки: экранирует \ и ",
@@ -207,10 +243,12 @@ apt_install() {
     fi
 }
 
+# confirm <вопрос> — да/нет из stdin. EOF (Ctrl+D, stdin не терминал) — «нет», а не
+# падение под set -e посреди модуля.
 confirm() {
-    local prompt="${1:-Продолжить?} [y/N]: " ans
-    read -r -p "$prompt" ans
-    [[ "$ans" =~ ^[yYдД] ]]
+    local prompt="${1:-Продолжить?} [y/N]: " ans=""
+    read -r -p "$prompt" ans || { echo; return 1; }
+    is_yes "$ans"
 }
 
 # Основной интерфейс по default route — токен ПОСЛЕ `dev`, а не пятое поле: `$5` верен
@@ -401,6 +439,27 @@ CONF_DIR=/etc/node-accelerator
 # curl|bash гоняет модули из временной папки → без персиста на ноде НЕ остаётся
 # стабильной команды для мониторинга/повторного прогона. Снимается rollback'ом.
 NA_LIB_DIR=/usr/local/lib/node-accelerator
+
+# reboot_pending — optimize поставил ядро/параметры загрузки, а перезагрузки с тех пор не
+# было. Маркер `reboot_needed=1` пишет optimize, и никто его не снимает: после ребута JSON
+# продолжал отдавать true (аудит флота: 9 нод уже на XanMod, а мониторинг ждал ребута).
+# Сверяем с ТЕКУЩЕЙ загрузкой: boot_id из маркера (v4.1.3+) или, для старых маркеров,
+# время загрузки (btime) против installed_at. Не разобрать — как раньше, верим маркеру.
+# Общий для diagnose и шапки меню install.sh.
+reboot_pending() {
+    local f="$STATE_DIR/optimize.installed" bid cur inst inst_s bt
+    [[ -f "$f" ]] || return 1
+    grep -q '^reboot_needed=1' "$f" 2>/dev/null || return 1
+    bid="$(awk -F= '/^boot_id=/{print $2; exit}' "$f" 2>/dev/null)"
+    cur="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+    if [[ -n "$bid" && -n "$cur" ]]; then [[ "$bid" == "$cur" ]]; return; fi
+    inst="$(awk -F= '/^installed_at=/{print $2; exit}' "$f" 2>/dev/null)"
+    [[ -n "$inst" ]] || return 0   # `date -d ""` = сегодняшняя полночь — не дата установки
+    inst_s="$(date -d "$inst" +%s 2>/dev/null)" || return 0
+    bt="$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null)"
+    [[ "$inst_s" =~ ^[0-9]+$ && "$bt" =~ ^[0-9]+$ ]] || return 0
+    (( bt < inst_s ))
+}
 
 # ─── Персист конфига ноды ─────────────────────────────────────────────────────
 # Зачем: тулкит параметризуется через ENV. Без персиста ре-ран модуля БЕЗ ENV

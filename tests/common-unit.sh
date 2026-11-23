@@ -208,6 +208,26 @@ ANC
 check "IP и порт сессии найдены у предка" "198.51.100.77 2200" "$("$WBASH" "$T/ancestor.sh" 2>&1)"
 check "без SSH_CONNECTION нигде — пусто, без ошибок" "" "$(env -u SSH_CONNECTION "$WBASH" -c ". '$PCOPY'; ssh_client_ip" 2>&1)"
 
+NA_V="$(run 'echo "$NA_VERSION"')"
+echo "== 10. подтверждения: «д/Д» в любой локали, «нет» — не «да» (v4.3) =="
+# В C-локали `[[ $a =~ ^[yYдД] ]]` — набор байтов: «д» кладёт в него 0xD0, с которого
+# начинается почти вся кириллица, и «нет»/«н» (клавиша Y в русской раскладке) были «да».
+for a in y Y yes д Д да; do
+    check "LC_ALL=C: «$a» — да"  yes "$(LC_ALL=C run "is_yes '$a' && echo yes || echo no")"
+done
+for a in н нет n N т "" " y"; do
+    check "LC_ALL=C: «$a» — нет" no  "$(LC_ALL=C run "is_yes '$a' && echo yes || echo no")"
+done
+check "UTF-8: «нет» — нет" no "$(LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 run "is_yes 'нет' && echo yes || echo no")"
+check "confirm: «нет» в C-локали — отказ"  no  "$(printf 'нет\n' | LC_ALL=C run 'confirm "?" && echo yes || echo no' | tail -1)"
+check "confirm: EOF — отказ, а не падение" no  "$(LC_ALL=C run 'set -e; confirm "?" < /dev/null && echo yes || echo no' | tail -1)"
+
+echo "== 11. цвет и шапка модуля не в терминал (v4.3) =="
+check "не терминал: коды цвета пустые" "[][][]" "$(TERM=xterm run 'printf "[%s]" "$RED" "$BOLD" "$NC"')"
+check "ok/warn в пайп — без ESC" "" "$(TERM=xterm run 'ok x; warn y' | tr -cd '\033')"
+check "na_banner в пайп: одна строка без ESC и без clear" "🩺  node-accelerator ${NA_V} — диагностика ноды" \
+      "$(TERM=xterm run 'na_banner 🩺 "диагностика ноды"')"
+
 echo
 echo "итого: ok=$PASS fail=$FAIL"
 [[ "$FAIL" -eq 0 ]]
