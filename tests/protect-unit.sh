@@ -514,6 +514,8 @@ echo "== v4.3: списки портов и лок в фоновом сейфт�
 sed -n '/^_norm_port_list() {/,/^}/p' "$PROTECT" > "$T/normports.sh"
 np() { "$WBASH" -c "set -euo pipefail; . '$T/normports.sh'; _norm_port_list \"\$1\"" _ "$1" 2>&1; }
 check "«443, 8443» → 443,8443"            "443,8443"  "$(np '443, 8443')"
+check "«443 80» → 443,80 (пробел — разделитель, а не склейка в 44380)" "443,80" "$(np '443 80')"
+check "«22<TAB>80» → 22,80"                "22,80"     "$(np $'22\t80')"
 check "«,22,,2222,» → 22,2222"            "22,2222"   "$(np ',22,,2222,')"
 check "« 22 » → 22"                        "22"        "$(np ' 22 ')"
 check "none/auto не трогаются"             "none auto" "$(np none) $(np auto)"
