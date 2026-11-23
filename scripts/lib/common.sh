@@ -70,6 +70,20 @@ status_line() {
 is_tty()   { [[ -t 1 ]]; }
 tty_tput() { if is_tty; then tput "$@" 2>/dev/null || true; fi; return 0; }
 
+# na_clear — «чистый экран» без потери истории: прежнее содержимое прокручивается вверх, в
+# историю терминала, а не стирается. `clear`/`tput clear` (ncurses ≥ 6.1) шлют ещё ESC[3J и
+# стирают прокрутку целиком — вывод модуля пропадал при возврате в меню; без описания
+# терминала на сервере (TERM=xterm-kitty/ghostty без ncurses-term) tput не делал ничего, и
+# копии меню копились одна под другой. Только в терминал; высота — с управляющего терминала.
+na_clear() {
+    is_tty && [[ "${TERM:-dumb}" != dumb ]] || return 0
+    local rows
+    rows="$(stty size </dev/tty 2>/dev/null || true)"; rows="${rows%% *}"
+    [[ "$rows" =~ ^[0-9]+$ && "$rows" -gt 0 ]] || rows=50
+    printf '%*s' "$rows" '' | tr ' ' '\n'
+    printf '\033[H'
+}
+
 # na_banner <эмодзи> <что за модуль> — шапка отчёта модуля. Экран чистится и рамка
 # рисуется только в терминале: голый `clear` пишет ESC[3J ESC[H ESC[2J и в файл, поэтому
 # `na-diagnose > report.txt` начинался с мусора. Правую границу ставит CHA (ESC[<n>G —
@@ -83,7 +97,7 @@ na_banner() {
     fi
     # NA_NO_CLEAR=1 — модуль в цепочке (install.sh all): экран не чистим, чтобы отчёт не
     # стирал вывод предыдущих модулей
-    [[ "${NA_NO_CLEAR:-0}" == 1 ]] || tty_tput clear
+    [[ "${NA_NO_CLEAR:-0}" == 1 ]] || na_clear
     # ширина: ${#t} — символы в UTF-8-локали (в C — байты, рамка выйдет шире, но ровной)
     w=$(( ${#t} + 10 )); (( w > 76 )) && w=76
     local line; printf -v line '%*s' $(( w - 2 )) ''; line="${line// /─}"

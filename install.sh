@@ -208,16 +208,19 @@ run_all() { run_optimize; run_protect; NA_NO_CLEAR=1 bash "$SCRIPTS/diagnose.sh"
 # получал EOF, и под set -e меню закрывалось сразу после рамки (до v4.3). Модули из меню
 # тоже получают терминал на stdin: protect спрашивает режим, порты и «Соединение работает?»
 # только при -t 0 — иначе из меню под curl|bash молча применились бы дефолты.
-# NA_TTY — откуда читать меню, когда stdin не терминал (по умолчанию /dev/tty).
+# Запуск из файла со stdin-пайпом (`printf '3\n' | bash install.sh`) читает пайп, как раньше:
+# это ввод оператора, а не сам скрипт. NA_TTY — откуда читать меню вместо stdin (по умолчанию
+# /dev/tty при curl|bash); заданный явно — главнее всего.
+NA_TTY_SET="${NA_TTY+x}"
 NA_TTY="${NA_TTY:-/dev/tty}"
 NA_FW=/usr/local/sbin/na-fw
 NA_FW_STATUS=/usr/local/sbin/na-fw-status
 NA_FW_TOP=/usr/local/sbin/na-fw-top-talkers
 M_IN=""; M_PROMPT=0; MENU_NOTE=""; REPLY=""
-M_ST=(); M_ADDRS=()
+M_ST=(); M_ADDRS=(); M_WRAP=()
 
 menu_open_input() {
-    if [[ -t 0 ]]; then M_IN=0; return 0; fi
+    if [[ -z "$NA_TTY_SET" ]] && [[ -t 0 || -n "$NA_SELF" ]]; then M_IN=0; return 0; fi
     { exec {M_IN}<"$NA_TTY"; } 2>/dev/null && return 0
     M_IN=""; return 1
 }
@@ -247,7 +250,7 @@ menu_yes() { menu_ask " $1 [y/N] › " && is_yes "$REPLY"; }
 menu_exec() {
     local head="$1" rc t0=$SECONDS
     shift
-    tty_tput clear
+    na_clear
     printf '\n %s%s%s\n\n' "$M_BOLD" "$head" "$M_R"
     set +e
     ( [[ "$M_IN" == 0 ]] || exec {M_IN}<&-; set -e; "$@" ) <&"$M_IN"
@@ -271,6 +274,13 @@ menu_done() {
         130) printf ' %s▲%s Прервано (Ctrl+C) через %s\n' "$M_WARN" "$M_R" "$d" ;;
         *)   printf ' %s✘%s Ошибка (код %s) через %s — подробности выше\n' "$M_FAIL" "$M_R" "$1" "$d" ;;
     esac
+    # набранное во время работы модуля (Enter «на всякий случай») — не ответ на эту паузу:
+    # иначе меню сразу перерисовывалось, и итог с хвостом вывода модуля уходили с экрана
+    if [[ -t "$M_IN" ]]; then
+        local _junk
+        # shellcheck disable=SC2034  # прочитанное выбрасываем
+        while read -r -t 0 -u "$M_IN" 2>/dev/null; do IFS= read -r -t 1 -u "$M_IN" _junk || break; done
+    fi
     menu_ask " ${M_DIM}Enter — в меню · 0 — выход${M_R} › " || exit 0
     case "$REPLY" in 0|q|Q) exit 0 ;; esac
     return 0
@@ -284,10 +294,9 @@ menu_done() {
 # строке с эмодзи. Уже 80 колонок (SSH с телефона) — без рамки и описаний; не терминал —
 # без цвета и escape-кодов вообще.
 menu_style() {
-    local cols s='ё'
+    local cols
     M_R='' M_BOLD='' M_DIM='' M_FR='' M_NUM='' M_OK='' M_WARN='' M_FAIL=''
-    M_CHA=0 M_BOX=0 M_W=76 M_TXT=59 M_UTF8=0
-    if (( ${#s} == 1 )); then M_UTF8=1; fi
+    M_CHA=0 M_BOX=0 M_W=76 M_TXT=59
     is_tty && [[ "${TERM:-dumb}" != dumb ]] || return 0
     M_CHA=1
     if [[ -z "${NO_COLOR:-}" ]]; then
@@ -376,17 +385,36 @@ _m_clip() {
     (( ${#s} <= $2 )) || s="${s:0:$(( $2 > 1 ? $2 - 1 : 1 ))}~"
     printf '%s' "$s"
 }
-# _m_fit <текст> <колонок> — обрезка строки состояния по символам (в UTF-8-локали)
-_m_fit() {
-    local t="$1"
-    if (( M_UTF8 && ${#t} > $2 )); then t="${t:0:$(( $2 - 1 ))}…"; fi
-    printf '%s' "$t"
+# _m_wrap <текст> <ширина> — строки не длиннее ширины, по словам, в массив M_WRAP. Перенос,
+# а не обрезка: в подсказках вся соль в хвосте (команда, путь). Слова — через read -a, без
+# раскрытия глобов (`/boot/initrd.img-*` в причине из optimize остаётся текстом). В C-локали
+# ${#} — байты: строки выходят короче, но рамку не пробивают.
+_m_wrap() {
+    local -a w
+    local line="" x
+    M_WRAP=()
+    read -r -a w <<<"$1"
+    for x in "${w[@]}"; do
+        while (( ${#x} > $2 )); do
+            [[ -n "$line" ]] && { M_WRAP+=("$line"); line=""; }
+            M_WRAP+=("${x:0:$2}"); x="${x:$2}"
+        done
+        if [[ -z "$line" ]]; then line="$x"
+        elif (( ${#line} + 1 + ${#x} <= $2 )); then line+=" $x"
+        else M_WRAP+=("$line"); line="$x"; fi
+    done
+    M_WRAP+=("$line")
+    return 0
 }
-_m_pid_alive() {
+# _m_safety_pid <pid-файл> — фолбэк-таймер сейфти (нет systemd-run) ещё жив. Мало kill -0:
+# файл в /var/lib переживает ребут, и его номер достаётся постороннему процессу — шапка
+# врала бы «взведён». Сверяем, что это всё ещё процесс сейфти.
+_m_safety_pid() {
     local p
     [[ -f "$1" && ! -L "$1" ]] || return 1
     p="$(cat "$1" 2>/dev/null || true)"
-    [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null
+    [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null || return 1
+    [[ "$(ps -o args= -p "$p" 2>/dev/null || true)" == *na-fw-safety-revert* ]]
 }
 
 # menu_status — строки «ГЛИФ|метка|текст» в M_ST
@@ -413,8 +441,13 @@ menu_status() {
         ver="$(_m_clip "$(_m_kv na_version "$f")" 10)"
         t="$(_m_date "$(_m_kv installed_at "$f")")"
         t="применён${t:+ $t}${ver:+ · v$ver}"
-        if [[ -n "$ver" && "$ver" != "${NA_VERSION:-}" ]]; then t+=" · ре-ран → v${NA_VERSION:-?}"; fi
-        M_ST+=("OK|Тюнинг|$t")
+        g=OK
+        if [[ -n "$ver" && "$ver" != "${NA_VERSION:-}" ]]; then
+            # маркер новее запущенного (старый NA_REF): «ре-ран» откатил бы ноду на старую версию
+            if ver_ge "$ver" "${NA_VERSION:-0}"; then g=WARN; t+=" · запущен v${NA_VERSION:-?} — старее"
+            else t+=" · ре-ран → v${NA_VERSION:-?}"; fi
+        fi
+        M_ST+=("$g|Тюнинг|$t")
     else
         M_ST+=("NONE|Тюнинг|не применялся — пункт 1")
     fi
@@ -435,7 +468,12 @@ menu_status() {
         t="$(_m_clip "$(_m_kv fw_mode "$f")" 8)"
         t="${t:-strict}"
         if [[ "$t" == skip ]]; then
-            g=NONE; t="FW_MODE=skip — файрвол не ставился"
+            # strict→skip с ответом «оставить»: старая na_filter грузится и режет порты
+            if nft -t list table inet na_filter >/dev/null 2>&1; then
+                g=WARN; t="FW_MODE=skip, но na_filter прошлой установки загружена и режет порты — снять: пункт 5"
+            else
+                g=NONE; t="FW_MODE=skip — файрвол не ставился"
+            fi
         elif nft -t list table inet na_filter >/dev/null 2>&1; then
             g=OK; t+=" · na_filter работает"
         else
@@ -454,10 +492,12 @@ menu_status() {
             M_ST+=("||сработал сейфти-таймер: доступ не подтвердили — пункт 2")
         fi
         if (( ! cs )); then M_ST+=("WARN||CrowdSec не запущен: systemctl status crowdsec"); fi
-        if systemctl is-active --quiet na-fw-safety.timer 2>/dev/null \
-           || _m_pid_alive "$STATE_DIR/na-fw-safety.pid"; then
+        if systemctl is-active --quiet na-fw-safety.timer 2>/dev/null; then
             M_ST+=("WARN||сейфти-таймер взведён — na_filter снимется сама")
             M_ST+=("||подтвердить доступ: systemctl stop na-fw-safety.timer")
+        elif _m_safety_pid "$STATE_DIR/na-fw-safety.pid"; then
+            M_ST+=("WARN||сейфти-таймер взведён — na_filter снимется сама")
+            M_ST+=("||подтвердить доступ: kill \$(cat $STATE_DIR/na-fw-safety.pid)")
         fi
     else
         M_ST+=("NONE|Защита|не установлена — пункт 2")
@@ -473,7 +513,10 @@ _m_status_row() {   # «ГЛИФ|метка|текст»
         FAIL) gl="${M_FAIL}✘${M_R}" ;;
         NONE) gl="${M_DIM}•${M_R}" ;;
     esac
-    _m_row 2 "${lab:+$M_DIM$lab$M_R}" 12 "$gl" 14 "$(_m_fit "$t" "$M_TXT")"
+    local i
+    _m_wrap "$t" "$M_TXT"
+    _m_row 2 "${lab:+$M_DIM$lab$M_R}" 12 "$gl" 14 "${M_WRAP[0]}"
+    for (( i = 1; i < ${#M_WRAP[@]}; i++ )); do _m_row 14 "${M_WRAP[i]}"; done
 }
 
 # ─── Экраны ──────────────────────────────────────────────────────────────────
@@ -482,7 +525,7 @@ menu_render() {
     menu_style
     menu_status
     [[ -n "${NA_TMPD:-}" ]] && src="$(_m_clip "$NA_REF" 24)"
-    tty_tput clear
+    na_clear
     _m_top "⚡ node-accelerator v${NA_VERSION:-?}" "$src"
     if (( M_BOX )); then
         _m_row 2 "${M_DIM}Оптимизация · Защита · Диагностика VPN-ноды${M_R}"
@@ -505,7 +548,7 @@ menu_render() {
 
 menu_rollback() {
     menu_style
-    tty_tput clear
+    na_clear
     _m_top "⏪ Откат"
     _m_row 2 "${M_NUM}1${M_R}" 6 "⚡ Тюнинг" 20 "${M_DIM}sysctl, RPS, THP — сразу, лимиты — после ребута${M_R}"
     _m_row 2 "${M_NUM}2${M_R}" 6 "🛡 Защиту" 20 "${M_DIM}файрвол na_filter, таймеры; CrowdSec остаётся${M_R}"
@@ -538,7 +581,7 @@ _m_addrs() {
 menu_report() {
     while :; do
         menu_style
-        tty_tput clear
+        na_clear
         _m_top "🔥 Атаки — форензика (read-only)"
         _m_sub 1 "Отчёт за 24 часа"         "na-report"
         _m_sub 2 "Отчёт за другое окно"     "na-report --hours N"
@@ -576,7 +619,7 @@ menu_firewall() {
     fi
     while :; do
         menu_style
-        tty_tput clear
+        na_clear
         _m_top "🧱 Файрвол"
         _m_sub 1 "Статус и счётчики дропов"  "na-fw-status"
         _m_sub 2 "Whitelist — показать"      "na-fw allow list"
@@ -609,7 +652,7 @@ menu_firewall() {
 
 menu_help() {
     menu_style
-    tty_tput clear
+    na_clear
     _m_top "❓ Справка"
     usage
     cat <<'H'

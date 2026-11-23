@@ -48,14 +48,17 @@ STATE_DIR="$SB/state"; CONF_DIR="$SB/conf"; NA_LIB_DIR="$SB/lib"
 STUB
 echo "boot-now" > "$SB/boot_id"
 # Модуль-стаб: строка «MODULE:<имя> args=[…] stdin=<что прочитал> no_clear=…» в журнал;
-# код выхода — STUB_RC_<имя>.
+# код выхода — STUB_RC_<имя>; STUB_SLEEP — «долгий» модуль (для Ctrl+C и ввода наперёд).
+# LEAK:<fd> — модулю достался чужой дескриптор (ввод меню открывается на fd ≥ 10).
 for m in optimize protect diagnose na-report rollback; do
     v="STUB_RC_${m//-/_}"
     cat > "$SB/scripts/$m.sh" <<S
 #!/usr/bin/env bash
 a=""; [[ -n "\${STUB_ASK:-}" ]] && { IFS= read -r a || true; }
+for fd in 10 11 12 13 14 15; do [[ -e /dev/fd/\$fd ]] && echo "LEAK:\$fd" >> "$SB/calls.log"; done
 echo "MODULE:$m args=[\$*] stdin=[\$a] no_clear=[\${NA_NO_CLEAR:-}]" >> "$SB/calls.log"
 echo "MODULE:$m"
+[[ -n "\${STUB_SLEEP:-}" ]] && sleep "\$STUB_SLEEP"
 exit \${$v:-0}
 S
 done
@@ -98,7 +101,7 @@ export PATH="$SB/bin:$BDIR:$PATH"
 # menu <файл-вывода> <ответы…> — меню из файла, ответы по строке; вывод не терминал
 menu() {
     local out="$1"; shift
-    printf '%s\n' "$@" > "$T/answers"
+    if (( $# )); then printf '%s\n' "$@" > "$T/answers"; else : > "$T/answers"; fi
     : > "$SB/calls.log"
     local rc=0
     NA_TTY="$T/answers" TERM=xterm "$WBASH" "$SB/install.sh" < /dev/null > "$out" 2>&1 || rc=$?
@@ -126,6 +129,14 @@ STUB_RC_protect=3 menu "$T/o2b" 2 "" 0
 has "код ошибки модуля назван" "Ошибка (код 3)" "$T/o2b"
 [[ ! -e "$SB/sbin/na-diagnose" ]] && ok_ "упавший protect не доходит до persist_toolkit" || fail_ "persist_toolkit после упавшего protect"
 [[ "$(cat "$T/o2b.rc")" == 0 ]] && ok_ "меню пережило ошибку модуля и вышло по 0" || fail_ "код $(cat "$T/o2b.rc")"
+STUB_ASK=1 menu "$T/o2c" 1 "x" "" 0
+hasnt "дескриптор ввода меню модулю не достаётся" "LEAK:" "$SB/calls.log"
+# запуск из файла, ответы пайпом в stdin, NA_TTY не задан — читается пайп, как до v4.3
+printf '%s\n' 3 "" 0 > "$T/answers"; : > "$SB/calls.log"; rc=0
+TERM=xterm "$WBASH" "$SB/install.sh" < "$T/answers" > "$T/o2d" 2>&1 || rc=$?
+{ [[ "$rc" == 0 ]] && grep -q 'MODULE:diagnose' "$SB/calls.log"; } \
+    && ok_ "из файла: ответы из stdin-пайпа (printf '3\\n' | bash install.sh) — как раньше" \
+    || fail_ "из файла с пайпом: rc=$rc, $(calls)"
 
 echo "== 3. откат: подтверждение, «н» — нет в любой локали =="
 LC_ALL=C menu "$T/o3" 5 2 "н" 0
@@ -174,6 +185,46 @@ menu "$T/o6r" 0
 has "ядро не готово к загрузке — ✘ «НЕ перезагружайся», а не «нужна перезагрузка»" "НЕ перезагружайся" "$T/o6r"
 has "…с причиной из optimize" "нет /boot/initrd.img-6.18.64-x64v3-xanmod1" "$T/o6r"
 hasnt "…и без призыва к перезагрузке" "нужна перезагрузка" "$T/o6r"
+# длинная причина переносится, а не обрезается; глоб в ней не раскрывается
+sed -i.bak '/^reboot_risk=/d' "$SB/state/optimize.installed" && rm -f "$SB/state/optimize.installed.bak"
+printf 'reboot_risk=версия ядра пакета linux-xanmod-x64v3 не определена — initrd и драйвер NIC не проверены (ls /boot/initrd.img-*xanmod* /lib/modules)\n' >> "$SB/state/optimize.installed"
+touch "$SB/boot-glob-bait"
+( cd "$SB" && menu "$T/o6w" 0 )
+has "длинная причина: начало на месте" "версия ядра пакета linux-xanmod-x64v3" "$T/o6w"
+has "…и хвост-подсказка не обрезан, глоб не раскрыт" "/boot/initrd.img-*xanmod* /lib/modules)" "$T/o6w"
+hasnt "…и в шапку не попало имя файла из каталога (глоб)" "boot-glob-bait" "$T/o6w"
+if command -v python3 >/dev/null 2>&1; then
+    # длина в СИМВОЛАХ (awk на macOS/mawk считает байты); линейки рамки не в счёт
+    if python3 -I -c 'import sys; sys.exit(any(len(l.rstrip("\n")) > 80 and "──" not in l for l in open(sys.argv[1], encoding="utf-8")))' "$T/o6w"
+    then ok_ "строки шапки перенесены (не длиннее 80 символов)"; else fail_ "строка шапки длиннее 80 символов"; fi
+fi
+sed -i.bak '/^reboot_risk=/d' "$SB/state/optimize.installed" && rm -f "$SB/state/optimize.installed.bak"
+# маркер новее запущенного тулкита — не «ре-ран», а предупреждение
+sed -i.bak 's/^na_version=4.2$/na_version=9.9/' "$SB/state/optimize.installed" && rm -f "$SB/state/optimize.installed.bak"
+menu "$T/o6v" 0
+has "маркер новее: запущен старый тулкит" "запущен v" "$T/o6v"
+hasnt "маркер новее: без «ре-ран →» (откатил бы версию)" "ре-ран →" "$T/o6v"
+sed -i.bak 's/^na_version=9.9$/na_version=4.2/' "$SB/state/optimize.installed" && rm -f "$SB/state/optimize.installed.bak"
+# фолбэк-таймер сейфти (pid-файл): наш процесс — «взведён» с подсказкой kill; чужой PID — нет
+( exec -a "sh -c sleep 30; /usr/local/sbin/na-fw-safety-revert" sleep 30 ) & sp=$!
+echo "$sp" > "$SB/state/na-fw-safety.pid"
+menu "$T/o6p" 0
+has "pid-файл сейфти с живым процессом сейфти — «взведён»" "сейфти-таймер взведён" "$T/o6p"
+has "…и подсказка для nohup-режима — kill, а не systemctl" "kill \$(cat" "$T/o6p"
+kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
+sleep 30 & sp=$!
+echo "$sp" > "$SB/state/na-fw-safety.pid"
+menu "$T/o6q" 0
+hasnt "PID из pid-файла занят посторонним процессом (после ребута) — не «взведён»" "сейфти-таймер взведён" "$T/o6q"
+kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
+rm -f "$SB/state/na-fw-safety.pid"
+# FW_MODE=skip, а таблица прошлой установки загружена
+sed -i.bak 's/^fw_mode=strict$/fw_mode=skip/' "$SB/state/protect.installed" && rm -f "$SB/state/protect.installed.bak"
+menu "$T/o6s" 0
+has "skip + загруженная na_filter прошлой установки — предупреждение" "na_filter прошлой установки загружена" "$T/o6s"
+STUB_NFT=0 menu "$T/o6t" 0
+has "skip без таблицы — «файрвол не ставился»" "файрвол не ставился" "$T/o6t"
+sed -i.bak 's/^fw_mode=skip$/fw_mode=strict/' "$SB/state/protect.installed" && rm -f "$SB/state/protect.installed.bak"
 echo "boot-later" > "$SB/boot_id"
 sleep 1; date +%s > "$SB/state/safety-fired.last"
 STUB_NFT=0 STUB_CC=cubic menu "$T/o6c" 0
@@ -186,11 +237,13 @@ rm -f "$SB/state/"*
 
 echo "== 7. curl | sudo bash: stdin — пайп со скриптом, ввод меню — терминал =="
 printf '%s\n' 3 "" 0 > "$T/answers"; : > "$SB/calls.log"
-rc=0; ( cd "$T" && NA_TTY="$T/answers" TERM=xterm bash -s < "$SB/install.sh" ) > "$T/o7" 2>&1 || rc=$?
+rc=0; ( cd "$T" && cat "$SB/install.sh" | NA_REF=menu-unit-ref NA_TTY="$T/answers" TERM=xterm bash -s ) > "$T/o7" 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok_ "меню из пайпа отработало и вышло по 0" || fail_ "код $rc: $(tail -3 "$T/o7")"
 grep -q 'MODULE:diagnose' "$SB/calls.log" && ok_ "выбор «3» прочитан с терминала — диагностика запущена" || fail_ "диагностика не запущена"
-has "источник модулей в шапке (NA_REF)" "main" "$T/o7"
-rc=0; ( cd "$T" && NA_TTY=/nonexistent/tty bash -s < "$SB/install.sh" ) > "$T/o7b" 2>&1 || rc=$?
+hasnt "…и модулю не достался дескриптор ввода меню" "LEAK:" "$SB/calls.log"
+if grep -v 'Скачиваю' "$T/o7" | grep -qx ' menu-unit-ref'; then ok_ "источник модулей (NA_REF) в шапке"
+else fail_ "NA_REF не показан в шапке"; fi
+rc=0; ( cd "$T" && cat "$SB/install.sh" | NA_TTY=/nonexistent/tty bash -s ) > "$T/o7b" 2>&1 || rc=$?
 [[ "$rc" == 2 ]] && ok_ "без терминала — код 2, а не тихий выход" || fail_ "без терминала: код $rc"
 has "без терминала — подсказка про команды" "Меню нужен терминал" "$T/o7b"
 
@@ -208,40 +261,69 @@ hasnt "all: после упавшего optimize protect не запускает
 "$WBASH" "$SB/install.sh" report --hours 6 --json > "$T/o8c" 2>&1 || true
 grep -q 'MODULE:na-report args=\[--hours 6 --json\]' "$SB/calls.log" && ok_ "report передаёт аргументы na-report" || fail_ "report: $(calls)"
 
-echo "== 9. рамка на псевдотерминале (python3) =="
+echo "== 9. на псевдотерминале (python3): рамка, Ctrl+C, ввод наперёд, история =="
 if command -v python3 >/dev/null 2>&1; then
+    # na_menu_pty.py <колонок> <шаги JSON> <команда…> — терминал заданной ширины; шаги
+    # [[ждать_строку|null, отправить|null, пауза_с], …]; вывод — в stdout, код — в «[exit=N]»
     cat > "$T/na_menu_pty.py" <<'PY'
-import os, pty, select, sys, time, fcntl, termios, struct
-cols = int(sys.argv[1]); argv = sys.argv[2:]
+import os, pty, select, sys, time, fcntl, termios, struct, json
+cols = int(sys.argv[1]); steps = json.loads(sys.argv[2]); argv = sys.argv[3:]
 pid, fd = pty.fork()
 if pid == 0:
     fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 40, cols, 0, 0))
     os.execvp(argv[0], argv)
-out = b''; sent = False; t0 = time.time()
-while time.time() - t0 < 10:
-    r, _, _ = select.select([fd], [], [], 0.1)
-    if r:
-        try: d = os.read(fd, 65536)
-        except OSError: break
-        if not d: break
-        out += d
-    if not sent and b'\xe2\x80\xba ' in out:      # приглашение «Выбор › »
-        os.write(fd, b'0\r'); sent = True
-sys.stdout.buffer.write(out)
+out = b''; pos = 0; alive = True; t0 = time.time()
+def pump(sec):
+    global out, alive
+    end = time.time() + sec
+    while alive and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: alive = False; break
+            if not d: alive = False; break
+            out += d
+for want, send, pause in steps:
+    if want:
+        w = want.encode()
+        while alive and w not in out[pos:] and time.time() - t0 < 20: pump(0.1)
+        i = out.find(w, pos); pos = i + len(w) if i >= 0 else pos
+    if pause: pump(pause)
+    if send and alive: os.write(fd, send.encode())
+while alive and time.time() - t0 < 25: pump(0.2)
+try: _, st = os.waitpid(pid, 0); code = os.waitstatus_to_exitcode(st)
+except ChildProcessError: code = -1
+sys.stdout.buffer.write(out + ('\n[exit=%d]\n' % code).encode())
 PY
-    TERM=xterm python3 -I "$T/na_menu_pty.py" 100 "$WBASH" "$SB/install.sh" > "$T/o9" 2>&1 || true
+    P='› '
+    pty_run() { local cols="$1" steps="$2" out="$3"; shift 3; TERM=xterm python3 -I "$T/na_menu_pty.py" "$cols" "$steps" "$@" > "$out" 2>&1 || true; }
+    pty_run 100 "[[\"$P\",\"0\r\",0]]" "$T/o9" "$WBASH" "$SB/install.sh"
     n_box="$(grep -c '│' "$T/o9" || true)"
     n_cha="$(grep -c $'\033\\[77G.*│' "$T/o9" || true)"
     if [[ "$n_box" -gt 10 && "$n_box" == "$n_cha" ]]; then
         ok_ "100 колонок: правая граница каждой строки поставлена CHA в колонку 77 ($n_box строк)"
     else fail_ "100 колонок: строк с │ — $n_box, из них с ESC[77G — $n_cha"; head -c 400 "$T/o9" | od -c | head -8; fi
-    TERM=xterm python3 -I "$T/na_menu_pty.py" 56 "$WBASH" "$SB/install.sh" > "$T/o9b" 2>&1 || true
+    hasnt "экран чистится без ESC[3J — история прокрутки цела" $'\033[3J' "$T/o9"
+    pty_run 56 "[[\"$P\",\"0\r\",0]]" "$T/o9b" "$WBASH" "$SB/install.sh"
     if grep -q 'Оптимизатор' "$T/o9b" && ! grep -q '│' "$T/o9b"; then ok_ "56 колонок: без рамки"
     else fail_ "56 колонок: рамка или пустой экран"; fi
-    NO_COLOR=1 TERM=xterm python3 -I "$T/na_menu_pty.py" 100 "$WBASH" "$SB/install.sh" > "$T/o9c" 2>&1 || true
+    NO_COLOR=1 pty_run 100 "[[\"$P\",\"0\r\",0]]" "$T/o9c" "$WBASH" "$SB/install.sh"
     if grep -qE $'\033\\[[0-9;]*m' "$T/o9c"; then fail_ "NO_COLOR: в выводе коды цвета (SGR)"
     elif grep -q '│' "$T/o9c"; then ok_ "NO_COLOR: рамка есть, кодов цвета нет"
     else fail_ "NO_COLOR: пустой экран"; fi
+    # Ctrl+C на приглашении — выход 130 (сам read на трапе не прерывается — выходим из трапа)
+    pty_run 100 "[[\"$P\",\"\u0003\",0]]" "$T/o9d" "$WBASH" "$SB/install.sh"
+    has "Ctrl+C на приглашении — выход с кодом 130" "[exit=130]" "$T/o9d"
+    # Ctrl+C во время модуля — модуль прерван, меню живо
+    STUB_SLEEP=5 pty_run 100 "[[\"$P\",\"1\r\",0],[\"MODULE:optimize\",\"\u0003\",0.3],[\"Enter — в меню\",\"\r\",0],[\"$P\",\"0\r\",0]]" "$T/o9e" "$WBASH" "$SB/install.sh"
+    has "Ctrl+C в модуле — «Прервано»" "Прервано (Ctrl+C)" "$T/o9e"
+    has "…меню живо и выходит по 0" "[exit=0]" "$T/o9e"
+    # Enter, нажатый во время работы модуля, не съедает паузу: итог остаётся на экране, пока
+    # не нажмёшь Enter ещё раз (иначе «Выбор ›» появился бы второй раз до нашего «0»)
+    STUB_SLEEP=1 pty_run 100 "[[\"$P\",\"1\r\",0],[\"MODULE:optimize\",\"\r\",0],[\"Enter — в меню\",null,1.5],[null,\"0\r\",0]]" "$T/o9f" "$WBASH" "$SB/install.sh"
+    n_prompt="$(grep -o 'Выбор ›' "$T/o9f" | wc -l | tr -d ' ')"
+    [[ "$n_prompt" == 1 ]] && ok_ "ввод наперёд во время модуля сброшен — пауза ждёт" \
+        || fail_ "ввод наперёд съел паузу: «Выбор ›» показан $n_prompt раз(а)"
 else
     echo "  skip (нет python3)"
 fi
