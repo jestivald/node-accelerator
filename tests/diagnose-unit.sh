@@ -32,7 +32,8 @@
 #       серт и серты Caddy/nginx; docker без max-size; OOM за сутки по всем загрузкам;
 #       RPS при RX-очередей ≥ ядер.
 #   v4.3 (охота на баги diagnose): «журнал ≈ аптайму» — в обе стороны (после ребута ▲ про
-#       глубину журнала пропадал).
+#       глубину журнала пропадал); серты встроенного CA Caddy (`tls internal`, 12 ч) — не
+#       вечный ✘ «renewal сломан».
 #
 # Не требует root/сети/nft/docker. Запуск: bash tests/diagnose-unit.sh
 set -euo pipefail
@@ -441,6 +442,8 @@ case "$last" in
   *retired*) echo "notAfter=RETIRED" ;;
   *expired*) echo "notAfter=EXPIRED" ;;
   *nginx*)   echo "notAfter=NGINX" ;;
+  # встроенный CA Caddy (tls internal): серт живёт 12 ч
+  */certificates/local/*) echo "notAfter=INTERNAL" ;;
   *caddy*)   echo "notAfter=CADDY" ;;
   *)         echo "notAfter=GOOD" ;;
 esac
@@ -457,6 +460,7 @@ if [ "$1" = "-d" ]; then
       *EXPIRED*) echo $(( now - 10*86400 + 3600 )) ;;
       *NGINX*)   echo $(( now + 20*86400 + 3600 )) ;;
       *CADDY*)   echo $(( now + 15*86400 + 3600 )) ;;
+      *INTERNAL*) echo $(( now + 12*3600 )) ;;
       2026-09-01T00:00:00+00:00) echo 1788220800 ;;   # installed_at старого маркера optimize
       *) exit 1 ;;
     esac
@@ -1175,6 +1179,28 @@ grep_not "журнал 30ч при аптайме 2ч — не «≈ аптай�
 grep_ok  "…а ▲ «менее 48ч» на месте"                   "▲  журнал вмещает менее 48ч (самая старая запись 30ч назад)" "$T/o23.txt"
 JSTART="$JSTART_ORIG"; export JSTART
 printf '99999.00 88888.00\n' > "$T/proc/uptime"
+
+echo "== 24. серты встроенного CA Caddy (tls internal) — не «renewal сломан» (v4.3) =="
+# `tls internal`, сайты на localhost/IP: Caddy подписывает их своим CA, серт живёт 12 ч и
+# перевыпускается за треть срока — в хранилище он ВСЕГДА «истекает в ближайшие сутки».
+# До v4.3: под mount работающего контейнера Caddy — вечный ✘ и cert_min_days=0; у пакетного
+# Caddy без активного юнита — ▲ «брошенный».
+CADDY_L="$T/var/lib/docker/volumes/caddy_data/_data/caddy/certificates/local/localhost"
+CADDY_P="$T/var/lib/caddy/.local/share/caddy/certificates/local/10.0.0.5"
+mkdir -p "$CADDY_L" "$CADDY_P"
+printf 'x\n' > "$CADDY_L/localhost.crt"; printf 'x\n' > "$CADDY_P/10.0.0.5.crt"
+printf '%s\n' "$T/var/lib/docker/volumes/caddy_data/_data" > "$NFTD/docker-mounts"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o24.json" 2>/dev/null || true
+check "json: серты встроенного CA не в счёте (cert_min_days живого, stale=0)" "60 0" \
+      "$(jget "$T/o24.json" cert_min_days) $(jget "$T/o24.json" cert_stale_count)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o24.txt" 2>/dev/null || true
+grep_not "текст: нет ✘ «истекает в ближайшие сутки»"   "истекает в ближайшие сутки" "$T/o24.txt"
+grep_not "текст: нет ▲ «серт без обслуживающего сервиса»" "серт без обслуживающего сервиса" "$T/o24.txt"
+grep_ok  "текст: ближайший — живой серт"               "ближайший TLS-серт: 60 дн" "$T/o24.txt"
+# явно заданный путь (NA_CERT_PATHS) смотрится как есть — оператор сам попросил
+env TERM=dumb NA_CERT_PATHS="$CADDY_L/localhost.crt" "$WBASH" "$DIAG" --json > "$T/o24x.json" 2>/dev/null || true
+check "json: NA_CERT_PATHS на серт встроенного CA — учитывается (0 дн)" 0 "$(jget "$T/o24x.json" cert_min_days)"
+rm -rf "$T/var/lib/docker/volumes" "$T/var/lib/caddy" "$NFTD/docker-mounts"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"

@@ -683,6 +683,12 @@ cert_scan() {
         done
         [[ "$skip" == 1 ]] && continue
         cert_retired "$cf" && continue
+        # certificates/local/ в хранилище Caddy — серты ВСТРОЕННОГО CA (`tls internal`, сайты
+        # на localhost/IP): живут 12 ч и перевыпускаются самим Caddy за треть срока, то есть
+        # ВСЕГДА «истекают в ближайшие сутки». На панели с catch-all `tls internal` это был
+        # вечный ✘ «renewal сломан?» и cert_min_days=0 в мониторинге (без активного Caddy — ▲
+        # «брошенный»). Публичным TLS они не являются; явно заданный путь смотрим как есть.
+        [[ "$src" == g && "$cf" == */caddy/certificates/local/* ]] && continue
         out="$(openssl x509 -noout -enddate -subject -nameopt RFC2253 -in "$cf" 2>/dev/null)"
         cend="$(sed -n 's/^notAfter=//p' <<<"$out")"; [[ -n "$cend" ]] || continue
         cn="$(sed -nE 's/^subject=.*CN=([^,]+).*/\1/p' <<<"$out")"
