@@ -31,6 +31,12 @@
 #       порт xray в эфемерном диапазоне; обновление XanMod и reboot-required; просроченный
 #       серт и серты Caddy/nginx; docker без max-size; OOM за сутки по всем загрузкам;
 #       RPS при RX-очередей ≥ ядер.
+#   v4.3 (охота на баги diagnose): «журнал ≈ аптайму» — в обе стороны (после ребута ▲ про
+#       глубину журнала пропадал); серты встроенного CA Caddy (`tls internal`, 12 ч) — не
+#       вечный ✘ «renewal сломан»; слои whitelist сверяются покрытием, а не текстом (живой
+#       набор с auto-merge склеивает соседние адреса — это не дрейф); MSS-коллапс — только
+#       по полю mss:, а не rcvmss:/advmss:; маска RPS на >32 CPU (группы через запятую);
+#       --retrans не пишет временных файлов (единственная запись — diag-counters.last).
 #
 # Не требует root/сети/nft/docker. Запуск: bash tests/diagnose-unit.sh
 set -euo pipefail
@@ -439,6 +445,8 @@ case "$last" in
   *retired*) echo "notAfter=RETIRED" ;;
   *expired*) echo "notAfter=EXPIRED" ;;
   *nginx*)   echo "notAfter=NGINX" ;;
+  # встроенный CA Caddy (tls internal): серт живёт 12 ч
+  */certificates/local/*) echo "notAfter=INTERNAL" ;;
   *caddy*)   echo "notAfter=CADDY" ;;
   *)         echo "notAfter=GOOD" ;;
 esac
@@ -455,6 +463,7 @@ if [ "$1" = "-d" ]; then
       *EXPIRED*) echo $(( now - 10*86400 + 3600 )) ;;
       *NGINX*)   echo $(( now + 20*86400 + 3600 )) ;;
       *CADDY*)   echo $(( now + 15*86400 + 3600 )) ;;
+      *INTERNAL*) echo $(( now + 12*3600 )) ;;
       2026-09-01T00:00:00+00:00) echo 1788220800 ;;   # installed_at старого маркера optimize
       *) exit 1 ;;
     esac
@@ -1157,6 +1166,155 @@ i=k.index("dynset_no_timeout")
 print("ok" if k[i+1:]==new and k[0]=="kernel" else "keys after tail: %s" % k[i+1:])
 PYK
 )"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  v4.3 — ложные ✔/▲/✘, найденные охотой на баги diagnose
+# ════════════════════════════════════════════════════════════════════════════
+echo "== 23. журнал: «≈ аптайму» — только когда глубина ≈ аптайму в обе стороны (v4.3) =="
+# Нода перезагрузилась 2 ч назад, а самая старая запись журнала — 30 ч назад (прошлая загрузка
+# в нём есть): глубина < 48 ч — это вытеснение, а не «журнал держит только текущую загрузку».
+# До v4.3 «≈» проверялось в одну сторону: после ребута ▲ пропадал, а текст уверял, что
+# прошлых загрузок в журнале нет.
+printf '7200.00 88888.00\n' > "$T/proc/uptime"
+JSTART_ORIG="$JSTART"; JSTART=$(( $(/bin/date +%s) - 30*3600 )); export JSTART
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o23.txt" 2>/dev/null || true
+grep_not "журнал 30ч при аптайме 2ч — не «≈ аптайму»"  "≈ аптайму" "$T/o23.txt"
+grep_ok  "…а ▲ «менее 48ч» на месте"                   "▲  журнал вмещает менее 48ч (самая старая запись 30ч назад)" "$T/o23.txt"
+JSTART="$JSTART_ORIG"; export JSTART
+printf '99999.00 88888.00\n' > "$T/proc/uptime"
+
+echo "== 24. серты встроенного CA Caddy (tls internal) — не «renewal сломан» (v4.3) =="
+# `tls internal`, сайты на localhost/IP: Caddy подписывает их своим CA, серт живёт 12 ч и
+# перевыпускается за треть срока — в хранилище он ВСЕГДА «истекает в ближайшие сутки».
+# До v4.3: под mount работающего контейнера Caddy — вечный ✘ и cert_min_days=0; у пакетного
+# Caddy без активного юнита — ▲ «брошенный».
+CADDY_L="$T/var/lib/docker/volumes/caddy_data/_data/caddy/certificates/local/localhost"
+CADDY_P="$T/var/lib/caddy/.local/share/caddy/certificates/local/10.0.0.5"
+mkdir -p "$CADDY_L" "$CADDY_P"
+printf 'x\n' > "$CADDY_L/localhost.crt"; printf 'x\n' > "$CADDY_P/10.0.0.5.crt"
+printf '%s\n' "$T/var/lib/docker/volumes/caddy_data/_data" > "$NFTD/docker-mounts"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o24.json" 2>/dev/null || true
+check "json: серты встроенного CA не в счёте (cert_min_days живого, stale=0)" "60 0" \
+      "$(jget "$T/o24.json" cert_min_days) $(jget "$T/o24.json" cert_stale_count)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o24.txt" 2>/dev/null || true
+grep_not "текст: нет ✘ «истекает в ближайшие сутки»"   "истекает в ближайшие сутки" "$T/o24.txt"
+grep_not "текст: нет ▲ «серт без обслуживающего сервиса»" "серт без обслуживающего сервиса" "$T/o24.txt"
+grep_ok  "текст: ближайший — живой серт"               "ближайший TLS-серт: 60 дн" "$T/o24.txt"
+# явно заданный путь (NA_CERT_PATHS) смотрится как есть — оператор сам попросил
+env TERM=dumb NA_CERT_PATHS="$CADDY_L/localhost.crt" "$WBASH" "$DIAG" --json > "$T/o24x.json" 2>/dev/null || true
+check "json: NA_CERT_PATHS на серт встроенного CA — учитывается (0 дн)" 0 "$(jget "$T/o24x.json" cert_min_days)"
+rm -rf "$T/var/lib/docker/volumes" "$T/var/lib/caddy" "$NFTD/docker-mounts"
+
+echo "== 25. whitelist: живой набор с auto-merge сверяется покрытием, а не текстом (v4.3) =="
+# whitelist_v4/v6 объявлены с auto-merge: ядро склеивает соседние и вложенные элементы, и nft
+# печатает склейку префиксом (203.0.113.4 + .5 → 203.0.113.4/31, две /25 → /24, адрес внутри
+# CIDR пропадает) или диапазоном (три соседних → a-b). В na_filter.nft, protect.conf и allowlist
+# CrowdSec те же адреса записаны как задал оператор. До v4.3 сверка шла текстом (comm): на
+# здоровой ноде ▲ «пропадут при ребуте», ▲ «НЕ переживёт ре-ран», ▲ «не прикрыт в CrowdSec»
+# и whitelist_drift_conf/_crowdsec > 0 в мониторинге. Настоящий дрейф (SSH-IP прогона, его нет
+# в protect.conf) обязан остаться — и только он.
+cp "$T/etc/node-accelerator/protect.conf" "$T/p25.conf.orig"
+cp "$T/etc/node-accelerator/na_filter.nft" "$T/p25.nft.orig"
+cp "$NFTD/set-whitelist_v4" "$T/p25.wl4.orig"
+WL25="203.0.113.4,203.0.113.5,192.0.2.0/25,192.0.2.128/25,192.0.2.77,198.18.0.1,198.18.0.2,198.18.0.3"
+printf ': "${FW_MODE:=strict}"\n: "${WHITELIST:=%s}"\n' "$WL25" > "$T/etc/node-accelerator/protect.conf"
+# файл автозагрузки — как его пишет protect: список из add_wl (+ SSH-IP прогона), без склейки
+printf 'table inet na_filter {\n    set whitelist_v4 { type ipv4_addr; flags interval; auto-merge; elements = { %s, 198.51.100.7 } }\n}\n' \
+       "${WL25//,/, }" > "$T/etc/node-accelerator/na_filter.nft"
+# живой набор — как его печатает nft после auto-merge
+printf 'table inet na_filter {\n\tset whitelist_v4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n\t\telements = { 192.0.2.0/24, 198.18.0.1-198.18.0.3,\n\t\t\t     198.51.100.7, 203.0.113.4/31 }\n\t}\n}\n' > "$NFTD/set-whitelist_v4"
+# allowlist CrowdSec — как его пишет protect (ip/cidr из того же списка)
+S2="$T/etc/crowdsec/parsers/s02-enrich"; mkdir -p "$S2"
+{ printf 'name: node-accelerator/whitelist\nwhitelist:\n  reason: node-accelerator trusted\n  ip:\n'
+  for a in 203.0.113.4 203.0.113.5 192.0.2.77 198.18.0.1 198.18.0.2 198.18.0.3 198.51.100.7 2001:db8::1; do printf '    - "%s"\n' "$a"; done
+  printf '  cidr:\n    - "192.0.2.0/25"\n    - "192.0.2.128/25"\n'; } > "$S2/na-whitelist.yaml"
+env TERM=dumb NA_TEST_CS_TABLE=1 "$WBASH" "$DIAG" > "$T/o25.txt" 2>/dev/null || true
+grep_ok  "склейка ≠ дрейф: файл и память совпадают (переживёт ребут)" "✔  whitelist в файле и в памяти совпадают (переживёт ребут)" "$T/o25.txt"
+grep_not "…и нет «в файле, но не в живом» про склеенные"              "но не в живом whitelist_v4" "$T/o25.txt"
+grep_ok  "настоящий дрейф к protect.conf назван — ровно SSH-IP прогона" "нет 1 адрес(ов) — 198.51.100.7. Добавлены" "$T/o25.txt"
+grep_ok  "allowlist CrowdSec покрывает склейку — ✔"                    "✔  whitelist na_filter целиком прикрыт allowlist CrowdSec" "$T/o25.txt"
+grep_not "…и не «лишний в allowlist»"                                  "в allowlist CrowdSec, но не в whitelist na_filter" "$T/o25.txt"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o25.json" 2>/dev/null || true
+check "json: whitelist_drift_conf=1, whitelist_drift_crowdsec=0" "1 0" \
+      "$(jget "$T/o25.json" whitelist_drift_conf) $(jget "$T/o25.json" whitelist_drift_crowdsec)"
+cp "$T/p25.conf.orig" "$T/etc/node-accelerator/protect.conf"
+cp "$T/p25.nft.orig" "$T/etc/node-accelerator/na_filter.nft"
+cp "$T/p25.wl4.orig" "$NFTD/set-whitelist_v4"
+rm -rf "$T/etc/crowdsec"
+
+echo "== 26. MSS-коллапс: только поле mss:, а не rcvmss:/advmss: (v4.3) =="
+# `ss -tin` печатает три поля с «mss:» — mss (send-MSS: его и ужимает коллапс), advmss и rcvmss
+# (оценка MSS пира по входящим сегментам; у пира с мелкими сегментами без PSH — вплоть до 88).
+# Регэксп 'mss:[0-9]+' ловил все три: сокет с send-MSS 1400 и rcvmss:120 шёл в «обрезанные»
+# (mss_collapsed_sockets в мониторинге, а при min_snd_mss < 512 — ✘ «ИДЁТ MSS-коллапс»).
+cp "$SSD/estab-mss" "$T/estab-mss.orig"
+cat > "$SSD/estab-mss" <<'EST'
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
+ESTAB  0      0      10.0.0.5:443        203.0.113.99:60001
+	 bbr wscale:7,7 rto:204 rtt:0.5/0.25 ato:40 mss:1400 pmtu:1500 rcvmss:120 advmss:1448 cwnd:10
+ESTAB  0      0      10.0.0.5:443        203.0.113.98:60002
+	 bbr wscale:7,7 rto:204 rtt:0.5/0.25 ato:40 mss:1400 pmtu:1500 rcvmss:536 advmss:1448 cwnd:10
+EST
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o26.json" 2>/dev/null || true
+check "json: rcvmss:120 при send-MSS 1400 — не «обрезанный MSS»" 0 "$(jget "$T/o26.json" mss_collapsed_sockets)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o26.txt" 2>/dev/null || true
+grep_ok  "текст: ✔ коллапса не видно"                            "✔  сокетов с обрезанным MSS нет" "$T/o26.txt"
+env TERM=dumb "$WBASH" "$DIAG" --retrans --window 5 > "$T/o26r.txt" 2>/dev/null || true
+grep_ok  "--retrans: rcvmss не в счёте collapsed_sockets"         "collapsed_sockets=0" "$T/o26r.txt"
+# контроль: настоящий коллапс send-MSS (mss:88) по-прежнему считается
+sed -i.bak 's/mss:1400 pmtu:1500 rcvmss:120/mss:88 pmtu:1500 rcvmss:536/' "$SSD/estab-mss"; rm -f "$SSD/estab-mss.bak"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o26b.json" 2>/dev/null || true
+check "json: send-MSS 88 — в счёте"                              1 "$(jget "$T/o26b.json" mss_collapsed_sockets)"
+cp "$T/estab-mss.orig" "$SSD/estab-mss"
+
+echo "== 27. RPS: маска на >32 CPU — группы через запятую (v4.3) =="
+# rps_cpus на машине с >32 CPU — группы по 32 бита через запятую: «00000000,00000000». Проверка
+# '^0+$' такую строку не узнавала: выключенный RPS шёл как ✔ «RPS включён», а юнит na-rps —
+# как ✔ «активен» вместо ▲ про гонку на буте.
+printf '00000000,00000000\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o27.txt" 2>/dev/null || true
+grep_not "нулевая маска из двух групп — не ✔ «RPS включён»" "✔  RPS включён" "$T/o27.txt"
+grep_ok  "…а ▲ «RPS выключен»"                              "▲  RPS выключен" "$T/o27.txt"
+grep_ok  "…и ▲ про юнит, отработавший вхолостую"            "na-rps.service active, но rps_cpus пуст" "$T/o27.txt"
+printf '00000000,0000000f\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o27b.txt" 2>/dev/null || true
+grep_ok  "ненулевая маска из двух групп — ✔"               "✔  RPS включён" "$T/o27b.txt"
+printf '0\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
+
+echo "== 28. --retrans ничего не пишет на диск (v4.3) =="
+# diagnose read-only: единственная запись — diag-counters.last. --retrans снимал `ethtool -S`
+# до окна во временный файл (mktemp в /tmp) и удалял его только в конце: прерванный на окне
+# (Ctrl-C за 20 с ожидания) прогон оставлял файл. Стаб mktemp пишет журнал вызовов.
+cat > "$BIN/ethtool" <<ETH
+#!/bin/sh
+[ "\$1" = "-S" ] || exit 0
+n=\$(cat "$T/ethtool.n" 2>/dev/null || echo 0); n=\$((n+1)); echo "\$n" > "$T/ethtool.n"
+printf 'NIC statistics:\n     rx_dropped: %d\n     tx_packets: 100\n' \$(( (n-1)*5 ))
+ETH
+printf '#!/bin/sh\necho "$*" >> "%s/mktemp.calls"\nexec /usr/bin/mktemp "$@"\n' "$T" > "$BIN/mktemp"
+chmod +x "$BIN/ethtool" "$BIN/mktemp"; rm -f "$T/mktemp.calls" "$T/ethtool.n"
+env TERM=dumb "$WBASH" "$DIAG" --retrans --window 5 > "$T/o28.txt" 2>/dev/null || true
+check   "--retrans: временных файлов не создаёт (mktemp не зовётся)" 0 \
+        "$(if [ -f "$T/mktemp.calls" ]; then wc -l < "$T/mktemp.calls" | tr -d ' '; else echo 0; fi)"
+grep_ok "--retrans: дропы NIC за окно по-прежнему видны"          "nic: rx_dropped:" "$T/o28.txt"
+rm -f "$BIN/ethtool" "$BIN/mktemp" "$T/mktemp.calls" "$T/ethtool.n"
+
+echo "== 29. v4.3: флаги --json/--fast в любом порядке =="
+# `--fast --json` печатал человекочитаемый отчёт: --json узнавался только первым аргументом
+env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" --fast --json > "$T/o29.json" 2>/dev/null || true
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$T/o29.json" 2>/dev/null; then
+    PASS=$((PASS+1)); echo "  ok   --fast --json — валидный JSON"
+else FAIL=$((FAIL+1)); echo "  FAIL --fast --json — не JSON: $(head -c 200 "$T/o29.json")"; fi
+check "--fast --json — быстрый режим (журнал не читается: -1)" -1 "$(jget "$T/o29.json" portscan_log_lines_24h)"
+env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" --json --fast > "$T/o29b.json" 2>/dev/null || true
+check "--json --fast — как и раньше, быстрый режим" -1 "$(jget "$T/o29b.json" portscan_log_lines_24h)"
+
+echo "== 30. v4.3: счётчик whitelist v6 — адреса, а не строки =="
+cp "$NFTD/set-whitelist_v6" "$T/wl6.saved"
+printf 'table inet na_filter {\n\tset whitelist_v6 {\n\t\ttype ipv6_addr\n\t\telements = { 2001:db8::1, 2001:db8::2, 2001:db8:1::/48 }\n\t}\n}\n' > "$NFTD/set-whitelist_v6"
+env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" > "$T/o30.txt" 2>/dev/null || true
+grep_ok "три v6-адреса в одной строке — v6=3" "whitelist: v4=3 v6=3 адрес(ов)" "$T/o30.txt"
+cp "$T/wl6.saved" "$NFTD/set-whitelist_v6"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"

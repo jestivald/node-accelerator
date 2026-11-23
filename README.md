@@ -148,13 +148,14 @@ Read-only: кто/откуда/чем/когда — из журнала ядр�
 ## Установка
 
 ```bash
-# меню
+# меню (и из curl: curl -fsSL …/install.sh | sudo bash — ввод берётся из терминала)
 sudo bash install.sh
 
 # по модулям
 sudo bash install.sh optimize     # ⚡ XanMod+BBRv3 + тюнинг
 sudo bash install.sh protect      # 🛡 nftables + CrowdSec
 sudo bash install.sh diagnose     # 🩺 read-only
+sudo bash install.sh report       # 🔥 форензика атак, read-only (--hours N, --ip <адрес>, --json)
 sudo bash install.sh all          # всё подряд
 
 # неинтерактивно (Remnawave node: strict — блок всех портов, кроме перечисленных;
@@ -173,16 +174,37 @@ curl -fsSL https://raw.githubusercontent.com/jestivald/node-accelerator/main/ins
 
 # прод-режим: пиньте тег через NA_REF — компрометация ветки main тогда не утечёт
 # сразу на весь флот (скрипты тянутся из того же тега):
-export NA_REF=v4.2
+export NA_REF=v4.3
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 
 # максимум: + проверка minisign-подписей модулей (подписи лежат в дереве с v3.6):
-export NA_REF=v4.2 NA_REQUIRE_SIG=1 \
+export NA_REF=v4.3 NA_REQUIRE_SIG=1 \
        NA_MINISIGN_PUBKEY="RWQrJghT9nkdBC3ntiEXF29zrS8o429WhObHKq6I7CKoftVDhQBrBscu"
 curl -fsSL "https://raw.githubusercontent.com/jestivald/node-accelerator/$NA_REF/install.sh" | sudo -E bash -s all
 ```
 
 > После установки **XanMod нужна перезагрузка** (`reboot`), чтобы BBRv3 заработал. Проверка: `uname -r` содержит `xanmod`.
+
+### Меню
+
+`sudo bash install.sh` без аргументов — меню; с v4.3 оно работает и из `curl … | sudo bash`
+(выбор и вопросы модулей читаются из терминала, а не из пайпа со скриптом).
+
+- **Шапка — состояние ноды:** ядро и BBR, когда и какой версией применён тюнинг, нужна ли
+  перезагрузка (по `boot_id`, а не по вечному маркеру), загружена ли `na_filter`, взведён или
+  сработал сейфти-таймер, запущен ли CrowdSec.
+- **Пункты 1–5 — как раньше** (оптимизатор, защита, диагностика, всё сразу, откат). Новые:
+  **6 🔥 Атаки** — na-report за 24 ч, за своё окно, разбор одного IP, порт, proxyware;
+  **7 🧱 Файрвол** — статус, whitelist (показать/добавить/убрать), разбан, топ источников.
+  В подменю рядом с пунктом — команда, которой то же делается без меню.
+- После действия меню не закрывается: итог (✔ / ✘ с кодом / ▲ прервано) и время, Enter — назад.
+  Ctrl+C прерывает модуль, а не меню; на приглашении — выход.
+- **Откат — только с подтверждением.** До v4.3 любой ввод, кроме `a`/`b` (опечатка, Enter),
+  откатывал всё. «н»/«нет» — отказ в любой локали.
+- Рамка ровная в любом терминале: колонки ставит escape-последовательность CHA, а не пробелы
+  (ширину эмодзи терминалы считают по-разному). Уже 80 колонок (SSH с телефона) — без рамки и
+  описаний; `NO_COLOR=1` — без цвета; вывод не в терминал — без escape-кодов. Без терминала
+  вообще (cron, CI) меню не открывается: код 2 и список команд.
 
 ---
 

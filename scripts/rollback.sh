@@ -122,8 +122,12 @@ rollback_optimize() {
     if [[ -f "$STATE_DIR/journald.persistent" ]]; then
         info "журнал остаётся постоянным: /var/log/journal создал optimize, в нём история (удалить: rm -rf /var/log/journal — история пропадёт)"
     fi
+    # logrotate.ceded/owned — учёт «какие маски чьи» для diagnose; без нашей станцы и
+    # таймера он описывает то, чего уже нет, и diagnose после отката рапортует чужие стансы
+    # как «отданные тулкиту».
     rm -f "$STATE_DIR/sysctl.orig" "$STATE_DIR/rps-orig.tsv" "$STATE_DIR/thp.orig" \
-          "$STATE_DIR/reserved-ports.na" "$STATE_DIR/journald.persistent"
+          "$STATE_DIR/reserved-ports.na" "$STATE_DIR/journald.persistent" \
+          "$STATE_DIR/logrotate.ceded" "$STATE_DIR/logrotate.owned"
 
     # psi=1 в GRUB_CMDLINE_LINUX_DEFAULT снимаем ТОЛЬКО если дописывали его МЫ: ровно
     # в этом случае в маркере есть строка psi=1. Оператор мог включить учёт давления
@@ -149,7 +153,13 @@ rollback_optimize() {
         local pkg; pkg="$(cat "$STATE_DIR/xanmod.pkg")"
         if [[ "${NA_REMOVE_XANMOD:-0}" == "1" ]] && [[ "$(uname -r)" != *xanmod* ]]; then
             info "Удаляю XanMod-пакет $pkg ..."
-            DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg" >/dev/null 2>&1 || warn "не удалил $pkg"
+            if DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$pkg" >/dev/null 2>&1; then
+                # метка нужна только пока пакет стоит: иначе повторный откат пишет «XanMod
+                # оставлен», а diagnose показывает уже удалённый пакет
+                rm -f "$STATE_DIR/xanmod.pkg"
+            else
+                warn "не удалил $pkg"
+            fi
             update-grub >/dev/null 2>&1 || true
             # репозиторий и ключ больше не нужны — чистим, чтобы apt не ругался на suite
             rm -f /etc/apt/sources.list.d/xanmod*.list /etc/apt/keyrings/xanmod-archive-keyring.gpg
@@ -171,9 +181,12 @@ rollback_protect() {
     rm -f "$STATE_DIR/na-fw-safety.pid" "$STATE_DIR/na-fw-safety.log" /tmp/na-fw-safety.pid /tmp/na-fw-safety.log 2>/dev/null || true
 
     # v3.0 модули: fleet-sync / blocklists / ctguard — снимаем таймеры/сервисы
+    # Таймер — ПЕРВЫМ: снятый раньше сервис он успевает запустить заново (OnUnitActiveSec),
+    # и свежий прогон fleet-sync/blocklist/ctguard вернёт наборы в таблицу, которую мы
+    # удаляем строкой ниже, а юнит-файл удалится из-под только что стартовавшего сервиса.
     for unit in na-firewall na-fleet-sync na-blocklist na-ctguard; do
-        systemctl disable --now "$unit.service" >/dev/null 2>&1 || true
         systemctl disable --now "$unit.timer"   >/dev/null 2>&1 || true
+        systemctl disable --now "$unit.service" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$unit.service" "/etc/systemd/system/$unit.timer"
     done
     systemctl daemon-reload

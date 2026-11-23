@@ -36,22 +36,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── Аргументы ────────────────────────────────────────────────────────────────
 JSON=0; HOURS=24; TOPN=15; FOCUS_IP=""; FOCUS_PORT=""; PROXYAUDIT=0
+# Флаг со значением без значения — ошибка, а не молчаливый дефолт: `--ip` в хвосте команды
+# (`na-report --ip $IP` с пустой переменной) раньше выдавал полный отчёт вместо вердикта.
+need_val() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { err "$1 требует значение"; exit 1; }; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json) JSON=1 ;;
-        --hours) HOURS="${2:-24}"; shift ;;
-        --top) TOPN="${2:-15}"; shift ;;
-        --ip) FOCUS_IP="${2:-}"; shift ;;
-        --port) FOCUS_PORT="${2:-}"; shift ;;
+        --hours) need_val "$@"; HOURS="$2"; shift ;;
+        --top) need_val "$@"; TOPN="$2"; shift ;;
+        --ip) need_val "$@"; FOCUS_IP="$2"; shift ;;
+        --port) need_val "$@"; FOCUS_PORT="$2"; shift ;;
         --proxyware) PROXYAUDIT=1 ;;
         -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
         *) err "Неизвестный аргумент: $1"; exit 1 ;;
     esac
     shift
 done
+# 10#: «08» в `[[ -ge ]]` — ошибка «value too great for base», а «010» читалось как 8
+# при том, что journalctl получал -010h (=10 ч): окно в отчёте и в запросе расходилось.
+[[ "$HOURS" =~ ^[0-9]{1,4}$ ]] && HOURS=$((10#$HOURS))
+[[ "$TOPN"  =~ ^[0-9]{1,4}$ ]] && TOPN=$((10#$TOPN))
 [[ "$HOURS" =~ ^[0-9]+$ && "$HOURS" -ge 1 && "$HOURS" -le 720 ]] || { err "--hours 1..720"; exit 1; }
 [[ "$TOPN"  =~ ^[0-9]+$ && "$TOPN" -ge 1 && "$TOPN" -le 100 ]] || { err "--top 1..100"; exit 1; }
 [[ -z "$FOCUS_PORT" || "$FOCUS_PORT" =~ ^[0-9]+$ ]] || { err "--port должен быть числом"; exit 1; }
+# --ip уходит в `nft get element … "{ $ip }"` и getent: пускаем только адрес
+[[ -z "$FOCUS_IP" || "$FOCUS_IP" =~ ^[0-9a-fA-F.:]+$ ]] || { err "--ip: ожидается IPv4/IPv6-адрес"; exit 1; }
 
 NOW="$(date +%s)"
 # Глубина журнала в часах (возраст самой старой записи; -1 = не измерить). Без неё
@@ -85,14 +94,42 @@ collect_events() {
 # Через общий json_escape: сырой \r/\t из ответа whois (имя AS) ломал бы документ.
 json_str() { json_escape "$1"; }
 
+# IPv6 → каноничная полная форма (8 групп по 4 цифры, нижний регистр), построчно со stdin;
+# не-IPv6 и невалидное пропускает как есть. Ядро печатает SRC= через %pI6 (полная форма
+# `2001:0db8:0000:…:0001`), а `nft list set` — сжатую (`2001:db8::1`): сравнение строк
+# без нормализации никогда не совпадало, и забаненный v6-адрес получал вердикт «suspect»
+# вместо «attacker», а `--ip 2001:db8::1` не находил ни одного попадания в логе.
+v6_full_stream() {
+    awk '
+        function pad(g) { return substr("0000" g, length(g) + 1) }
+        function norm(a,   n, l, r, nl, nr, i, out, cnt, L, R) {
+            a = tolower(a)
+            if (a !~ /^[0-9a-f:]+$/ || a !~ /:/ || a ~ /:::/) return a
+            n = index(a, "::")
+            if (n) { l = substr(a, 1, n - 1); r = substr(a, n + 2)
+                     nl = (l == "" ? 0 : split(l, L, ":")); nr = (r == "" ? 0 : split(r, R, ":")) }
+            else { nl = split(a, L, ":"); nr = 0 }
+            if ((!n && nl != 8) || (n && nl + nr > 7)) return a
+            for (i = 1; i <= nl; i++) if (length(L[i]) > 4) return a
+            for (i = 1; i <= nr; i++) if (length(R[i]) > 4) return a
+            out = ""; cnt = 0
+            for (i = 1; i <= nl; i++) out = out (cnt++ ? ":" : "") pad(L[i])
+            if (n) for (i = nl + nr; i < 8; i++) out = out (cnt++ ? ":" : "") "0000"
+            for (i = 1; i <= nr; i++) out = out (cnt++ ? ":" : "") pad(R[i])
+            return out
+        }
+        { print norm($0) }'
+}
+v6_full() { printf '%s\n' "$1" | v6_full_stream; }
+
 # Множество забаненных (autoban v4+v6) — для вердикта.
 load_autoban() {
     { nft list set inet na_filter autoban_v4 2>/dev/null
       nft list set inet na_filter autoban_v6 2>/dev/null
     } | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}' \
-      | sort -u > "$TMP".ab || true
+      | v6_full_stream | sort -u > "$TMP".ab || true
 }
-is_banned() { grep -qxF "$1" "$TMP".ab 2>/dev/null; }
+is_banned() { grep -qxF "$(v6_full "$1")" "$TMP".ab 2>/dev/null; }
 
 count_reason() { awk -F'\t' -v r="$1" '$2==r{c++} END{print c+0}' "$TMP"; }
 events_total() { wc -l < "$TMP" | tr -d ' '; }
@@ -267,7 +304,8 @@ emit_json() {
 focus_ip() {
     collect_events; load_autoban
     local ip="$FOCUS_IP" hits fam found="" base ptr cc
-    hits="$(awk -F'\t' -v x="$ip" '$3==x{c++} END{print c+0}' "$TMP")"
+    local ipn; ipn="$(v6_full "$ip")"   # в логе адрес в полной форме — сравниваем в ней
+    hits="$(awk -F'\t' -v x="$ipn" '$3==x{c++} END{print c+0}' "$TMP")"
     enrich_asn "$ip"
     title "🔎 Анализ IP $ip"
     status_line "$([[ "$hits" -gt 0 ]] && echo WARN || echo OK)" "попаданий в drop-лог (за ${HOURS}ч): $hits"
@@ -293,23 +331,16 @@ focus_ip() {
         [[ "${cc:-0}" -gt 0 ]] && status_line WARN "активных conntrack-сессий: $cc" || info "активных conntrack-сессий: 0"
     fi
     info "Причины (за ${HOURS}ч):"
-    awk -F'\t' -v x="$ip" '$3==x{c[$2]++} END{for(r in c) printf "    %-10s %d\n", r, c[r]}' "$TMP"
+    awk -F'\t' -v x="$ipn" '$3==x{c[$2]++} END{for(r in c) printf "    %-10s %d\n", r, c[r]}' "$TMP"
     info "Таймлайн по часам (непустые бакеты):"
-    awk -F'\t' -v x="$ip" -v now="$NOW" -v H="$HOURS" '$3==x{h=int((now-$1)/3600); if(h>=0&&h<H)b[h]++} END{for(i=H-1;i>=0;i--) if(b[i]) printf "    -%dч: %d\n", i, b[i]}' "$TMP"
+    awk -F'\t' -v x="$ipn" -v now="$NOW" -v H="$HOURS" '$3==x{h=int((now-$1)/3600); if(h>=0&&h<H)b[h]++} END{for(i=H-1;i>=0;i--) if(b[i]) printf "    -%dч: %d\n", i, b[i]}' "$TMP"
     echo "  Вердикт: $(verdict "$ip" "$hits" "$hits")"
 }
 
 # ─── Человекочитаемый отчёт ─────────────────────────────────────────────────────
 human() {
     collect_events; load_autoban
-    clear 2>/dev/null || true
-    printf "%b" "$BOLD"
-    cat <<'B'
-  ┌────────────────────────────────────────────┐
-  │   🔥  node-accelerator — форензика атак     │
-  └────────────────────────────────────────────┘
-B
-    printf "%b" "$NC"
+    na_banner "🔥" "форензика атак"
     local total rate usrc; total="$(events_total)"; rate="$(ban_rate_5m)"; usrc="$(unique_src_5m)"
     info "Окно: последние ${HOURS}ч   ·   событий в drop-логе: $total   ·   за 5 мин: $rate от $usrc адрес(ов)"
     if [[ "$JSPAN" -ge 0 && "$JSPAN" -lt "$HOURS" ]]; then
@@ -459,14 +490,7 @@ pw_section() {
 }
 
 proxyware_audit() {
-    clear 2>/dev/null || true
-    printf "%b" "$BOLD"
-    cat <<'B'
-  ┌────────────────────────────────────────────┐
-  │  🕵  node-accelerator — proxyware self-audit │
-  └────────────────────────────────────────────┘
-B
-    printf "%b" "$NC"
+    na_banner "🕵" "proxyware self-audit"
     info "Read-only проверка на residential-proxy / bandwidth-SDK (для abuse-тикетов)."
 
     local hit=0

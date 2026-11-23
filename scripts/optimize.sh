@@ -137,10 +137,14 @@ xanmod_import_key() {
     # рядом с настоящим ключом может приехать чужой. apt по signed-by= доверяет КАЖДОМУ
     # ключу keyring'а, поэтому кладём туда ровно наш отпечаток (import_pinned_key),
     # а не «всё, что прислали».
-    if ! import_pinned_key "$tmpkey" "$XANMOD_FP" "$keyring"; then
+    # В keyring — только прошедший проверку: import_pinned_key при отказе удаляет файл
+    # назначения, и на ре-ране ответ-заглушка вместо ключа (прокси, страница-капча с 200)
+    # сносил уже проверенный keyring — apt переставал верить репо, обновления ядра вставали.
+    if ! import_pinned_key "$tmpkey" "$XANMOD_FP" "$keyring.na-new"; then
         warn "Ключ XanMod не сошёлся с отпечатком $XANMOD_FP — отказываюсь использовать"
         rm -f "$tmpkey"; return 1
     fi
+    mv -f "$keyring.na-new" "$keyring"
     rm -f "$tmpkey"
     return 0
 }
@@ -173,15 +177,31 @@ setup_xanmod_repo() {
     # ситуация на съёмных VPS. Без скоупа живой XanMod-репо ложно объявлялся мёртвым,
     # фоллбэк на bookworm падал так же, и ядро молча не ставилось «репо недоступен».
     local -a UPDSC=(-o "Dir::Etc::sourcelist=$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0)
+    # Прежний list (ре-ран на ноде, где ядро уже стоит): если репо не поднялось, возвращаем
+    # его и сборку, а не удаляем. Временный отказ deb.xanmod.org иначе молча выключал
+    # обновления уже стоящего ядра до следующего ре-рана (итог: «репозиторий не обновлён
+    # (само ядро не тронуто)»), а lts от провалившегося фолбэка закреплял save_conf.
+    # list'а не было (первая установка) — битый источник не оставляем, как раньше.
+    local prev_list="" prev_flv="$XANMOD_FLAVOR" up=0
+    [[ -s "$list" ]] && prev_list="$(cat "$list")"
     echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
     if ! apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null; then
         if [[ "$codename" != "bookworm" ]]; then
             warn "Suite '$codename' не поднялся — откатываюсь на 'bookworm' (LTS)"
             codename="bookworm"; XANMOD_FLAVOR="lts"
             echo "deb [signed-by=$keyring] https://deb.xanmod.org $codename main" > "$list"
-            apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null || { warn "XanMod-репо недоступен"; rm -f "$list"; return 1; }
-        else
-            warn "XanMod-репо ('bookworm') недоступен"; rm -f "$list"; return 1
+            apt-get "${APT_LOCK[@]}" update -qq "${UPDSC[@]}" 2>/dev/null && up=1
+        fi
+        if [[ "$up" != 1 ]]; then
+            warn "XanMod-репо ('$codename') недоступен"
+            XANMOD_FLAVOR="$prev_flv"
+            if [[ -n "$prev_list" ]]; then
+                printf '%s\n' "$prev_list" > "$list"
+                warn "прежний $list оставлен как был — обновления уже стоящего ядра не выключаю"
+            else
+                rm -f "$list"
+            fi
+            return 1
         fi
     fi
     # общий кэш (чтобы apt-cache/install видели пакеты); чужие битые источники не фатальны
@@ -254,9 +274,15 @@ xanmod_kver() {
     fi
     [[ -n "$v" ]] && echo "$v"
 }
-# Драйвер NIC по sysfs: …/device/driver → ../../bus/virtio/drivers/virtio_net.
+# Драйвер NIC по sysfs: модуль драйвера (…/device/driver/module → …/module/xen_netfront),
+# без него — имя драйвера (…/device/driver → ../../bus/virtio/drivers/virtio_net). Имя
+# драйвера с модулем совпадает не всегда: у Xen netfront (AWS t2/m4, Xen-VPS) драйвер —
+# «vif», а модуль — xen-netfront.ko, и проверка нового ядра не находила vif.ko —
+# ложное «НЕ ПЕРЕЗАГРУЖАЙСЯ» с советом снести исправное ядро.
 nic_driver() {
-    local d; d="$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null || true)"
+    local d
+    d="$(readlink "/sys/class/net/$1/device/driver/module" 2>/dev/null || true)"
+    [[ -n "$d" ]] || d="$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null || true)"
     [[ -n "$d" ]] && basename "$d"
 }
 # xanmod_postcheck <версия> <NIC> — поднимется ли новое ядро с сетью: initrd собран, а
@@ -288,6 +314,34 @@ xanmod_postcheck() {
     [[ -z "$why" ]] && return 0
     printf '%s' "${why%; }"
     return 1
+}
+
+# xanmod_pending_reboot — ядро XanMod, поставленное ПРОШЛЫМ прогоном, всё ещё ждёт ребута:
+# маркер прошлого прогона с reboot_needed=1 и ТЕМ ЖЕ boot_id (как reboot_pending в
+# diagnose), пакет из xanmod.pkg стоит, а загружены мы не с XanMod. Ре-ран до ребута,
+# который ядро сам не ставит (ENABLE_XANMOD=0; /boot после установки ядра стал теснее
+# NA_BOOT_MIN_MB; репо недоступно), писал reboot_needed=0: diagnose и меню переставали
+# ждать ребута, а «НЕ ПЕРЕЗАГРУЖАЙСЯ» прошлого прогона пропадало без проверки. Готовность
+# ядра проверяем заново. Меняет REBOOT_NEEDED / REBOOT_WHY / XANMOD_RISK.
+xanmod_pending_reboot() {
+    local m="$STATE_DIR/optimize.installed" pkg bid cur kv why
+    [[ "$REBOOT_WHY" != *XanMod* && "$(uname -r)" != *xanmod* && -s "$STATE_DIR/xanmod.pkg" ]] || return 0
+    grep -qx 'reboot_needed=1' "$m" 2>/dev/null || return 0
+    bid="$(awk -F= '$1 == "boot_id" { print $2; exit }' "$m" 2>/dev/null || true)"
+    cur="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    [[ -n "$bid" && "$bid" == "$cur" ]] || return 0
+    pkg="$(cat "$STATE_DIR/xanmod.pkg")"
+    [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null || true)" == ii* ]] || return 0
+    REBOOT_NEEDED=1
+    REBOOT_WHY="${REBOOT_WHY:+$REBOOT_WHY; }новое ядро XanMod ($pkg, поставлено прошлым прогоном)"
+    kv="$(xanmod_kver "$pkg" || true)"
+    if [[ -z "$kv" ]]; then
+        XANMOD_RISK="версия ядра пакета $pkg не определена — initrd и драйвер NIC не проверены (ls /boot/initrd.img-*xanmod* /lib/modules)"
+    elif ! why="$(xanmod_postcheck "$kv" "$(default_iface || true)")"; then
+        XANMOD_RISK="$why"
+    fi
+    warn "XanMod $pkg${kv:+ (ядро $kv)} поставлен прошлым прогоном и ждёт перезагрузки${XANMOD_RISK:+ — но к загрузке НЕ готов: $XANMOD_RISK}"
+    return 0
 }
 
 install_xanmod() {
@@ -385,6 +439,7 @@ if [[ "$ENABLE_XANMOD" == "1" ]]; then
 else
     info "ENABLE_XANMOD=0 — установка ядра пропущена"
 fi
+xanmod_pending_reboot
 
 # ─── 2b. PSI: учёт давления CPU/памяти/IO (opt-in) ───────────────────────────
 # XanMod и стоковые ядра Debian собраны с CONFIG_PSI_DEFAULT_DISABLED=y: PSI в ядре
@@ -696,7 +751,13 @@ _mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 104857
 CT_MAX=$(( _mem_kb * 1024 / 8 / 320 ))
 [[ "$CT_MAX" -gt 2000000 ]] && CT_MAX=2000000
 [[ "$CT_MAX" -lt 262144  ]] && CT_MAX=262144
-CT_BUCKETS=$(( CT_MAX / 4 ))
+# Хэш conntrack ядро выделяет целыми страницами (nf_ct_alloc_hashtable: roundup до
+# PAGE_SIZE/8 корзин — 512 на 4K) и nf_conntrack_buckets при чтении отдаёт уже
+# округлённый размер. Пишем сразу его: иначе сверка ниже почти на любой ноде ≥ 1 ГБ
+# (четверть max не кратна 512) печатала «не применились (ядро/контейнер не дал
+# записать?)» вместо ✔ — ложная тревога в каждом прогоне.
+_pg="$(getconf PAGESIZE 2>/dev/null || true)"; [[ "$_pg" =~ ^[0-9]+$ ]] && (( _pg >= 4096 )) || _pg=4096
+CT_BUCKETS=$(( (CT_MAX / 4 + _pg / 8 - 1) / (_pg / 8) * (_pg / 8) ))
 cat > "$SYSCTL_CT_NEW" <<CT
 # node-accelerator: ёмкость conntrack под RAM этой ноды (~$(( _mem_kb / 1024 )) MB)
 net.netfilter.nf_conntrack_max     = $CT_MAX
@@ -1118,8 +1179,25 @@ swap_size_mb() {   # "2G" / "512M" / "2048" → мегабайты (для dd-ф
 make_swapfile() {
     local size="${REMNAWAVE_SWAP_SIZE:-2G}" mb
     mb="$(swap_size_mb "$size")"
+    # голое число — мегабайты (так его читает swap_size_mb и dd-фоллбэк), а fallocate счёл бы
+    # его байтами: `REMNAWAVE_SWAP_SIZE=2048` давал файл в 2 КБ, mkswap падал, swap не создавался
+    [[ "$size" =~ ^[0-9]+$ ]] && size="${size}M"
     if [[ $'\n'"$(swapon --show=NAME --noheadings 2>/dev/null)"$'\n' == *$'\n'/swapfile$'\n'* ]]; then
         info "/swapfile уже активен — пропускаю"; return 0
+    fi
+    # Неактивный /swapfile уже лежит. Наш (метка прошлого прогона) — просто включаем. Чужой не
+    # трогаем: до v4.3 fallocate+mkswap переформатировали его, метка объявляла его нашим, и
+    # `rollback optimize` потом удалял чужой swap вместе с его строкой в fstab.
+    if [[ -e /swapfile ]]; then
+        if [[ -f "$STATE_DIR/swapfile.created" ]]; then
+            if swapon /swapfile 2>/dev/null; then
+                grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+                ok "/swapfile (создан прошлым прогоном) включён"; return 0
+            fi
+            warn "/swapfile (создан прошлым прогоном) не включился — swapon /swapfile, проверь dmesg"; return 1
+        fi
+        info "/swapfile уже есть, но не активен — чужой файл не трогаю (включить: swapon /swapfile)"
+        return 0
     fi
     if ! fallocate -l "$size" /swapfile 2>/dev/null; then
         rm -f /swapfile
@@ -1473,7 +1551,20 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now na-thp-off.service >/dev/null 2>&1 || true
-ok "THP отключён"
+# ✔ — по факту, а не по тому, что юнит записан: в контейнере (LXC/OpenVZ) sysfs только на
+# чтение и режим THP задаёт хост, ExecStart молча глотает отказ записи, а итог печатал
+# «THP отключён» при живом [madvise]/[always].
+_thp="$(grep -oE '\[[a-z+]+\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]' || true)"
+if [[ "$_thp" == never ]]; then
+    ok "THP отключён"
+elif [[ -z "$_thp" ]]; then
+    info "THP в этом ядре нет — отключать нечего"
+elif is_container; then
+    info "THP: $_thp — контейнер, режим THP задаёт хост (наш юнит его не меняет)"
+else
+    warn "THP не отключился (сейчас: $_thp) — systemctl status na-thp-off.service"
+fi
+unset _thp
 
 # ─── 10. CPU governor ────────────────────────────────────────────────────────
 title "CPU governor → performance"
@@ -1501,9 +1592,26 @@ fi
 # ─── 11. irqbalance ──────────────────────────────────────────────────────────
 title "irqbalance"
 systemctl enable --now irqbalance >/dev/null 2>&1 || true
-ok "irqbalance запущен"
+# ✔ — только если демон реально работает. На 1 vCPU он не нужен и не держится (юнит с
+# ConditionCPUs=>1 не стартует, сам irqbalance на одном CPU завершается), в контейнере
+# юнит отсекает ConditionVirtualization=!container — а `enable --now` при этом успешен,
+# и итог печатал «irqbalance запущен» про остановленный демон.
+if [[ "$(nproc 2>/dev/null || echo 2)" -le 1 ]]; then
+    info "irqbalance: 1 vCPU — распределять прерывания не по чему, демон не нужен"
+elif systemctl is-active --quiet irqbalance 2>/dev/null; then
+    ok "irqbalance запущен"
+elif is_container; then
+    info "irqbalance не запущен: контейнер — прерываниями управляет хост"
+else
+    warn "irqbalance не запустился — systemctl status irqbalance"
+fi
 
 # ─── 12. Маркер ──────────────────────────────────────────────────────────────
+# reboot_risk — почему новое ядро НЕ готово к загрузке (нет initrd, драйвера NIC): шапка меню
+# install.sh показывает «✘ НЕ перезагружайся», а не просто «нужна перезагрузка» — иначе
+# оператор, не видевший вывода этого прогона, перезагрузил бы ноду в ядро без сети.
+# Одной строкой, в хвосте маркера (читатели ищут ключи, порядок полей им не важен).
+_risk="${XANMOD_RISK//$'\n'/ }"
 mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/optimize.installed" <<EOF
 installed_at=$(date -Is)
@@ -1517,7 +1625,9 @@ psi=$PSI_MARK
 tier=$TIER
 sock_max=$SOCK_MAX
 sock_def=$SOCK_DEF
+reboot_risk=$_risk
 EOF
+unset _risk
 
 # Персист конфига оптимизатора → ре-ран без ENV не сбрасывает выбор сборки/флейвора.
 save_conf "$CONF_DIR/optimize.conf" \
