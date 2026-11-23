@@ -247,7 +247,9 @@ if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" && "$DRY_RUN" != "1" && "${CROW
         # node-agent порт — понятие Remnawave; в open-режиме его правила не ставятся
         [[ "$FW_MODE" == "strict" ]] && read -rp "Порт node-agent (auto = детект)  [$NODE_PORT]: " _v && NODE_PORT="${_v:-$NODE_PORT}"
     fi
-    read -rp "Whitelist IP/CIDR (панель, твои)  [пусто]: "     _v && WHITELIST="${_v:-$WHITELIST}"
+    # в подсказке — то, что оставит Enter (список из protect.conf/ENV): «[пусто]» при живом
+    # списке подталкивало вписать «свой» адрес — и заменить им весь список (панель выпадала)
+    read -rp "Whitelist IP/CIDR (панель, твои)  [${WHITELIST:-пусто}]: " _v && WHITELIST="${_v:-$WHITELIST}"
 fi
 # Неинтерактивно и без явного FW_MODE — strict (прежнее поведение не меняется).
 [[ -z "$FW_MODE" ]] && FW_MODE=strict
@@ -326,6 +328,18 @@ if [[ -n "$CADDY_AUTH_API_TOKEN" || -n "$REMNAWAVE_TOKEN" ]]; then
         [[ "$_u" == http://* ]] && warn "'$_u' по http:// — токен панели/Caddy уйдёт открытым текстом. Возьми https."
     done
     unset _u
+fi
+# Токены уходят в fleet.env (см. блок fleet-sync) — набор символов проверяем ЗДЕСЬ, до любых
+# изменений, при том же условии, при котором fleet.env пишется. До v4.3 проверка стояла в
+# блоке fleet-sync, ПОСЛЕ nft -f и взвода сейфти: кривой токен ронял прогон с уже применённым
+# ruleset и взведённым сейфти, а тот через SAFETY_DELAY снимал таблицу И автозагрузку — нода
+# оставалась без файрвола, хотя оператор видел лишь ошибку валидации.
+if [[ "$FW_MODE" != "skip" && "$FLEET_SYNC" != "0" ]] \
+   && { [[ -n "$REMNAWAVE_NODES_URL" ]] || [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]]; }; then
+    for _k in REMNAWAVE_TOKEN CADDY_AUTH_API_TOKEN; do
+        [[ -z "${!_k}" || "${!_k}" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] \
+            || { err "$_k: недопустимые символы (ожидается base64/JWT/hex-подобный токен)"; exit 1; }
+    done
 fi
 unset _k
 
@@ -1753,13 +1767,8 @@ if [[ "$FLEET_ON" == "1" ]]; then
         umask 077; mkdir -p "$CONF_DIR"
         # fleet.env хелпер подключает через `.` от root каждые 5 минут: до v4.2 значения
         # писались как есть, и токен вида `abc;cmd` исполнял cmd, а `abc def` молча давал
-        # пустой токен (синк навсегда на last-known-good). Набор символов токена проверяем,
-        # значения пишем в экранированном виде (%q).
-        for _k in REMNAWAVE_TOKEN CADDY_AUTH_API_TOKEN; do
-            [[ -z "${!_k}" || "${!_k}" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] \
-                || { err "$_k: недопустимые символы (ожидается base64/JWT/hex-подобный токен)"; exit 1; }
-        done
-        unset _k
+        # пустой токен (синк навсегда на last-known-good). Набор символов токена проверен в
+        # валидации (до применения), значения пишем в экранированном виде (%q).
         {
             [[ -z "$REMNAWAVE_URL"            ]] || printf 'REMNAWAVE_URL=%q\n' "$REMNAWAVE_URL"
             [[ -z "$REMNAWAVE_TOKEN"          ]] || printf 'REMNAWAVE_TOKEN=%q\n' "$REMNAWAVE_TOKEN"
@@ -2237,9 +2246,18 @@ fam_of() {   # fam_of <адрес> → 4|6; rc=1 — не адрес
     elif [[ "$1" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ && "$1" == *:* ]]; then echo 6
     else return 1; fi
 }
-norm() { local a="$1"; a="${a%/32}"; [[ "$a" == *:* ]] && a="${a%/128}"; printf '%s' "$a"; }
+# /32 — хост только у v4: у v6 это префикс на 2^96 адресов (до v4.3 срезался у любого, и
+# `allow add 2001:db8::/32` клал в whitelist хост 2001:db8:: вместо префикса)
+norm() { local a="$1"; if [[ "$a" == *:* ]]; then a="${a%/128}"; else a="${a%/32}"; fi; printf '%s' "$a"; }
 nonempty() { grep -v '^$' || true; }   # под pipefail пустой вход — не ошибка
-conf_list() { sed -nE 's/^: "\$\{WHITELIST:?=([^}]*)\}".*/\1/p' "$CONF" 2>/dev/null | tail -1; }
+# нет conf (сброс к дефолтам — `rm protect.conf`, так советует шапка самого файла) — пустой
+# список, conf_set создаст файл: под pipefail отказ sed ронял `cur="$(conf_list)"` молча, rc≠0
+conf_list() { [[ -f "$CONF" ]] || return 0; sed -nE 's/^: "\$\{WHITELIST:?=([^}]*)\}".*/\1/p' "$CONF" 2>/dev/null | tail -1; }
+# WHITELIST в protect.conf — дословно, как задал оператор: protect режет его и по запятым, и
+# по пробелам («a, b» — естественный ввод в интерактиве) и сам срезает /32. Сравнивать надо в
+# той же нормализации: строкой целиком del не находил « b» или «b/32», адрес оставался в conf
+# (при отчёте «во всех слоях»), и ре-ран protect молча возвращал его в whitelist.
+conf_norm() { tr ', \t' '\n\n\n' | nonempty | while IFS= read -r x; do norm "$x"; echo; done | paste -sd, -; }
 conf_set() {   # conf_set <csv> — переписать WHITELIST= в protect.conf (none = пусто)
     local v="${1:-none}" tmp
     [[ -f "$CONF" ]] || { umask 077; : > "$CONF"; }
@@ -2279,7 +2297,7 @@ case "$cmd" in
             mkdir -p "$STATE_DIR"; exec 9>"$STATE_DIR/protect.lock"
             flock -n 9 || die "идёт прогон protect (лок $STATE_DIR/protect.lock) — повтори после него"
         fi
-        cur="$(conf_list)"; [[ "$cur" == none ]] && cur=""
+        cur="$(conf_list | conf_norm)"; [[ "$cur" == none ]] && cur=""
         e4="$(file_elems 4)"; e6="$(file_elems 6)"
         live_add=(); live_del=()
         for a in "$@"; do
@@ -2470,8 +2488,16 @@ else
     fi
     echo
     if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" ]]; then
-        read -r -p "Соединение работает? [y/N]: " c
-        if [[ "$c" =~ ^[yYдД] ]]; then
+        # EOF (Ctrl+D) — это не «да»: голый read под set -e ронял скрипт молча, с ВЗВЕДЁННЫМ
+        # сейфти, и через SAFETY_DELAY защита пропадала без единого слова. Строка, оборванная
+        # EOF без Enter, — тоже не подтверждение.
+        c=""
+        read -r -p "Соединение работает? [y/N]: " c || { c=""; echo; }
+        # glob, а не регэксп ^[yYдД]: в C-локали (LC_CTYPE=UTF-8, который macOS передаёт по SSH,
+        # на Linux не существует → bash в C) скобочное выражение — набор БАЙТОВ, и «нет»/«н»
+        # (первый байт 0xD0, как у «д») снимали сейфти, хотя вход НЕ работает. Glob сравнивает
+        # «д»/«Д» целиком и в C, и в UTF-8.
+        if [[ "$c" == [yY]* || "$c" == д* || "$c" == Д* ]]; then
             disarm_safety
             # сейфти мог сработать, пока шли установки модулей: «защита активна» без таблицы — ложь
             if nft -t list table inet na_filter >/dev/null 2>&1; then
@@ -2483,9 +2509,14 @@ else
             warn "Сейфти оставлен: через ${SAFETY_DELAY}s na_filter удалится сам."
             warn "Если всё ок — сними: systemctl stop na-fw-safety.timer  (или kill \$(cat $STATE_DIR/na-fw-safety.pid))"
         fi
-    else
+    elif nft -t list table inet na_filter >/dev/null 2>&1; then
         warn "Неинтерактивно: сейфти-таймер на ${SAFETY_DELAY}s АКТИВЕН."
         warn "Подтверди доступ и сними: systemctl stop na-fw-safety.timer"
+    else
+        # Сейфти успел сработать, пока после взвода шли apt (jq/conntrack), фиды блок-листов и
+        # fleet-sync. «Таймер АКТИВЕН — подтверди и сними» тут ложь: вход работает (файрвола-то
+        # нет), оператор снимал уже сработавший таймер и уходил с нодой без защиты.
+        err "Сейфти-таймер УЖЕ сработал (таблицы na_filter нет, автозагрузка выключена) — защиты сейчас нет. Прогони protect заново (SAFETY_DELAY=… побольше)."
     fi
     echo
     [[ "$FW_MODE" == "open" ]] && info "FW_MODE=open: не перечисленные порты открыты. Появится полный список — закрой всё ре-раном с FW_MODE=strict TCP_PORTS=… UDP_PORTS=…"
