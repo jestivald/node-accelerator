@@ -510,6 +510,18 @@ snapshot_bans; restore_bans" 2>&1)"
     check "временный файл убран" 0 "$(ls "$B/state"/.bans.* 2>/dev/null | wc -l | tr -d ' ')"
 fi
 
+echo "== v4.3: списки портов и лок в фоновом сейфти =="
+sed -n '/^_norm_port_list() {/,/^}/p' "$PROTECT" > "$T/normports.sh"
+np() { "$WBASH" -c "set -euo pipefail; . '$T/normports.sh'; _norm_port_list \"\$1\"" _ "$1" 2>&1; }
+check "«443, 8443» → 443,8443"            "443,8443"  "$(np '443, 8443')"
+check "«,22,,2222,» → 22,2222"            "22,2222"   "$(np ',22,,2222,')"
+check "« 22 » → 22"                        "22"        "$(np ' 22 ')"
+check "none/auto не трогаются"             "none auto" "$(np none) $(np auto)"
+check "«,» → пусто (протект отвергает)"    ""          "$(np ',')"
+# nohup-фолбэк сейфти (нет systemd-run) не должен наследовать лок protect (fd 9): `sleep`
+# держал его весь SAFETY_DELAY, и ре-ран/na-fw отказывались «идёт прогон protect»
+check "nohup-таймер сейфти закрывает fd 9" 1 "$(grep -c '>"$logf" 2>&1 9>&- &$' "$PROTECT")"
+
 echo
 echo "итого: ok=$PASS fail=$FAIL"
 [[ "$FAIL" -eq 0 ]]

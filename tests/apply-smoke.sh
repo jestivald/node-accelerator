@@ -508,7 +508,7 @@ else
     set +e; pty_protect $'y\n' "$L"; rc=$?; set -e
     [ "$rc" -eq 0 ] || { echo "[x] pty whitelist: прогон упал (exit $rc)"; tail -5 "$L"; fail=1; }
     grep -qF 'Whitelist IP/CIDR (панель, твои)  [198.51.100.50,203.0.113.60]' "$L" \
-        || { echo "[x] pty whitelist: подсказка не показывает сохранённый список (Enter его оставляет)"; grep -a 'Whitelist IP' "$L"; fail=1; }
+        || { echo "[x] pty whitelist: подсказка не показывает сохранённый список (Enter его оставляет)"; { grep -a 'Whitelist IP' "$L" || true; }; fail=1; }
     grep -q 'elements = { 198.51.100.50, 203.0.113.60' "$NFTF" || { echo "[x] pty whitelist: Enter не сохранил список из conf"; fail=1; }
 fi
 
@@ -553,6 +553,31 @@ FW_MODE=skip FLEET_SYNC=1 REMNAWAVE_URL=https://panel.example.com REMNAWAVE_TOKE
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || { echo "[x] bad-token: FW_MODE=skip (fleet не ставится) теперь отвергает неиспользуемый токен"; fail=1; }
+
+# ── v4.3: списки портов с пробелами и пустыми элементами ─────────────────────────
+# «443, 8443» — естественный ответ в интерактиве (из меню install.sh) — ронял прогон после
+# всех вопросов; «,22»/хвостовая запятая уходили в ruleset как `{ , 22 }`. Теперь пробелы и
+# пустые элементы убираются до проверки, а список из одних запятых — ошибка до применения.
+reset_t
+set +e
+TCP_PORTS="443, 8443" UDP_PORTS=",443,," SSH_PORT=" 22 " ENABLE_CROWDSEC=0 \
+  REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-ports.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "[x] ports: «443, 8443» уронил прогон (exit $rc)"; tail -5 "$T/apply-ports.log"; fail=1; }
+{ grep -q 'tcp dport 443 ct state new accept' "$NFTF" && grep -q 'tcp dport 8443 ct state new accept' "$NFTF"; } \
+    || { echo "[x] ports: в ruleset нет правил на 443 и 8443"; { grep -a 'ct state new accept' "$NFTF" 2>/dev/null | head -5 || true; }; fail=1; }
+grep -q 'tcp dport { 22 } ct state new ip  saddr @ssh4 accept' "$NFTF" || { echo "[x] ports: SSH_PORT « 22 » не нормализован"; fail=1; }
+grep -qE 'dport \{ *,|, *\}' "$NFTF" && { echo "[x] ports: пустой элемент дошёл до ruleset"; fail=1; }
+grep -q '^: "${TCP_PORTS:=443,8443}"$' "$T/conf/protect.conf" || { echo "[x] ports: в protect.conf не нормализованный список"; fail=1; }
+reset_t
+set +e
+TCP_PORTS="," ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-ports2.log" 2>&1
+rc=$?
+set -e
+{ [ "$rc" -ne 0 ] && grep -qF "TCP_PORTS=',' — ни одного порта" "$T/apply-ports2.log"; } \
+    || { echo "[x] ports: список из одних запятых не отвергнут"; tail -3 "$T/apply-ports2.log"; fail=1; }
+[ -e "$NFTF" ] && { echo "[x] ports: ruleset применён при отвергнутом списке"; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"

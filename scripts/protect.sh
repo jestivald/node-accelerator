@@ -254,6 +254,24 @@ fi
 # Неинтерактивно и без явного FW_MODE — strict (прежнее поведение не меняется).
 [[ -z "$FW_MODE" ]] && FW_MODE=strict
 
+# Списки портов — без пробелов и пустых элементов. «443, 8443» — естественный ввод в
+# интерактиве (с v4.3 меню install.sh задаёт эти вопросы и под curl|bash) — ронял прогон уже
+# после всех ответов; «,22», «22,,2222» и хвостовая запятая проходили проверку и уходили в
+# ruleset как `{ , 22 }`, и nft отвергал файл только после установки CrowdSec. Список из одних
+# запятых — ошибка, а не «портов нет»: закрыть все порты сервиса — осознанное слово none.
+_norm_port_list() {
+    local v="${1//[[:space:]]/}"
+    while [[ "$v" == *,,* ]]; do v="${v//,,/,}"; done
+    v="${v#,}"; v="${v%,}"
+    printf '%s' "$v"
+}
+for _k in SSH_PORT TCP_PORTS UDP_PORTS NODE_PORT UDP_BULK_PORTS; do
+    _v="$(_norm_port_list "${!_k:-}")"
+    if [[ -n "${!_k:-}" && -z "$_v" ]]; then err "$_k='${!_k}' — ни одного порта (закрыть все — словом none)"; exit 1; fi
+    printf -v "$_k" '%s' "$_v"
+done
+unset _k _v
+
 # none = осознанно пусто (пустой ENV — «как в conf», см. load_conf выше). В conf уходит само
 # слово none — иначе на следующем прогоне вернулся бы встроенный дефолт (UDP_PORTS → 443,2087).
 NA_NONE_KEYS=""
@@ -707,8 +725,11 @@ arm_safety() {
     mkdir -p "$STATE_DIR"
     local pidf="$STATE_DIR/na-fw-safety.pid" logf="$STATE_DIR/na-fw-safety.log"
     [[ -f "$pidf" && ! -L "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null || true; }
+    # 9>&- — лок protect (exec 9> в начале прогона) фоновому таймеру не нужен: унаследовав
+    # его, `sleep` держал лок весь SAFETY_DELAY — и после «y» (kill гасит sh, а не sleep):
+    # ре-ран protect и na-fw отказывались запускаться («идёт прогон protect»).
     nohup sh -c 'sleep "$1"; /usr/local/sbin/na-fw-safety-revert 2>/dev/null; rm -f "$2"' \
-        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 &
+        _ "$SAFETY_DELAY" "$pidf" >"$logf" 2>&1 9>&- &
     echo $! > "$pidf"
     ok "safety: nohup pid $(cat "$pidf")"
 }
@@ -2493,11 +2514,10 @@ else
         # EOF без Enter, — тоже не подтверждение.
         c=""
         read -r -p "Соединение работает? [y/N]: " c || { c=""; echo; }
-        # glob, а не регэксп ^[yYдД]: в C-локали (LC_CTYPE=UTF-8, который macOS передаёт по SSH,
-        # на Linux не существует → bash в C) скобочное выражение — набор БАЙТОВ, и «нет»/«н»
-        # (первый байт 0xD0, как у «д») снимали сейфти, хотя вход НЕ работает. Glob сравнивает
-        # «д»/«Д» целиком и в C, и в UTF-8.
-        if [[ "$c" == [yY]* || "$c" == д* || "$c" == Д* ]]; then
+        # is_yes (common.sh) — глоб, а не регэксп ^[yYдД]: в C-локали (LC_CTYPE=UTF-8, который
+        # macOS передаёт по SSH, на Linux не существует → bash в C) скобочное выражение — набор
+        # БАЙТОВ, и «нет»/«н» (первый байт 0xD0, как у «д») снимали сейфти, хотя вход НЕ работает.
+        if is_yes "$c"; then
             disarm_safety
             # сейфти мог сработать, пока шли установки модулей: «защита активна» без таблицы — ложь
             if nft -t list table inet na_filter >/dev/null 2>&1; then
