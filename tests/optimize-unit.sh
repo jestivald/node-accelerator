@@ -84,6 +84,9 @@ if a[:1] == ["--system"]:
             k = k.strip().lstrip("-").replace("/", "."); v = " ".join(v.split())
             p = path(k)
             if k in ro or not os.path.exists(p): continue
+            # как ядро: хэш conntrack — целыми страницами (4K / 8 Б на корзину = 512),
+            # и nf_conntrack_buckets при чтении отдаёт уже округлённый вверх размер
+            if k == "net.netfilter.nf_conntrack_buckets" and v.isdigit(): v = str(-(-int(v) // 512) * 512)
             open(p, "w").write(v.replace(" ", "\t") + "\n")
     sys.exit(0)
 sys.exit(1)
@@ -117,6 +120,8 @@ echo "journalctl $*" >> "$REC/calls"
 exit 0
 JC
 printf '#!/bin/sh\nexit 0\n' > "$BIN/systemd-tmpfiles"
+# страница 4K, как на x86_64 (на macOS у getconf 16K — песочница не должна от этого зависеть)
+printf '#!/bin/sh\necho 4096\n' > "$BIN/getconf"
 # date -Is (GNU) — для маркеров; на BSD date его нет
 cat > "$BIN/date" <<'DT'
 #!/bin/sh
@@ -266,6 +271,20 @@ echo "== 1d. снимок НЕ снимается, если наш файл уж
 rm -f "$T/state/sysctl.orig"
 run_sysctl
 expect_not "наш файл есть, снимка не было → не создаём (в ядре уже наши значения)" test -e "$T/state/sysctl.orig"
+
+echo "== 1e. nf_conntrack_buckets: ядро округляет хэш до страницы — это не «не применилось» =="
+# 1 ГБ-нода: MemTotal 1004852 kB → max 401940, четверть (100485) не кратна 512
+printf 'MemTotal:  1004852 kB\n' > "$T/proc/meminfo"
+kset net.netfilter.nf_conntrack_buckets 16384
+run_sysctl
+CTF="$T/etc/sysctl.d/99-node-accelerator-conntrack.conf"
+expect "rc=0" test "$rc" -eq 0
+expect_not "округлённый ядром buckets не объявлен «не применившимся»" grep -q 'не применились.*nf_conntrack_buckets' "$T/out"
+expect "в файле — размер, который ядро и применит (кратен 512)" \
+    test "$(awk '$1 == "net.netfilter.nf_conntrack_buckets" { print $3 % 512 }' "$CTF")" = 0
+expect "в ядре — значение из файла" test "$(kget net.netfilter.nf_conntrack_buckets)" = "$(awk '$1 == "net.netfilter.nf_conntrack_buckets" { print $3 }' "$CTF")"
+expect "сверка: «значения наших файлов действуют»" grep -q 'значения наших файлов действуют' "$T/out"
+printf 'MemTotal:  2048000 kB\n' > "$T/proc/meminfo"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo "== 2. journald: 10-na-size.conf, volatile → persistent, явный Storage оператора =="
@@ -430,7 +449,7 @@ set -euo pipefail
 . "$T/xm-section.sh"
 case "\$1" in
   pre)  xanmod_preflight ;;
-  post) v="\$(xanmod_kver linux-xanmod-x64v3)"; echo "KVER=\$v"; why="\$(xanmod_postcheck "\$v" ens18)" && echo READY || echo "RISK=\$why" ;;
+  post) v="\$(xanmod_kver linux-xanmod-x64v3)"; echo "KVER=\$v"; why="\$(xanmod_postcheck "\$v" "\${2:-ens18}")" && echo READY || echo "RISK=\$why" ;;
 esac
 WRAP
 xm() { rc=0; : > "$REC/calls"; "$WBASH" "$T/wrap-xm.sh" "$@" > "$T/out" 2>&1 || rc=$?; return 0; }
@@ -473,8 +492,147 @@ expect "нет initrd → пробуем пересобрать (update-initramf
 expect "…не вышло → риск назван" grep -q "RISK=нет $T/boot/initrd.img-$KV" "$T/out"
 NA_TEST_INITRD_FIX=1 xm post
 expect "пересборка initrd удалась → READY" grep -qx READY "$T/out"
+# Xen netfront (AWS t2/m4, Xen-VPS): драйвер в sysfs зовётся «vif», модуль — xen-netfront.ko.
+# Сверять надо модуль (…/device/driver/module), а не имя драйвера.
+mkdir -p "$SYSN/eth0/device" "$T/sys/bus/xen/drivers/vif" "$T/sys/module/xen_netfront"
+ln -sfn "$T/sys/module/xen_netfront" "$T/sys/bus/xen/drivers/vif/module"
+ln -sfn "$T/sys/bus/xen/drivers/vif" "$SYSN/eth0/device/driver"
+: > "$T/lib/modules/$KV/kernel/drivers/net/xen-netfront.ko.xz"
+xm post eth0
+expect "Xen netfront: драйвер «vif» найден как модуль xen-netfront → READY" grep -qx READY "$T/out"
+rm -f "$T/lib/modules/$KV/kernel/drivers/net/xen-netfront.ko.xz"
+xm post eth0
+expect "…модуля в новом ядре нет → риск назван по модулю" grep -q 'RISK=драйвера NIC eth0 (xen_netfront) нет' "$T/out"
 expect "установка ядра идёт только после предполётной проверки" grep -q 'elif xanmod_preflight; then' "$OPT"
 expect "риск печатается до рапорта «нужна перезагрузка»" grep -q 'НЕ ПЕРЕЗАГРУЖАЙСЯ, пока не исправлено' "$OPT"
+
+echo "== 5b. XanMod: сбой репо на ре-ране не сносит рабочий list и проверенный ключ =="
+# Ре-ран на ноде, где ядро XanMod уже стоит («обновляю только репозиторий»): временный
+# отказ deb.xanmod.org или ответ-заглушка вместо ключа не должны выключать обновления ядра.
+awk '/^xanmod_import_key\(\) \{/{f=1} /^# Список пакетов-кандидатов/{f=0} f' "$OPT" \
+  | "$REAL_SED" -e "s#/etc/apt/keyrings#$T/etc/apt/keyrings#g" \
+                -e "s#/etc/apt/sources\.list\.d#$T/etc/apt/sources.list.d#g" > "$T/xm-repo.sh"
+[ -s "$T/xm-repo.sh" ] || { echo "  ✘ не смог извлечь функции репо XanMod из optimize.sh"; fail=1; }
+cat > "$BIN/curl" <<'CU'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do [ "$1" = -o ] && { out="$2"; shift; }; shift; done
+[ "${NA_TEST_CURL:-ok}" = ok ] || exit 22
+echo KEY > "$out"
+CU
+# apt-get: скоупленный update по list'у XanMod падает при NA_TEST_XM_UPD=fail
+cat > "$BIN/apt-get" <<'AG'
+#!/bin/sh
+echo "apt-get $*" >> "$REC/apt-xm"
+case "$*" in *" update "*"Dir::Etc::sourcelist="*) [ "${NA_TEST_XM_UPD:-ok}" = fail ] && exit 100 ;; esac
+exit 0
+AG
+chmod +x "$BIN/curl" "$BIN/apt-get"
+cat > "$T/wrap-xmrepo.sh" <<WRAP
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/scripts/lib/common.sh"
+APT_LOCK=(-o DPkg::Lock::Timeout=300)
+XANMOD_FP="D38D7D1DA1349567ADED882D86F7D09EE734E623"
+XANMOD_FLAVOR="\${XANMOD_FLAVOR:-lts}"
+OS_CODENAME=trixie
+# как настоящий import_pinned_key: при ЛЮБОМ отказе удаляет файл назначения
+import_pinned_key() { if [ "\${NA_TEST_KEY_OK:-1}" = 1 ]; then echo pinned > "\$3"; return 0; fi; rm -f "\$3"; return 1; }
+. "$T/xm-repo.sh"
+rc=0; setup_xanmod_repo || rc=\$?
+echo "RC=\$rc FLAVOR=\$XANMOD_FLAVOR"
+WRAP
+xmrepo() { rc=0; "$WBASH" "$T/wrap-xmrepo.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
+XKR="$T/etc/apt/keyrings/xanmod-archive-keyring.gpg"; XL="$T/etc/apt/sources.list.d/xanmod-release.list"
+mkdir -p "$T/etc/apt/keyrings" "$T/etc/apt/sources.list.d"
+printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] https://deb.xanmod.org trixie main\n' > "$XL"
+cp "$XL" "$T/xl.first"; echo old-pinned > "$XKR"
+XANMOD_FLAVOR=main NA_TEST_XM_UPD=fail xmrepo
+expect "сбой репо: rc=1 (вызывающий скажет «не обновлён»)" grep -q '^RC=1 ' "$T/out"
+expect "рабочий list не удалён и не переписан на bookworm" cmp -s "$T/xl.first" "$XL"
+expect "сборка не подменена на lts провалившимся фолбэком (иначе save_conf её закрепит)" grep -q 'FLAVOR=main$' "$T/out"
+echo old-pinned > "$XKR"
+NA_TEST_KEY_OK=0 xmrepo
+expect "ключ не сошёлся с отпечатком: rc=1" grep -q '^RC=1 ' "$T/out"
+expect "…прежний проверенный keyring не удалён" grep -qx old-pinned "$XKR"
+expect "…list не тронут" cmp -s "$T/xl.first" "$XL"
+expect_not "…временный файл ключа не остался" compgen -G "$T/etc/apt/keyrings/*.na-*"
+# первая установка: list'а не было — при отказе битый источник не оставляем (как раньше)
+rm -f "$XL"
+NA_TEST_XM_UPD=fail xmrepo
+expect "первая установка + сбой репо: list не оставлен" test ! -e "$XL"
+xmrepo
+expect "первая установка: list записан" grep -q 'deb.xanmod.org trixie main' "$XL"
+expect "…и ключ из проверки на месте" grep -qx pinned "$XKR"
+
+echo "== 5c. ре-ран до перезагрузки: ядро XanMod прошлого прогона всё ещё ждёт ребута =="
+# Исполняем сам блок выбора ядра (секция 2) поверх его хелперов. Прошлый прогон поставил
+# XanMod (reboot_needed=1 в маркере, та же загрузка), ре-ран ядро сам не ставит.
+{ awk '/^NA_SB_EFIVAR=/{f=1} /^install_xanmod\(\) \{/{f=0} f' "$OPT"
+  awk '/^if .*ENABLE_XANMOD" == "1"/{f=1} /^# ─── 2b\./{f=0} f' "$OPT"; } \
+  | "$REAL_SED" -e "s#/sys/firmware#$T/sys/firmware#g" -e "s#/boot/#$T/boot/#g" \
+                -e "s#/lib/modules#$T/lib/modules#g" -e "s#/sys/class/net#$SYSN#g" \
+                -e "s#/proc/sys/kernel/random/boot_id#$T/proc/boot_id#g" > "$T/xm-pend.sh"
+grep -q 'ENABLE_XANMOD=0 — установка ядра пропущена' "$T/xm-pend.sh" \
+    || { echo "  ✘ не смог извлечь блок выбора ядра из optimize.sh"; fail=1; }
+printf '#!/bin/sh\ncase "$1" in -m) echo x86_64 ;; -r) echo "${NA_TEST_UNAME_R:-6.12.48+deb13-amd64}" ;; *) echo Linux ;; esac\n' > "$BIN/uname"
+printf '#!/bin/sh\necho kvm\n' > "$BIN/systemd-detect-virt"
+printf '#!/bin/sh\necho "default via 10.0.0.1 dev ens18 proto static"\n' > "$BIN/ip"
+cat > "$BIN/dpkg-query" <<'DQ'
+#!/bin/sh
+case "$*" in *Status-Abbrev*) printf '%s' "${NA_TEST_DPKG_STATUS:-ii }"; exit 0 ;; esac
+echo "linux-image-6.18.52-x64v3-xanmod1, linux-headers-6.18.52-x64v3-xanmod1"
+DQ
+chmod +x "$BIN/uname" "$BIN/systemd-detect-virt" "$BIN/ip" "$BIN/dpkg-query"
+cat > "$T/wrap-pend.sh" <<WRAP
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/scripts/lib/common.sh"
+STATE_DIR="$T/state5c"
+ENABLE_XANMOD="\${ENABLE_XANMOD:-1}"
+REBOOT_NEEDED=0; REBOOT_WHY=""; XANMOD_RISK=""
+setup_xanmod_repo() { return 0; }
+# установка в этом прогоне: fail — репо не поднялось; ok — поставили (как install_xanmod)
+install_xanmod() {
+    [ "\${NA_TEST_INSTALL:-fail}" = ok ] || { echo "INSTALL-FAILED"; return 1; }
+    REBOOT_NEEDED=1; REBOOT_WHY="\${REBOOT_WHY:+\$REBOOT_WHY; }новое ядро XanMod (linux-xanmod-x64v3)"
+}
+. "$T/xm-pend.sh"
+printf 'REBOOT_NEEDED=%s\nREBOOT_WHY=%s\nXANMOD_RISK=%s\n' "\$REBOOT_NEEDED" "\$REBOOT_WHY" "\$XANMOD_RISK"
+WRAP
+pend() { rc=0; : > "$REC/calls"; "$WBASH" "$T/wrap-pend.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
+mkdir -p "$T/state5c" "$T/proc"
+echo 5c1e1d0a-0000-4000-8000-000000000001 > "$T/proc/boot_id"
+echo linux-xanmod-x64v3 > "$T/state5c/xanmod.pkg"
+printf '%s\n' "installed_at=2026-11-23T10:00:00+00:00" "na_version=4.2" "xanmod=linux-xanmod-x64v3" \
+    "reboot_needed=1" "boot_id=5c1e1d0a-0000-4000-8000-000000000001" > "$T/state5c/optimize.installed"
+echo x > "$T/boot/initrd.img-$KV"
+ENABLE_XANMOD=0 pend
+expect "ENABLE_XANMOD=0: rc=0" test "$rc" -eq 0
+expect "ENABLE_XANMOD=0: ребут по-прежнему нужен (reboot_needed=1 в маркер)" grep -qx 'REBOOT_NEEDED=1' "$T/out"
+expect "…причина — ядро XanMod прошлого прогона" grep -q '^REBOOT_WHY=.*XanMod (linux-xanmod-x64v3, поставлено прошлым прогоном)' "$T/out"
+expect "…готовность ядра перепроверена: initrd и драйвер на месте" grep -qx 'XANMOD_RISK=' "$T/out"
+NA_TEST_BOOT_FREE=150 pend
+expect "/boot после установки ядра стал теснее порога: ядро не ставим…" grep -q 'свободно 150 МБ' "$T/out"
+expect "…но ребут, которого ждёт уже стоящее ядро, не забыт" grep -qx 'REBOOT_NEEDED=1' "$T/out"
+pend
+expect "репо недоступно (установка не прошла) — ребут не забыт" grep -qx 'REBOOT_NEEDED=1' "$T/out"
+rm -f "$T/boot/initrd.img-$KV"
+ENABLE_XANMOD=0 pend
+expect "initrd нового ядра пропал — «НЕ ПЕРЕЗАГРУЖАЙСЯ» снова с причиной" grep -q "^XANMOD_RISK=нет $T/boot/initrd.img-$KV" "$T/out"
+echo x > "$T/boot/initrd.img-$KV"
+NA_TEST_INSTALL=ok pend
+expect "установка в этом прогоне: причина не задвоена" test "$(grep -o 'XanMod' "$T/out" | wc -l | tr -d ' ')" -le 2
+expect_not "…и без пометки «прошлым прогоном»" grep -q 'поставлено прошлым прогоном' "$T/out"
+echo 5c1e1d0a-0000-4000-8000-000000000002 > "$T/proc/boot_id"
+ENABLE_XANMOD=0 pend
+expect "после перезагрузки (другой boot_id) прошлый флаг не переносится" grep -qx 'REBOOT_NEEDED=0' "$T/out"
+echo 5c1e1d0a-0000-4000-8000-000000000001 > "$T/proc/boot_id"
+ENABLE_XANMOD=0 NA_TEST_UNAME_R=6.18.52-x64v3-xanmod1 pend
+expect "уже загружены с XanMod — ребут не нужен" grep -qx 'REBOOT_NEEDED=0' "$T/out"
+ENABLE_XANMOD=0 NA_TEST_DPKG_STATUS='un ' pend
+expect "пакет XanMod снят (dpkg: не установлен) — ребут не нужен" grep -qx 'REBOOT_NEEDED=0' "$T/out"
+rm -f "$BIN/uname" "$BIN/systemd-detect-virt" "$BIN/ip"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo "== 6. common: default_iface и apt_install =="
@@ -511,6 +669,62 @@ expect "update — тоже с таймаутом лока" grep -q 'apt-get -o 
 rc=0; NA_TEST_APT_FAIL_ONCE=1 "$WBASH" "$T/wrap-common.sh" apt > "$T/out" 2>&1 || rc=$?
 expect "ретрай после неудачи тоже с таймаутом лока" test "$(grep -c 'DPkg::Lock::Timeout=120 install -y -qq --no-install-recommends foo bar' "$REC/apt")" -eq 2
 expect_not "ни одного вызова apt-get без таймаута лока" grep -qv 'DPkg::Lock::Timeout=120' "$REC/apt"
+
+# ════════════════════════════════════════════════════════════════════════════
+echo "== 7. итог THP и irqbalance: ✔ только по факту (1 vCPU, контейнер) =="
+# ════════════════════════════════════════════════════════════════════════════
+{ awk '/^# ─── 9\. THP off/{f=1} /^# ─── 10\./{f=0} f' "$OPT"
+  awk '/^# ─── 11\. irqbalance/{f=1} /^# ─── 12\./{f=0} f' "$OPT"; } \
+  | "$REAL_SED" -e "s#/sys/kernel/mm#$T/sys7/kernel/mm#g" -e "s#/etc/systemd/system/#$T/units7/#g" > "$T/fin-section.sh"
+grep -q 'title "irqbalance"' "$T/fin-section.sh" || { echo "  ✘ не смог извлечь секции 9/11 из optimize.sh"; fail=1; }
+THP7="$T/sys7/kernel/mm/transparent_hugepage"
+# systemctl: `enable --now na-thp-off` исполняет ExecStart (sysfs только на чтение — запись
+# молча не проходит, как в контейнере); `is-active irqbalance` — по NA_TEST_IRQ
+cat > "$BIN/systemctl" <<'SC'
+#!/bin/sh
+echo "systemctl $*" >> "$REC/calls"
+case "$*" in
+  "enable --now na-thp-off.service")
+    [ "${NA_TEST_THP_RO:-0}" = 1 ] || [ ! -d "$NA_T/sys7/kernel/mm/transparent_hugepage" ] \
+      || echo 'always madvise [never]' > "$NA_T/sys7/kernel/mm/transparent_hugepage/enabled" ;;
+  "is-active --quiet irqbalance") [ "${NA_TEST_IRQ:-active}" = active ] || exit 3 ;;
+esac
+exit 0
+SC
+printf '#!/bin/sh\necho "${NA_TEST_NCPU:-4}"\n' > "$BIN/nproc"
+printf '#!/bin/sh\necho "${NA_TEST_VIRT:-kvm}"\n' > "$BIN/systemd-detect-virt"
+chmod +x "$BIN/systemctl" "$BIN/nproc" "$BIN/systemd-detect-virt"
+cat > "$T/wrap-fin.sh" <<WRAP
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/scripts/lib/common.sh"
+STATE_DIR="$T/state7"
+. "$T/fin-section.sh"
+WRAP
+fin() { rc=0; : > "$REC/calls"; rm -rf "$T/state7" "$T/units7"; mkdir -p "$T/state7" "$T/units7"
+        "$WBASH" "$T/wrap-fin.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
+mkdir -p "$THP7"; echo 'always [madvise] never' > "$THP7/enabled"
+fin
+expect "VM: rc=0" test "$rc" -eq 0
+expect "VM: THP реально never → ✔ «THP отключён»" grep -q '\[+\].*THP отключён' "$T/out"
+expect "4 vCPU, демон работает → ✔ «irqbalance запущен»" grep -q '\[+\].*irqbalance запущен' "$T/out"
+echo 'always [madvise] never' > "$THP7/enabled"
+NA_TEST_VIRT=lxc NA_TEST_THP_RO=1 NA_TEST_IRQ=inactive fin
+expect "контейнер: rc=0" test "$rc" -eq 0
+expect_not "контейнер: sysfs только на чтение — ✔ «THP отключён» не печатается" grep -q 'THP отключён' "$T/out"
+expect "…сказано, что THP задаёт хост" grep -q 'THP: madvise — контейнер' "$T/out"
+expect_not "контейнер: ConditionVirtualization — ✔ «irqbalance запущен» не печатается" grep -q 'irqbalance запущен' "$T/out"
+NA_TEST_THP_RO=1 NA_TEST_IRQ=inactive fin
+expect "VM: THP не переключился — warn с текущим режимом" grep -q '\[!\].*THP не отключился (сейчас: madvise)' "$T/out"
+expect "VM 4 vCPU: демон не поднялся — warn" grep -q '\[!\].*irqbalance не запустился' "$T/out"
+NA_TEST_NCPU=1 NA_TEST_IRQ=inactive fin
+expect_not "1 vCPU: ✔ «irqbalance запущен» не печатается" grep -q 'irqbalance запущен' "$T/out"
+expect "…сказано, что на 1 vCPU он не нужен" grep -q 'irqbalance: 1 vCPU' "$T/out"
+rm -rf "$THP7"
+fin
+expect "THP в ядре нет: rc=0" test "$rc" -eq 0
+expect_not "THP в ядре нет — ✔ не печатается" grep -q 'THP отключён' "$T/out"
+expect "…сказано, что отключать нечего" grep -q 'THP в этом ядре нет' "$T/out"
 
 if [ "$fail" -ne 0 ]; then echo "OPTIMIZE-UNIT: FAIL"; exit 1; fi
 echo "OPTIMIZE-UNIT: OK (sysctl: виновник назван, резерв портов, снимок только при первом прогоне; journald 10-*, persistent; откат runtime; XanMod: Secure Boot//boot/initrd/драйвер NIC; default_iface после dev; apt ждёт лок)"
