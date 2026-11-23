@@ -84,6 +84,9 @@ if a[:1] == ["--system"]:
             k = k.strip().lstrip("-").replace("/", "."); v = " ".join(v.split())
             p = path(k)
             if k in ro or not os.path.exists(p): continue
+            # как ядро: хэш conntrack — целыми страницами (4K / 8 Б на корзину = 512),
+            # и nf_conntrack_buckets при чтении отдаёт уже округлённый вверх размер
+            if k == "net.netfilter.nf_conntrack_buckets" and v.isdigit(): v = str(-(-int(v) // 512) * 512)
             open(p, "w").write(v.replace(" ", "\t") + "\n")
     sys.exit(0)
 sys.exit(1)
@@ -117,6 +120,8 @@ echo "journalctl $*" >> "$REC/calls"
 exit 0
 JC
 printf '#!/bin/sh\nexit 0\n' > "$BIN/systemd-tmpfiles"
+# страница 4K, как на x86_64 (на macOS у getconf 16K — песочница не должна от этого зависеть)
+printf '#!/bin/sh\necho 4096\n' > "$BIN/getconf"
 # date -Is (GNU) — для маркеров; на BSD date его нет
 cat > "$BIN/date" <<'DT'
 #!/bin/sh
@@ -266,6 +271,20 @@ echo "== 1d. снимок НЕ снимается, если наш файл уж
 rm -f "$T/state/sysctl.orig"
 run_sysctl
 expect_not "наш файл есть, снимка не было → не создаём (в ядре уже наши значения)" test -e "$T/state/sysctl.orig"
+
+echo "== 1e. nf_conntrack_buckets: ядро округляет хэш до страницы — это не «не применилось» =="
+# 1 ГБ-нода: MemTotal 1004852 kB → max 401940, четверть (100485) не кратна 512
+printf 'MemTotal:  1004852 kB\n' > "$T/proc/meminfo"
+kset net.netfilter.nf_conntrack_buckets 16384
+run_sysctl
+CTF="$T/etc/sysctl.d/99-node-accelerator-conntrack.conf"
+expect "rc=0" test "$rc" -eq 0
+expect_not "округлённый ядром buckets не объявлен «не применившимся»" grep -q 'не применились.*nf_conntrack_buckets' "$T/out"
+expect "в файле — размер, который ядро и применит (кратен 512)" \
+    test "$(awk '$1 == "net.netfilter.nf_conntrack_buckets" { print $3 % 512 }' "$CTF")" = 0
+expect "в ядре — значение из файла" test "$(kget net.netfilter.nf_conntrack_buckets)" = "$(awk '$1 == "net.netfilter.nf_conntrack_buckets" { print $3 }' "$CTF")"
+expect "сверка: «значения наших файлов действуют»" grep -q 'значения наших файлов действуют' "$T/out"
+printf 'MemTotal:  2048000 kB\n' > "$T/proc/meminfo"
 
 # ════════════════════════════════════════════════════════════════════════════
 echo "== 2. journald: 10-na-size.conf, volatile → persistent, явный Storage оператора =="

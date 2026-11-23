@@ -745,7 +745,13 @@ _mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 104857
 CT_MAX=$(( _mem_kb * 1024 / 8 / 320 ))
 [[ "$CT_MAX" -gt 2000000 ]] && CT_MAX=2000000
 [[ "$CT_MAX" -lt 262144  ]] && CT_MAX=262144
-CT_BUCKETS=$(( CT_MAX / 4 ))
+# Хэш conntrack ядро выделяет целыми страницами (nf_ct_alloc_hashtable: roundup до
+# PAGE_SIZE/8 корзин — 512 на 4K) и nf_conntrack_buckets при чтении отдаёт уже
+# округлённый размер. Пишем сразу его: иначе сверка ниже почти на любой ноде ≥ 1 ГБ
+# (четверть max не кратна 512) печатала «не применились (ядро/контейнер не дал
+# записать?)» вместо ✔ — ложная тревога в каждом прогоне.
+_pg="$(getconf PAGESIZE 2>/dev/null || true)"; [[ "$_pg" =~ ^[0-9]+$ ]] && (( _pg >= 4096 )) || _pg=4096
+CT_BUCKETS=$(( (CT_MAX / 4 + _pg / 8 - 1) / (_pg / 8) * (_pg / 8) ))
 cat > "$SYSCTL_CT_NEW" <<CT
 # node-accelerator: ёмкость conntrack под RAM этой ноды (~$(( _mem_kb / 1024 )) MB)
 net.netfilter.nf_conntrack_max     = $CT_MAX
