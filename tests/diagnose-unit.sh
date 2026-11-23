@@ -35,7 +35,7 @@
 #       глубину журнала пропадал); серты встроенного CA Caddy (`tls internal`, 12 ч) — не
 #       вечный ✘ «renewal сломан»; слои whitelist сверяются покрытием, а не текстом (живой
 #       набор с auto-merge склеивает соседние адреса — это не дрейф); MSS-коллапс — только
-#       по полю mss:, а не rcvmss:/advmss:.
+#       по полю mss:, а не rcvmss:/advmss:; маска RPS на >32 CPU (группы через запятую).
 #
 # Не требует root/сети/nft/docker. Запуск: bash tests/diagnose-unit.sh
 set -euo pipefail
@@ -1265,6 +1265,20 @@ sed -i.bak 's/mss:1400 pmtu:1500 rcvmss:120/mss:88 pmtu:1500 rcvmss:536/' "$SSD/
 env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o26b.json" 2>/dev/null || true
 check "json: send-MSS 88 — в счёте"                              1 "$(jget "$T/o26b.json" mss_collapsed_sockets)"
 cp "$T/estab-mss.orig" "$SSD/estab-mss"
+
+echo "== 27. RPS: маска на >32 CPU — группы через запятую (v4.3) =="
+# rps_cpus на машине с >32 CPU — группы по 32 бита через запятую: «00000000,00000000». Проверка
+# '^0+$' такую строку не узнавала: выключенный RPS шёл как ✔ «RPS включён», а юнит na-rps —
+# как ✔ «активен» вместо ▲ про гонку на буте.
+printf '00000000,00000000\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o27.txt" 2>/dev/null || true
+grep_not "нулевая маска из двух групп — не ✔ «RPS включён»" "✔  RPS включён" "$T/o27.txt"
+grep_ok  "…а ▲ «RPS выключен»"                              "▲  RPS выключен" "$T/o27.txt"
+grep_ok  "…и ▲ про юнит, отработавший вхолостую"            "na-rps.service active, но rps_cpus пуст" "$T/o27.txt"
+printf '00000000,0000000f\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o27b.txt" 2>/dev/null || true
+grep_ok  "ненулевая маска из двух групп — ✔"               "✔  RPS включён" "$T/o27b.txt"
+printf '0\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"

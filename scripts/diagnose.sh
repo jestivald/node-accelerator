@@ -1408,8 +1408,10 @@ if [[ -n "$NIC" ]]; then
     info "NIC: $NIC   driver: ${DRV:-?}   txqueuelen: $(cat /sys/class/net/$NIC/tx_queue_len 2>/dev/null || echo '?')"
     RXQ=$(ls -d /sys/class/net/"$NIC"/queues/rx-* 2>/dev/null | wc -l | tr -d " ")
     RPS_ON=0
+    # маска на >32 CPU — группы по 32 бита через запятую («00000000,00000000»): '^0+$' её не
+    # узнавал, и выключенный RPS шёл как ✔ «RPS включён» (а юнит — как «активен»)
     for q in /sys/class/net/"$NIC"/queues/rx-*/rps_cpus; do
-        [[ -f "$q" ]] && grep -qvE '^0+$' "$q" 2>/dev/null && RPS_ON=1
+        [[ -f "$q" ]] && grep -qvE '^[0,]+$' "$q" 2>/dev/null && RPS_ON=1
     done
     [[ "$RXQ" -gt 1 ]] && info "RX-очередей: $RXQ (multi-queue)" || info "RX-очередей: $RXQ (single-queue — RPS критичен)"
     # RX-очередей не меньше, чем ядер: приём уже размазан аппаратно (RSS), RPS поверх
