@@ -1047,9 +1047,14 @@ emit_json() {
 # журналу, без `cscli -a` (десятки тысяч решений), без apt-cache, steal окном 1 с. Поля
 # остаются на местах, неизмеренные — −1/пусто. Полный --json на ноде с большим журналом
 # и одним vCPU занимает десятки секунд.
-NA_FAST=0
-[[ "${NA_DIAG_FAST:-0}" == 1 || "${2:-}" == "--fast" ]] && NA_FAST=1
-if [[ "${1:-}" == "--json" ]]; then emit_json; exit 0; fi
+# Флаги — в любом порядке: до v4.3 `--json` узнавался только первым, а `--fast` — только
+# вторым, и `na-diagnose --fast --json` печатал человекочитаемый отчёт вместо JSON (опрос
+# мониторинга получал невалидный документ).
+NA_FAST=0; NA_JSON=0
+for _a in "$@"; do case "$_a" in --json) NA_JSON=1 ;; --fast) NA_FAST=1 ;; esac; done
+unset _a
+[[ "${NA_DIAG_FAST:-0}" == 1 ]] && NA_FAST=1
+if [[ "$NA_JSON" == 1 ]]; then emit_json; exit 0; fi
 
 # ─── Глубокий разбор retrans (`--retrans [--window N]`) ───────────────────────
 # Панель/`--json` показывают tcp_retrans_pct и mss_collapsed — это инструмент
@@ -1498,8 +1503,10 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
     else
         info "autoban: v4=0  v6=0 (нода никого не банила)"
     fi
-    WLN=$(nft list set inet na_filter whitelist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l | tr -d ' ')
-    WL6N=$(nft list set inet na_filter whitelist_v6 2>/dev/null | grep -c ':')
+    # адреса, а не строки вывода: `grep -c ':'` давал «v6=1» при трёх адресах в одной строке
+    # elements = { … } (тот же класс, что #32 у autoban)
+    WLN="$(nft_set_count inet na_filter whitelist_v4)"
+    WL6N="$(nft_set_count inet na_filter whitelist_v6)"
     if [[ "$WLN" -gt 0 || "$WL6N" -gt 0 ]]; then pass "whitelist: v4=$WLN v6=$WL6N адрес(ов)"
     else wrn "whitelist пуст — твой IP не защищён от автобана!"; fi
     # Дрейф живого сета от файла. Адреса, добавленные на ходу через `nft add element`,

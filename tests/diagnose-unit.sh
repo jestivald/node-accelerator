@@ -1299,6 +1299,23 @@ check   "--retrans: временных файлов не создаёт (mktemp 
 grep_ok "--retrans: дропы NIC за окно по-прежнему видны"          "nic: rx_dropped:" "$T/o28.txt"
 rm -f "$BIN/ethtool" "$BIN/mktemp" "$T/mktemp.calls" "$T/ethtool.n"
 
+echo "== 29. v4.3: флаги --json/--fast в любом порядке =="
+# `--fast --json` печатал человекочитаемый отчёт: --json узнавался только первым аргументом
+env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" --fast --json > "$T/o29.json" 2>/dev/null || true
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$T/o29.json" 2>/dev/null; then
+    PASS=$((PASS+1)); echo "  ok   --fast --json — валидный JSON"
+else FAIL=$((FAIL+1)); echo "  FAIL --fast --json — не JSON: $(head -c 200 "$T/o29.json")"; fi
+check "--fast --json — быстрый режим (журнал не читается: -1)" -1 "$(jget "$T/o29.json" portscan_log_lines_24h)"
+env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" --json --fast > "$T/o29b.json" 2>/dev/null || true
+check "--json --fast — как и раньше, быстрый режим" -1 "$(jget "$T/o29b.json" portscan_log_lines_24h)"
+
+echo "== 30. v4.3: счётчик whitelist v6 — адреса, а не строки =="
+cp "$NFTD/set-whitelist_v6" "$T/wl6.saved"
+printf 'table inet na_filter {\n\tset whitelist_v6 {\n\t\ttype ipv6_addr\n\t\telements = { 2001:db8::1, 2001:db8::2, 2001:db8:1::/48 }\n\t}\n}\n' > "$NFTD/set-whitelist_v6"
+env "$SSHENV" TERM=dumb "$WBASH" "$DIAG" > "$T/o30.txt" 2>/dev/null || true
+grep_ok "три v6-адреса в одной строке — v6=3" "whitelist: v4=3 v6=3 адрес(ов)" "$T/o30.txt"
+cp "$T/wl6.saved" "$NFTD/set-whitelist_v6"
+
 echo
 echo "  прогон: $PASS ok, $FAIL fail"
 if [[ "$FAIL" -ne 0 ]]; then echo "DIAGNOSE-UNIT: FAIL"; exit 1; fi
