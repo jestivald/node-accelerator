@@ -329,6 +329,18 @@ if [[ -n "$CADDY_AUTH_API_TOKEN" || -n "$REMNAWAVE_TOKEN" ]]; then
     done
     unset _u
 fi
+# Токены уходят в fleet.env (см. блок fleet-sync) — набор символов проверяем ЗДЕСЬ, до любых
+# изменений, при том же условии, при котором fleet.env пишется. До v4.3 проверка стояла в
+# блоке fleet-sync, ПОСЛЕ nft -f и взвода сейфти: кривой токен ронял прогон с уже применённым
+# ruleset и взведённым сейфти, а тот через SAFETY_DELAY снимал таблицу И автозагрузку — нода
+# оставалась без файрвола, хотя оператор видел лишь ошибку валидации.
+if [[ "$FW_MODE" != "skip" && "$FLEET_SYNC" != "0" ]] \
+   && { [[ -n "$REMNAWAVE_NODES_URL" ]] || [[ -n "$REMNAWAVE_URL" && -n "$REMNAWAVE_TOKEN" ]]; }; then
+    for _k in REMNAWAVE_TOKEN CADDY_AUTH_API_TOKEN; do
+        [[ -z "${!_k}" || "${!_k}" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] \
+            || { err "$_k: недопустимые символы (ожидается base64/JWT/hex-подобный токен)"; exit 1; }
+    done
+fi
 unset _k
 
 # Порт ТЕКУЩЕЙ SSH-сессии — ground truth (sshd её уже принял, гадать не нужно). Если он
@@ -1755,13 +1767,8 @@ if [[ "$FLEET_ON" == "1" ]]; then
         umask 077; mkdir -p "$CONF_DIR"
         # fleet.env хелпер подключает через `.` от root каждые 5 минут: до v4.2 значения
         # писались как есть, и токен вида `abc;cmd` исполнял cmd, а `abc def` молча давал
-        # пустой токен (синк навсегда на last-known-good). Набор символов токена проверяем,
-        # значения пишем в экранированном виде (%q).
-        for _k in REMNAWAVE_TOKEN CADDY_AUTH_API_TOKEN; do
-            [[ -z "${!_k}" || "${!_k}" =~ ^[A-Za-z0-9._~+/=:-]+$ ]] \
-                || { err "$_k: недопустимые символы (ожидается base64/JWT/hex-подобный токен)"; exit 1; }
-        done
-        unset _k
+        # пустой токен (синк навсегда на last-known-good). Набор символов токена проверен в
+        # валидации (до применения), значения пишем в экранированном виде (%q).
         {
             [[ -z "$REMNAWAVE_URL"            ]] || printf 'REMNAWAVE_URL=%q\n' "$REMNAWAVE_URL"
             [[ -z "$REMNAWAVE_TOKEN"          ]] || printf 'REMNAWAVE_TOKEN=%q\n' "$REMNAWAVE_TOKEN"

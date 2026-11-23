@@ -530,6 +530,30 @@ printf '#!/bin/sh\nexit 0\n' > "$T/bin/nft"; chmod +x "$T/bin/nft"
 grep -qF 'АКТИВЕН' "$T/apply-fired.log" && { echo "[x] safety-fired: «таймер АКТИВЕН» при уже сработавшем сейфти"; fail=1; }
 grep -qF 'Сейфти-таймер УЖЕ сработал' "$T/apply-fired.log" || { echo "[x] safety-fired: не сказано, что сейфти уже сработал и защиты нет"; fail=1; }
 
+# ── Кривой токен fleet-sync отвергается ДО применения ──
+# Проверка набора символов токенов стояла в блоке fleet-sync — ПОСЛЕ nft -f и взвода сейфти:
+# прогон падал «недопустимые символы» с уже применённым ruleset и взведённым сейфти, а тот
+# через SAFETY_DELAY снимал таблицу И автозагрузку — нода оставалась без файрвола (и после
+# ребута), хотя оператор видел лишь ошибку валидации.
+reset_t; : > "$NA_TEST_SYSTEMCTL_LOG"
+set +e
+FLEET_SYNC=1 REMNAWAVE_URL=https://panel.example.com REMNAWAVE_TOKEN=tok CADDY_AUTH_API_TOKEN='s3cr3t!#x' \
+  ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-badtok.log" 2>&1
+rc=$?
+set -e
+{ [ "$rc" -ne 0 ] && grep -qF 'CADDY_AUTH_API_TOKEN: недопустимые символы' "$T/apply-badtok.log"; } \
+    || { echo "[x] bad-token: кривой токен не отвергнут"; tail -5 "$T/apply-badtok.log"; fail=1; }
+grep -q 'stop na-fw-safety.timer' "$NA_TEST_SYSTEMCTL_LOG" && { echo "[x] bad-token: сейфти взведён до отказа (через SAFETY_DELAY снял бы таблицу и автозагрузку)"; fail=1; }
+[ -e "$NFTF" ] && { echo "[x] bad-token: ruleset применён до отказа"; fail=1; }
+# FW_MODE=skip: fleet-sync не ставится, токен не используется — отказа нет, как и раньше
+reset_t
+set +e
+FW_MODE=skip FLEET_SYNC=1 REMNAWAVE_URL=https://panel.example.com REMNAWAVE_TOKEN=tok CADDY_AUTH_API_TOKEN='s3cr3t!#x' \
+  ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-badtok-skip.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "[x] bad-token: FW_MODE=skip (fleet не ставится) теперь отвергает неиспользуемый токен"; fail=1; }
+
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
     echo "APPLY-SMOKE: FAIL"; exit 1
