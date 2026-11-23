@@ -39,11 +39,17 @@ NOW="$(date +%s)"
   printf '%s.000001 node kernel: [na portscan] IN=eth0 OUT= SRC=198.51.100.30 DST=192.0.2.1 PROTO=TCP DPT=25\n' "$(( NOW - 3000 ))"
   printf '%s.000001 node kernel: [na portscan] IN=eth0 OUT= SRC=198.51.100.30 DST=192.0.2.1 PROTO=TCP DPT=26\n' "$(( NOW - 3100 ))"
 } > "$T/klog"
+# v6: ядро печатает SRC= через %pI6 — ПОЛНАЯ форма с ведущими нулями, nft list — сжатую
+{
+  printf '%s.000001 node kernel: [na portscan] IN=eth0 OUT= SRC=2001:0db8:0000:0000:0000:0000:0000:0005 DST=2001:0db8::1 PROTO=TCP DPT=22\n' "$(( NOW - 100 ))"
+  printf '%s.000001 node kernel: [na portscan] IN=eth0 OUT= SRC=2001:0db8:0000:0000:0000:0000:0000:0005 DST=2001:0db8::1 PROTO=TCP DPT=23\n' "$(( NOW - 90 ))"
+  printf '%s.000001 node kernel: [na portscan] IN=eth0 OUT= SRC=2001:0db8:0000:0000:0000:0000:0000:0009 DST=2001:0db8::1 PROTO=TCP DPT=25\n' "$(( NOW - 80 ))"
+} > "$T/klog6"
 
 cat > "$BIN/journalctl" <<'JC'
 #!/bin/sh
 case "$*" in
-  *"-k -b all"*) cat "$NA_T/klog" ;;
+  *"-k -b all"*) cat "${NA_TEST_KLOG:-$NA_T/klog}" ;;
   *short-unix*)  printf '%s.000000 node kernel: Linux version\n' "$(( $(date +%s) - 72*3600 ))" ;;
 esac
 exit 0
@@ -53,6 +59,8 @@ cat > "$BIN/nft" <<'NF'
 case "$*" in
   "list set inet na_filter autoban_v4")
       printf 'table inet na_filter {\n\tset autoban_v4 {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t\telements = { 203.0.113.10 timeout 1d expires 23h }\n\t}\n}\n' ;;
+  "list set inet na_filter autoban_v6")
+      printf 'table inet na_filter {\n\tset autoban_v6 {\n\t\ttype ipv6_addr\n\t\tflags timeout\n\t\telements = { 2001:db8::5 timeout 1d expires 23h59m }\n\t}\n}\n' ;;
 esac
 exit 0
 NF
@@ -154,6 +162,32 @@ if grep -qF '2 активных локальных решений (с CAPI/сп�
 else FAIL=$((FAIL+1)); echo "  FAIL crowdsec: нет строки «2 активных локальных решений (с CAPI/списками: 35)»"; fi
 if grep -qF 'ASN не обогащён: Team Cymru не ответил' <<<"$txt"; then PASS=$((PASS+1)); echo "  ok   ASN: «не ответил» отличим от «нет dig/whois»"
 else FAIL=$((FAIL+1)); echo "  FAIL ASN: нет пояснения про неответивший Cymru"; fi
+
+echo "== 4. IPv6: полная форма в логе против сжатой в nft-наборе (v4.3) =="
+NA_TEST_KLOG="$T/klog6" NA_TEST_WHOIS=none TERM=dumb "$WBASH" "$R" --json > "$T/o5.json" 2>/dev/null || true
+check "забаненный v6 (в наборе сжато) → attacker" attacker \
+      "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["top_ips"]; print([x["verdict"].split(" ")[0] for x in d if x["ip"].endswith(":0005")][0])' "$T/o5.json" 2>&1 | tail -1)"
+check "незабаненный v6 → suspect" suspect \
+      "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["top_ips"]; print([x["verdict"].split(" ")[0] for x in d if x["ip"].endswith(":0009")][0])' "$T/o5.json" 2>&1 | tail -1)"
+ipout="$(NA_TEST_KLOG="$T/klog6" NA_TEST_WHOIS=none TERM=dumb "$WBASH" "$R" --ip 2001:db8::5 2>/dev/null | sed $'s/\033\\[[0-9;]*m//g')"
+if grep -qF 'попаданий в drop-лог (за 24ч): 2' <<<"$ipout"; then PASS=$((PASS+1)); echo "  ok   --ip в сжатой форме находит события из лога (2)"
+else FAIL=$((FAIL+1)); echo "  FAIL --ip 2001:db8::5: нет «попаданий … 2»"; fi
+if grep -qF 'Вердикт: attacker' <<<"$ipout"; then PASS=$((PASS+1)); echo "  ok   --ip: вердикт attacker для забаненного v6"
+else FAIL=$((FAIL+1)); echo "  FAIL --ip: вердикт не attacker"; fi
+
+echo "== 5. разбор аргументов =="
+argrc() { local rc=0; TERM=dumb "$WBASH" "$R" "$@" >"$T/a.out" 2>"$T/a.err" </dev/null || rc=$?; echo "$rc"; }
+check "--ip без значения → rc 1"             1 "$(argrc --ip)"
+check "--ip '' → rc 1"                       1 "$(argrc --ip '')"
+check "--hours без значения → rc 1"          1 "$(argrc --hours)"
+check "--top --json (флаг вместо значения) → rc 1" 1 "$(argrc --top --json)"
+check "--ip не адрес → rc 1"                 1 "$(argrc --ip 'foo;bar')"
+check "--hours 08 → принят (не «octal»)"     0 "$(NA_TEST_WHOIS=none argrc --hours 08 --json)"
+check "--hours 08: без шума bash в stderr"   0 "$(grep -c 'value too great' "$T/a.err" || true)"
+check "--hours 0 → rc 1"                     1 "$(argrc --hours 0)"
+check "--hours 721 → rc 1"                   1 "$(argrc --hours 721)"
+check "--hours 010 → окно 10 ч, не 8"        10 "$(NA_TEST_WHOIS=none TERM=dumb "$WBASH" "$R" --json --hours 010 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["window_hours"])')"
+check "неизвестный флаг → rc 1"              1 "$(argrc --bogus)"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"
