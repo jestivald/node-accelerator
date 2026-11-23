@@ -512,6 +512,24 @@ else
     grep -q 'elements = { 198.51.100.50, 203.0.113.60' "$NFTF" || { echo "[x] pty whitelist: Enter не сохранил список из conf"; fail=1; }
 fi
 
+# ── Сейфти сработал, пока шли установки после взвода (apt jq/conntrack, фиды блок-листов,
+# fleet-sync; SAFETY_DELAY бывает и 30 с) ──
+# Неинтерактивный финал печатал «сейфти-таймер АКТИВЕН — подтверди доступ и сними», хотя
+# таблицы уже нет и автозагрузка выключена: вход «работает» (файрвола-то нет), оператор
+# снимал уже сработавший таймер и уходил с нодой без защиты. Ветка «y» это проверяет с v4.2.
+grep -qF 'сейфти-таймер на 300s АКТИВЕН' "$LOG" || { echo "[x] safety: в обычном неинтерактивном прогоне нет «таймер АКТИВЕН»"; fail=1; }
+reset_t
+# таблицы na_filter нет — ровно то, что оставляет сработавший сейфти
+printf '#!/bin/sh\ncase "$*" in "-t list table inet na_filter") exit 1;; esac\nexit 0\n' > "$T/bin/nft"; chmod +x "$T/bin/nft"
+set +e
+ENABLE_CROWDSEC=0 REMNAWAVE_NONINTERACTIVE=1 DRY_RUN=0 bash "$T/scripts/protect.sh" >"$T/apply-fired.log" 2>&1
+rc=$?
+set -e
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/nft"; chmod +x "$T/bin/nft"
+[ "$rc" -eq 0 ] || { echo "[x] safety-fired: прогон упал (exit $rc)"; tail -5 "$T/apply-fired.log"; fail=1; }
+grep -qF 'АКТИВЕН' "$T/apply-fired.log" && { echo "[x] safety-fired: «таймер АКТИВЕН» при уже сработавшем сейфти"; fail=1; }
+grep -qF 'Сейфти-таймер УЖЕ сработал' "$T/apply-fired.log" || { echo "[x] safety-fired: не сказано, что сейфти уже сработал и защиты нет"; fail=1; }
+
 if [ "$fail" -ne 0 ]; then
     echo "=== ХВОСТ ЛОГА (strict) ==="; tail -25 "$LOG"
     echo "APPLY-SMOKE: FAIL"; exit 1

@@ -2502,9 +2502,14 @@ else
             warn "Сейфти оставлен: через ${SAFETY_DELAY}s na_filter удалится сам."
             warn "Если всё ок — сними: systemctl stop na-fw-safety.timer  (или kill \$(cat $STATE_DIR/na-fw-safety.pid))"
         fi
-    else
+    elif nft -t list table inet na_filter >/dev/null 2>&1; then
         warn "Неинтерактивно: сейфти-таймер на ${SAFETY_DELAY}s АКТИВЕН."
         warn "Подтверди доступ и сними: systemctl stop na-fw-safety.timer"
+    else
+        # Сейфти успел сработать, пока после взвода шли apt (jq/conntrack), фиды блок-листов и
+        # fleet-sync. «Таймер АКТИВЕН — подтверди и сними» тут ложь: вход работает (файрвола-то
+        # нет), оператор снимал уже сработавший таймер и уходил с нодой без защиты.
+        err "Сейфти-таймер УЖЕ сработал (таблицы na_filter нет, автозагрузка выключена) — защиты сейчас нет. Прогони protect заново (SAFETY_DELAY=… побольше)."
     fi
     echo
     [[ "$FW_MODE" == "open" ]] && info "FW_MODE=open: не перечисленные порты открыты. Появится полный список — закрой всё ре-раном с FW_MODE=strict TCP_PORTS=… UDP_PORTS=…"
