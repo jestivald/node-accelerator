@@ -201,25 +201,7 @@ tls_listening() {
     ss -tlnH 2>/dev/null | awk '$4 ~ /[:.](443|8443)$/{f=1} END{exit !f}'
 }
 
-# reboot_pending — optimize поставил ядро/параметры загрузки, а перезагрузки с тех пор не
-# было. Маркер `reboot_needed=1` пишет optimize, и никто его не снимает: после ребута JSON
-# продолжал отдавать true (аудит флота: 9 нод уже на XanMod, а мониторинг ждал ребута).
-# Сверяем с ТЕКУЩЕЙ загрузкой: boot_id из маркера (v4.1.3+) или, для старых маркеров,
-# время загрузки (btime) против installed_at. Не разобрать — как раньше, верим маркеру.
-reboot_pending() {
-    local f="$STATE_DIR/optimize.installed" bid cur inst inst_s bt
-    [[ -f "$f" ]] || return 1
-    grep -q '^reboot_needed=1' "$f" 2>/dev/null || return 1
-    bid="$(awk -F= '/^boot_id=/{print $2; exit}' "$f" 2>/dev/null)"
-    cur="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
-    if [[ -n "$bid" && -n "$cur" ]]; then [[ "$bid" == "$cur" ]]; return; fi
-    inst="$(awk -F= '/^installed_at=/{print $2; exit}' "$f" 2>/dev/null)"
-    [[ -n "$inst" ]] || return 0   # `date -d ""` = сегодняшняя полночь — не дата установки
-    inst_s="$(date -d "$inst" +%s 2>/dev/null)" || return 0
-    bt="$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null)"
-    [[ "$inst_s" =~ ^[0-9]+$ && "$bt" =~ ^[0-9]+$ ]] || return 0
-    (( bt < inst_s ))
-}
+# reboot_pending — в lib/common.sh (общий с шапкой меню install.sh).
 
 # dynset_fill — заполненность наборов-лимитеров na_filter (SYN/UDP/SSH/ICMP/анти-скан/
 # node-port/open). До v4.1.3 они создавались `meter` без timeout: записи не истекали, и на
@@ -1085,14 +1067,7 @@ retrans_deep() {
     [[ "$win" =~ ^[0-9]+$ && "$win" -ge 5 && "$win" -le 300 ]] || win=20
     IFACE="$(default_iface)"; IFACE="${IFACE:-eth0}"
 
-    clear 2>/dev/null || true
-    printf "%b" "$BOLD"
-    cat <<'B'
-  ┌────────────────────────────────────────────┐
-  │   🔬  node-accelerator — разбор retrans     │
-  └────────────────────────────────────────────┘
-B
-    printf "%b" "$NC"
+    na_banner "🔬" "разбор retrans"
     info "iface=$IFACE   окно семплинга=${win}s   (read-only)"
 
     # ── BEFORE
@@ -1193,14 +1168,9 @@ I
 }
 if [[ "${1:-}" == "--retrans" ]]; then shift; retrans_deep "$@"; exit 0; fi
 
-clear 2>/dev/null || true
-printf "%b" "$BOLD"
-cat <<'B'
-  ┌────────────────────────────────────────────┐
-  │   🩺  node-accelerator — диагностика ноды   │
-  └────────────────────────────────────────────┘
-B
-printf "%b" "$NC"
+# шапка: в терминале — рамка (экран не чистится в цепочке install.sh all: NA_NO_CLEAR=1),
+# в файл/пайп — одна строка без escape-кодов (`na-diagnose > report.txt`)
+na_banner "🩺" "диагностика ноды"
 
 # ─── Система ─────────────────────────────────────────────────────────────────
 title "Система"
