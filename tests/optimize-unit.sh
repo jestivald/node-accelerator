@@ -377,7 +377,8 @@ expect_not "хелпер уже стоял (ре-ран/апгрейд) — сн
 # ════════════════════════════════════════════════════════════════════════════
 echo "== 4. rollback optimize: runtime возвращается без ребута =="
 # ════════════════════════════════════════════════════════════════════════════
-awk '/^    # ── Runtime без ребута/{f=1} f{print} f && /reserved-ports\.na" "\$STATE_DIR\/journald\.persistent"$/{exit}' \
+# конец блока — строка, которой заканчивается `rm -f` снимков (с v4.3 в нём ещё учёт logrotate)
+awk '/^    # ── Runtime без ребута/{f=1} f{print} f && /"\$STATE_DIR\/logrotate\.owned"$/{exit}' \
     "$REPO_ROOT/scripts/rollback.sh" \
   | "$REAL_SED" -e "s#/proc/sys/#$T/proc/sys/#g" -e "s#/sys/class/net#$SYSN#g" \
                 -e "s#/sys/kernel/mm#$T/sys/kernel/mm#g" > "$T/rb-section.sh"
