@@ -569,7 +569,7 @@ echo "== 5c. ре-ран до перезагрузки: ядро XanMod прош
 # Исполняем сам блок выбора ядра (секция 2) поверх его хелперов. Прошлый прогон поставил
 # XanMod (reboot_needed=1 в маркере, та же загрузка), ре-ран ядро сам не ставит.
 { awk '/^NA_SB_EFIVAR=/{f=1} /^install_xanmod\(\) \{/{f=0} f' "$OPT"
-  awk '/^if \[\[ "\$ENABLE_XANMOD" == "1" \]\]; then$/{f=1} /^# ─── 2b\./{f=0} f' "$OPT"; } \
+  awk '/^if .*ENABLE_XANMOD" == "1"/{f=1} /^# ─── 2b\./{f=0} f' "$OPT"; } \
   | "$REAL_SED" -e "s#/sys/firmware#$T/sys/firmware#g" -e "s#/boot/#$T/boot/#g" \
                 -e "s#/lib/modules#$T/lib/modules#g" -e "s#/sys/class/net#$SYSN#g" \
                 -e "s#/proc/sys/kernel/random/boot_id#$T/proc/boot_id#g" > "$T/xm-pend.sh"
