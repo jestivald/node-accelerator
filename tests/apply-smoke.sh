@@ -499,6 +499,17 @@ else
                 grep -qF 'Сейфти-таймер снят' "$L" || { echo "[x] pty LC_ALL=C $what: нет сообщения о снятии сейфти"; fail=1; } ;;
         esac
     done
+    # Ре-ран на настроенной ноде: вопрос про whitelist показывал «[пусто]», а Enter оставлял
+    # список из protect.conf. Поверив подсказке, оператор вписывал «свой» адрес — и ЗАМЕНЯЛ им
+    # весь список (адрес панели выпадал из whitelist).
+    reset_t
+    printf ': "${WHITELIST:=198.51.100.50,203.0.113.60}"\n' > "$T/conf/protect.conf"
+    L="$T/apply-pty-wl.log"
+    set +e; pty_protect $'y\n' "$L"; rc=$?; set -e
+    [ "$rc" -eq 0 ] || { echo "[x] pty whitelist: прогон упал (exit $rc)"; tail -5 "$L"; fail=1; }
+    grep -qF 'Whitelist IP/CIDR (панель, твои)  [198.51.100.50,203.0.113.60]' "$L" \
+        || { echo "[x] pty whitelist: подсказка не показывает сохранённый список (Enter его оставляет)"; grep -a 'Whitelist IP' "$L"; fail=1; }
+    grep -q 'elements = { 198.51.100.50, 203.0.113.60' "$NFTF" || { echo "[x] pty whitelist: Enter не сохранил список из conf"; fail=1; }
 fi
 
 if [ "$fail" -ne 0 ]; then

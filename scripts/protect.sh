@@ -247,7 +247,9 @@ if [[ -t 0 && -z "${REMNAWAVE_NONINTERACTIVE:-}" && "$DRY_RUN" != "1" && "${CROW
         # node-agent порт — понятие Remnawave; в open-режиме его правила не ставятся
         [[ "$FW_MODE" == "strict" ]] && read -rp "Порт node-agent (auto = детект)  [$NODE_PORT]: " _v && NODE_PORT="${_v:-$NODE_PORT}"
     fi
-    read -rp "Whitelist IP/CIDR (панель, твои)  [пусто]: "     _v && WHITELIST="${_v:-$WHITELIST}"
+    # в подсказке — то, что оставит Enter (список из protect.conf/ENV): «[пусто]» при живом
+    # списке подталкивало вписать «свой» адрес — и заменить им весь список (панель выпадала)
+    read -rp "Whitelist IP/CIDR (панель, твои)  [${WHITELIST:-пусто}]: " _v && WHITELIST="${_v:-$WHITELIST}"
 fi
 # Неинтерактивно и без явного FW_MODE — strict (прежнее поведение не меняется).
 [[ -z "$FW_MODE" ]] && FW_MODE=strict
