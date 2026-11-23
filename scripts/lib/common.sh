@@ -39,7 +39,17 @@ info()  { printf "%b[*]%b %s\n" "$BLUE"   "$NC" "$*"; }
 ok()    { printf "%b[+]%b %s\n" "$GREEN"  "$NC" "$*"; }
 warn()  { printf "%b[!]%b %s\n" "$YELLOW" "$NC" "$*"; }
 err()   { printf "%b[x]%b %s\n" "$RED"    "$NC" "$*" >&2; }
-title() { printf "\n%b== %s ==%b\n" "$BOLD" "$*" "$NC"; }
+# Заголовок секции. В терминале — линейка в стиле меню; в файл/пайп — прежний `== X ==`
+# (по нему грепают логи раскатки).
+title() {
+    if [[ -t 1 && "${TERM:-dumb}" != dumb ]]; then
+        local l n=$(( 56 - ${#1} )); (( n < 4 )) && n=4
+        printf -v l '%*s' "$n" ''
+        printf "\n%b── %s %s%b\n" "$BOLD" "$*" "${l// /─}" "$NC"
+    else
+        printf "\n%b== %s ==%b\n" "$BOLD" "$*" "$NC"
+    fi
+}
 hr()    { printf '%b%s%b\n' "$CYAN" "────────────────────────────────────────────────────" "$NC"; }
 
 # Статус-строка для диагностики: status_line OK|WARN|FAIL "текст"
