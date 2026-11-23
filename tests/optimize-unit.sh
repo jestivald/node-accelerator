@@ -449,7 +449,7 @@ set -euo pipefail
 . "$T/xm-section.sh"
 case "\$1" in
   pre)  xanmod_preflight ;;
-  post) v="\$(xanmod_kver linux-xanmod-x64v3)"; echo "KVER=\$v"; why="\$(xanmod_postcheck "\$v" ens18)" && echo READY || echo "RISK=\$why" ;;
+  post) v="\$(xanmod_kver linux-xanmod-x64v3)"; echo "KVER=\$v"; why="\$(xanmod_postcheck "\$v" "\${2:-ens18}")" && echo READY || echo "RISK=\$why" ;;
 esac
 WRAP
 xm() { rc=0; : > "$REC/calls"; "$WBASH" "$T/wrap-xm.sh" "$@" > "$T/out" 2>&1 || rc=$?; return 0; }
@@ -492,6 +492,17 @@ expect "нет initrd → пробуем пересобрать (update-initramf
 expect "…не вышло → риск назван" grep -q "RISK=нет $T/boot/initrd.img-$KV" "$T/out"
 NA_TEST_INITRD_FIX=1 xm post
 expect "пересборка initrd удалась → READY" grep -qx READY "$T/out"
+# Xen netfront (AWS t2/m4, Xen-VPS): драйвер в sysfs зовётся «vif», модуль — xen-netfront.ko.
+# Сверять надо модуль (…/device/driver/module), а не имя драйвера.
+mkdir -p "$SYSN/eth0/device" "$T/sys/bus/xen/drivers/vif" "$T/sys/module/xen_netfront"
+ln -sfn "$T/sys/module/xen_netfront" "$T/sys/bus/xen/drivers/vif/module"
+ln -sfn "$T/sys/bus/xen/drivers/vif" "$SYSN/eth0/device/driver"
+: > "$T/lib/modules/$KV/kernel/drivers/net/xen-netfront.ko.xz"
+xm post eth0
+expect "Xen netfront: драйвер «vif» найден как модуль xen-netfront → READY" grep -qx READY "$T/out"
+rm -f "$T/lib/modules/$KV/kernel/drivers/net/xen-netfront.ko.xz"
+xm post eth0
+expect "…модуля в новом ядре нет → риск назван по модулю" grep -q 'RISK=драйвера NIC eth0 (xen_netfront) нет' "$T/out"
 expect "установка ядра идёт только после предполётной проверки" grep -q 'elif xanmod_preflight; then' "$OPT"
 expect "риск печатается до рапорта «нужна перезагрузка»" grep -q 'НЕ ПЕРЕЗАГРУЖАЙСЯ, пока не исправлено' "$OPT"
 

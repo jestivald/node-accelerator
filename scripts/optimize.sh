@@ -274,9 +274,15 @@ xanmod_kver() {
     fi
     [[ -n "$v" ]] && echo "$v"
 }
-# Драйвер NIC по sysfs: …/device/driver → ../../bus/virtio/drivers/virtio_net.
+# Драйвер NIC по sysfs: модуль драйвера (…/device/driver/module → …/module/xen_netfront),
+# без него — имя драйвера (…/device/driver → ../../bus/virtio/drivers/virtio_net). Имя
+# драйвера с модулем совпадает не всегда: у Xen netfront (AWS t2/m4, Xen-VPS) драйвер —
+# «vif», а модуль — xen-netfront.ko, и проверка нового ядра не находила vif.ko —
+# ложное «НЕ ПЕРЕЗАГРУЖАЙСЯ» с советом снести исправное ядро.
 nic_driver() {
-    local d; d="$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null || true)"
+    local d
+    d="$(readlink "/sys/class/net/$1/device/driver/module" 2>/dev/null || true)"
+    [[ -n "$d" ]] || d="$(readlink "/sys/class/net/$1/device/driver" 2>/dev/null || true)"
     [[ -n "$d" ]] && basename "$d"
 }
 # xanmod_postcheck <версия> <NIC> — поднимется ли новое ядро с сетью: initrd собран, а
