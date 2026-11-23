@@ -2241,7 +2241,9 @@ fam_of() {   # fam_of <адрес> → 4|6; rc=1 — не адрес
 # `allow add 2001:db8::/32` клал в whitelist хост 2001:db8:: вместо префикса)
 norm() { local a="$1"; if [[ "$a" == *:* ]]; then a="${a%/128}"; else a="${a%/32}"; fi; printf '%s' "$a"; }
 nonempty() { grep -v '^$' || true; }   # под pipefail пустой вход — не ошибка
-conf_list() { sed -nE 's/^: "\$\{WHITELIST:?=([^}]*)\}".*/\1/p' "$CONF" 2>/dev/null | tail -1; }
+# нет conf (сброс к дефолтам — `rm protect.conf`, так советует шапка самого файла) — пустой
+# список, conf_set создаст файл: под pipefail отказ sed ронял `cur="$(conf_list)"` молча, rc≠0
+conf_list() { [[ -f "$CONF" ]] || return 0; sed -nE 's/^: "\$\{WHITELIST:?=([^}]*)\}".*/\1/p' "$CONF" 2>/dev/null | tail -1; }
 # WHITELIST в protect.conf — дословно, как задал оператор: protect режет его и по запятым, и
 # по пробелам («a, b» — естественный ввод в интерактиве) и сам срезает /32. Сравнивать надо в
 # той же нормализации: строкой целиком del не находил « b» или «b/32», адрес оставался в conf

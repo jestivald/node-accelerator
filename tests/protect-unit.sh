@@ -470,6 +470,13 @@ SCN
     check "…и о широком префиксе сказано вслух" 1 "$(grep -c 'ПОЛНЫЙ обход защиты' "$F/out6")"
     fw allow del 2001:db8::/32 >/dev/null
     check "del v6 /32: префикс снят и из файла, и из conf" 0 "$(cat "$F/etc/na_filter.nft" "$F/etc/protect.conf" | grep -c '2001:db8::')"
+    # protect.conf нет (сброс к дефолтам — `rm protect.conf`, так советует шапка самого файла):
+    # conf_list под pipefail ронял na-fw молча — rc≠0 без единого слова, хотя conf_set умеет
+    # создать файл сам
+    rm -f "$F/etc/protect.conf"
+    rc=0; fw allow add 198.51.100.20 >/dev/null || rc=$?
+    check "нет protect.conf: allow add не падает молча (rc=0)" 0 "$rc"
+    check "…и создаёт conf с адресом" 1 "$(grep -cxF ': "${WHITELIST:=198.51.100.20}"' "$F/etc/protect.conf" 2>/dev/null || true)"
 fi
 
 # ─── 8. v4.2: активные баны переживают ре-ран ────────────────────────────────
