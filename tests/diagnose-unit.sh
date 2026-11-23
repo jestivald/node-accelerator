@@ -34,7 +34,8 @@
 #   v4.3 (охота на баги diagnose): «журнал ≈ аптайму» — в обе стороны (после ребута ▲ про
 #       глубину журнала пропадал); серты встроенного CA Caddy (`tls internal`, 12 ч) — не
 #       вечный ✘ «renewal сломан»; слои whitelist сверяются покрытием, а не текстом (живой
-#       набор с auto-merge склеивает соседние адреса — это не дрейф).
+#       набор с auto-merge склеивает соседние адреса — это не дрейф); MSS-коллапс — только
+#       по полю mss:, а не rcvmss:/advmss:.
 #
 # Не требует root/сети/nft/docker. Запуск: bash tests/diagnose-unit.sh
 set -euo pipefail
@@ -1239,6 +1240,31 @@ cp "$T/p25.conf.orig" "$T/etc/node-accelerator/protect.conf"
 cp "$T/p25.nft.orig" "$T/etc/node-accelerator/na_filter.nft"
 cp "$T/p25.wl4.orig" "$NFTD/set-whitelist_v4"
 rm -rf "$T/etc/crowdsec"
+
+echo "== 26. MSS-коллапс: только поле mss:, а не rcvmss:/advmss: (v4.3) =="
+# `ss -tin` печатает три поля с «mss:» — mss (send-MSS: его и ужимает коллапс), advmss и rcvmss
+# (оценка MSS пира по входящим сегментам; у пира с мелкими сегментами без PSH — вплоть до 88).
+# Регэксп 'mss:[0-9]+' ловил все три: сокет с send-MSS 1400 и rcvmss:120 шёл в «обрезанные»
+# (mss_collapsed_sockets в мониторинге, а при min_snd_mss < 512 — ✘ «ИДЁТ MSS-коллапс»).
+cp "$SSD/estab-mss" "$T/estab-mss.orig"
+cat > "$SSD/estab-mss" <<'EST'
+State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
+ESTAB  0      0      10.0.0.5:443        203.0.113.99:60001
+	 bbr wscale:7,7 rto:204 rtt:0.5/0.25 ato:40 mss:1400 pmtu:1500 rcvmss:120 advmss:1448 cwnd:10
+ESTAB  0      0      10.0.0.5:443        203.0.113.98:60002
+	 bbr wscale:7,7 rto:204 rtt:0.5/0.25 ato:40 mss:1400 pmtu:1500 rcvmss:536 advmss:1448 cwnd:10
+EST
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o26.json" 2>/dev/null || true
+check "json: rcvmss:120 при send-MSS 1400 — не «обрезанный MSS»" 0 "$(jget "$T/o26.json" mss_collapsed_sockets)"
+env TERM=dumb "$WBASH" "$DIAG" > "$T/o26.txt" 2>/dev/null || true
+grep_ok  "текст: ✔ коллапса не видно"                            "✔  сокетов с обрезанным MSS нет" "$T/o26.txt"
+env TERM=dumb "$WBASH" "$DIAG" --retrans --window 5 > "$T/o26r.txt" 2>/dev/null || true
+grep_ok  "--retrans: rcvmss не в счёте collapsed_sockets"         "collapsed_sockets=0" "$T/o26r.txt"
+# контроль: настоящий коллапс send-MSS (mss:88) по-прежнему считается
+sed -i.bak 's/mss:1400 pmtu:1500 rcvmss:120/mss:88 pmtu:1500 rcvmss:536/' "$SSD/estab-mss"; rm -f "$SSD/estab-mss.bak"
+env TERM=dumb "$WBASH" "$DIAG" --json > "$T/o26b.json" 2>/dev/null || true
+check "json: send-MSS 88 — в счёте"                              1 "$(jget "$T/o26b.json" mss_collapsed_sockets)"
+cp "$T/estab-mss.orig" "$SSD/estab-mss"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"

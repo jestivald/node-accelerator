@@ -837,8 +837,9 @@ emit_json() {
     uln="$(ulimit -n 2>/dev/null || echo 0)"; [[ "$uln" =~ ^[0-9]+$ ]] || uln=0   # RLIMIT=infinity → "unlimited" сломал бы JSON-число
     minsnd="$(val net.ipv4.tcp_min_snd_mss)"; minsnd="${minsnd:-0}"
     mtuprobe="$(val net.ipv4.tcp_mtu_probing)"; mtuprobe="${mtuprobe:-0}"
-    # только established: отмирающие сокеты (TIME-WAIT и пр.) давали ложный «коллапс»
-    collapsed="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
+    # только established: отмирающие сокеты (TIME-WAIT и пр.) давали ложный «коллапс»;
+    # только поле mss: (send-MSS), а не rcvmss:/advmss: — см. секцию MSS отчёта
+    collapsed="$(ss -tin state established 2>/dev/null | grep -oE '[[:space:]]mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
     # CPU steal: окно 3 с + среднее с загрузки (секундный семпл был шумом)
     steal=0; stealb=0
     [[ -r /proc/stat ]] && read -r steal stealb <<<"$(cpu_steal_measure "$( [[ "$NA_FAST" == 1 ]] && echo 1 || echo 3)")"
@@ -1178,7 +1179,7 @@ I
     info "sack=$(val net.ipv4.tcp_sack) dsack=$(val net.ipv4.tcp_dsack) ts=$(val net.ipv4.tcp_timestamps) frto=$(val net.ipv4.tcp_frto) recovery=$(val net.ipv4.tcp_recovery)"
     local msnd mtup collapsed
     msnd="$(val net.ipv4.tcp_min_snd_mss)"; mtup="$(val net.ipv4.tcp_mtu_probing)"
-    collapsed="$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++}END{print c+0}')"
+    collapsed="$(ss -tin 2>/dev/null | grep -oE '[[:space:]]mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++}END{print c+0}')"
     info "min_snd_mss=${msnd:-?} mtu_probing=${mtup:-?} collapsed_sockets=${collapsed:-0}"
 
     title "Вердикт"
@@ -1383,7 +1384,10 @@ else wrn "tcp_min_snd_mss = ${MINSND:-?} (при mtu_probing=1 рекоменд.
 # объявить коллапс на совершенно здоровой ноде. И смотрим долю: единичный пир с маленьким
 # MSS — это его канал, а не наша беда. Настоящий коллапс — это когда пол опущен
 # (min_snd_mss мал) или просели сразу многие соединения.
-COLLAPSED="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
+# Считаем ТОЛЬКО поле mss: (send-MSS — его и ужимает коллапс). В той же строке `ss -i` есть
+# advmss: и rcvmss: (оценка MSS пира по входящим; у пира с мелкими сегментами без PSH — до 88),
+# и голый 'mss:[0-9]+' ловил все три: сокет с send-MSS 1400 и rcvmss:120 шёл в «обрезанные».
+COLLAPSED="$(ss -tin state established 2>/dev/null | grep -oE '[[:space:]]mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
 EST_TOTAL="$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
 [[ "${EST_TOTAL:-0}" =~ ^[0-9]+$ ]] || EST_TOTAL=0
 if [[ "${COLLAPSED:-0}" -eq 0 ]]; then
