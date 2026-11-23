@@ -535,6 +535,75 @@ xmrepo
 expect "первая установка: list записан" grep -q 'deb.xanmod.org trixie main' "$XL"
 expect "…и ключ из проверки на месте" grep -qx pinned "$XKR"
 
+echo "== 5c. ре-ран до перезагрузки: ядро XanMod прошлого прогона всё ещё ждёт ребута =="
+# Исполняем сам блок выбора ядра (секция 2) поверх его хелперов. Прошлый прогон поставил
+# XanMod (reboot_needed=1 в маркере, та же загрузка), ре-ран ядро сам не ставит.
+{ awk '/^NA_SB_EFIVAR=/{f=1} /^install_xanmod\(\) \{/{f=0} f' "$OPT"
+  awk '/^if \[\[ "\$ENABLE_XANMOD" == "1" \]\]; then$/{f=1} /^# ─── 2b\./{f=0} f' "$OPT"; } \
+  | "$REAL_SED" -e "s#/sys/firmware#$T/sys/firmware#g" -e "s#/boot/#$T/boot/#g" \
+                -e "s#/lib/modules#$T/lib/modules#g" -e "s#/sys/class/net#$SYSN#g" \
+                -e "s#/proc/sys/kernel/random/boot_id#$T/proc/boot_id#g" > "$T/xm-pend.sh"
+grep -q 'ENABLE_XANMOD=0 — установка ядра пропущена' "$T/xm-pend.sh" \
+    || { echo "  ✘ не смог извлечь блок выбора ядра из optimize.sh"; fail=1; }
+printf '#!/bin/sh\ncase "$1" in -m) echo x86_64 ;; -r) echo "${NA_TEST_UNAME_R:-6.12.48+deb13-amd64}" ;; *) echo Linux ;; esac\n' > "$BIN/uname"
+printf '#!/bin/sh\necho kvm\n' > "$BIN/systemd-detect-virt"
+printf '#!/bin/sh\necho "default via 10.0.0.1 dev ens18 proto static"\n' > "$BIN/ip"
+cat > "$BIN/dpkg-query" <<'DQ'
+#!/bin/sh
+case "$*" in *Status-Abbrev*) printf '%s' "${NA_TEST_DPKG_STATUS:-ii }"; exit 0 ;; esac
+echo "linux-image-6.18.52-x64v3-xanmod1, linux-headers-6.18.52-x64v3-xanmod1"
+DQ
+chmod +x "$BIN/uname" "$BIN/systemd-detect-virt" "$BIN/ip" "$BIN/dpkg-query"
+cat > "$T/wrap-pend.sh" <<WRAP
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/scripts/lib/common.sh"
+STATE_DIR="$T/state5c"
+ENABLE_XANMOD="\${ENABLE_XANMOD:-1}"
+REBOOT_NEEDED=0; REBOOT_WHY=""; XANMOD_RISK=""
+setup_xanmod_repo() { return 0; }
+# установка в этом прогоне: fail — репо не поднялось; ok — поставили (как install_xanmod)
+install_xanmod() {
+    [ "\${NA_TEST_INSTALL:-fail}" = ok ] || { echo "INSTALL-FAILED"; return 1; }
+    REBOOT_NEEDED=1; REBOOT_WHY="\${REBOOT_WHY:+\$REBOOT_WHY; }новое ядро XanMod (linux-xanmod-x64v3)"
+}
+. "$T/xm-pend.sh"
+printf 'REBOOT_NEEDED=%s\nREBOOT_WHY=%s\nXANMOD_RISK=%s\n' "\$REBOOT_NEEDED" "\$REBOOT_WHY" "\$XANMOD_RISK"
+WRAP
+pend() { rc=0; : > "$REC/calls"; "$WBASH" "$T/wrap-pend.sh" > "$T/out" 2>&1 || rc=$?; return 0; }
+mkdir -p "$T/state5c" "$T/proc"
+echo 5c1e1d0a-0000-4000-8000-000000000001 > "$T/proc/boot_id"
+echo linux-xanmod-x64v3 > "$T/state5c/xanmod.pkg"
+printf '%s\n' "installed_at=2026-11-23T10:00:00+00:00" "na_version=4.2" "xanmod=linux-xanmod-x64v3" \
+    "reboot_needed=1" "boot_id=5c1e1d0a-0000-4000-8000-000000000001" > "$T/state5c/optimize.installed"
+echo x > "$T/boot/initrd.img-$KV"
+ENABLE_XANMOD=0 pend
+expect "ENABLE_XANMOD=0: rc=0" test "$rc" -eq 0
+expect "ENABLE_XANMOD=0: ребут по-прежнему нужен (reboot_needed=1 в маркер)" grep -qx 'REBOOT_NEEDED=1' "$T/out"
+expect "…причина — ядро XanMod прошлого прогона" grep -q '^REBOOT_WHY=.*XanMod (linux-xanmod-x64v3, поставлено прошлым прогоном)' "$T/out"
+expect "…готовность ядра перепроверена: initrd и драйвер на месте" grep -qx 'XANMOD_RISK=' "$T/out"
+NA_TEST_BOOT_FREE=150 pend
+expect "/boot после установки ядра стал теснее порога: ядро не ставим…" grep -q 'свободно 150 МБ' "$T/out"
+expect "…но ребут, которого ждёт уже стоящее ядро, не забыт" grep -qx 'REBOOT_NEEDED=1' "$T/out"
+pend
+expect "репо недоступно (установка не прошла) — ребут не забыт" grep -qx 'REBOOT_NEEDED=1' "$T/out"
+rm -f "$T/boot/initrd.img-$KV"
+ENABLE_XANMOD=0 pend
+expect "initrd нового ядра пропал — «НЕ ПЕРЕЗАГРУЖАЙСЯ» снова с причиной" grep -q "^XANMOD_RISK=нет $T/boot/initrd.img-$KV" "$T/out"
+echo x > "$T/boot/initrd.img-$KV"
+NA_TEST_INSTALL=ok pend
+expect "установка в этом прогоне: причина не задвоена" test "$(grep -o 'XanMod' "$T/out" | wc -l | tr -d ' ')" -le 2
+expect_not "…и без пометки «прошлым прогоном»" grep -q 'поставлено прошлым прогоном' "$T/out"
+echo 5c1e1d0a-0000-4000-8000-000000000002 > "$T/proc/boot_id"
+ENABLE_XANMOD=0 pend
+expect "после перезагрузки (другой boot_id) прошлый флаг не переносится" grep -qx 'REBOOT_NEEDED=0' "$T/out"
+echo 5c1e1d0a-0000-4000-8000-000000000001 > "$T/proc/boot_id"
+ENABLE_XANMOD=0 NA_TEST_UNAME_R=6.18.52-x64v3-xanmod1 pend
+expect "уже загружены с XanMod — ребут не нужен" grep -qx 'REBOOT_NEEDED=0' "$T/out"
+ENABLE_XANMOD=0 NA_TEST_DPKG_STATUS='un ' pend
+expect "пакет XanMod снят (dpkg: не установлен) — ребут не нужен" grep -qx 'REBOOT_NEEDED=0' "$T/out"
+rm -f "$BIN/uname" "$BIN/systemd-detect-virt" "$BIN/ip"
+
 # ════════════════════════════════════════════════════════════════════════════
 echo "== 6. common: default_iface и apt_install =="
 # ════════════════════════════════════════════════════════════════════════════

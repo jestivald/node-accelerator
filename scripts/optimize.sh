@@ -310,6 +310,34 @@ xanmod_postcheck() {
     return 1
 }
 
+# xanmod_pending_reboot — ядро XanMod, поставленное ПРОШЛЫМ прогоном, всё ещё ждёт ребута:
+# маркер прошлого прогона с reboot_needed=1 и ТЕМ ЖЕ boot_id (как reboot_pending в
+# diagnose), пакет из xanmod.pkg стоит, а загружены мы не с XanMod. Ре-ран до ребута,
+# который ядро сам не ставит (ENABLE_XANMOD=0; /boot после установки ядра стал теснее
+# NA_BOOT_MIN_MB; репо недоступно), писал reboot_needed=0: diagnose и меню переставали
+# ждать ребута, а «НЕ ПЕРЕЗАГРУЖАЙСЯ» прошлого прогона пропадало без проверки. Готовность
+# ядра проверяем заново. Меняет REBOOT_NEEDED / REBOOT_WHY / XANMOD_RISK.
+xanmod_pending_reboot() {
+    local m="$STATE_DIR/optimize.installed" pkg bid cur kv why
+    [[ "$REBOOT_WHY" != *XanMod* && "$(uname -r)" != *xanmod* && -s "$STATE_DIR/xanmod.pkg" ]] || return 0
+    grep -qx 'reboot_needed=1' "$m" 2>/dev/null || return 0
+    bid="$(awk -F= '$1 == "boot_id" { print $2; exit }' "$m" 2>/dev/null || true)"
+    cur="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    [[ -n "$bid" && "$bid" == "$cur" ]] || return 0
+    pkg="$(cat "$STATE_DIR/xanmod.pkg")"
+    [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null || true)" == ii* ]] || return 0
+    REBOOT_NEEDED=1
+    REBOOT_WHY="${REBOOT_WHY:+$REBOOT_WHY; }новое ядро XanMod ($pkg, поставлено прошлым прогоном)"
+    kv="$(xanmod_kver "$pkg" || true)"
+    if [[ -z "$kv" ]]; then
+        XANMOD_RISK="версия ядра пакета $pkg не определена — initrd и драйвер NIC не проверены (ls /boot/initrd.img-*xanmod* /lib/modules)"
+    elif ! why="$(xanmod_postcheck "$kv" "$(default_iface || true)")"; then
+        XANMOD_RISK="$why"
+    fi
+    warn "XanMod $pkg${kv:+ (ядро $kv)} поставлен прошлым прогоном и ждёт перезагрузки${XANMOD_RISK:+ — но к загрузке НЕ готов: $XANMOD_RISK}"
+    return 0
+}
+
 install_xanmod() {
     setup_xanmod_repo || return 1
     info "psABI уровень CPU: x86-64-v$(cpu_psabi_level), сборка: $XANMOD_FLAVOR"
@@ -405,6 +433,7 @@ if [[ "$ENABLE_XANMOD" == "1" ]]; then
 else
     info "ENABLE_XANMOD=0 — установка ядра пропущена"
 fi
+xanmod_pending_reboot
 
 # ─── 2b. PSI: учёт давления CPU/памяти/IO (opt-in) ───────────────────────────
 # XanMod и стоковые ядра Debian собраны с CONFIG_PSI_DEFAULT_DISABLED=y: PSI в ядре
