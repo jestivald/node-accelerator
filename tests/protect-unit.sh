@@ -449,6 +449,27 @@ SCN
     fw unban 192.0.2.66 >/dev/null
     check "unban: autoban и suspect" 2 "$(grep -cE 'delete element inet na_filter (autoban|suspect)_v4 \{ 192.0.2.66 \}' "$F/nft.log")"
     check "unban: решения CrowdSec" 1 "$(grep -c 'decisions delete --ip 192.0.2.66' "$F/cscli.log")"
+    # v4.3: WHITELIST в protect.conf — дословно, как задал оператор: protect режет его и по
+    # запятым, и по пробелам («a, b» — естественный ввод в интерактиве) и сам срезает /32.
+    # na-fw сравнивал элемент conf со строкой целиком: del оставлял адрес в conf, рапортовал
+    # «во всех слоях», а ре-ран protect молча возвращал его в whitelist (полный обход защиты).
+    printf ': "${FW_MODE:=strict}"\n: "${WHITELIST:=203.0.113.7, 198.51.100.9/32 192.0.2.44}"\n' > "$F/etc/protect.conf"
+    printf 'table inet na_filter {\n    set whitelist_v4 { type ipv4_addr; flags interval; auto-merge; elements = { 203.0.113.7, 198.51.100.9, 192.0.2.44 } }\n    set whitelist_v6 { type ipv6_addr; flags interval; auto-merge; }\n}\n' > "$F/etc/na_filter.nft"
+    fw allow del 198.51.100.9 >/dev/null
+    check "del: адрес, записанный в conf с /32, оттуда снят" 0 "$(grep -c '198\.51\.100\.9' "$F/etc/protect.conf")"
+    fw allow del 192.0.2.44 >/dev/null
+    check "del: адрес после «, » и пробела снят из conf, остальные на месте" 1 \
+          "$(grep -cxF ': "${WHITELIST:=203.0.113.7}"' "$F/etc/protect.conf")"
+    fw allow add 203.0.113.7/32 >/dev/null
+    check "add: адрес, который в conf уже есть, не задваивается" 1 \
+          "$(grep -cxF ': "${WHITELIST:=203.0.113.7}"' "$F/etc/protect.conf")"
+    # v6 /32 — префикс на 2^96 адресов, а не хост: norm срезал /32 у любого адреса
+    fw allow add 2001:db8::/32 >"$F/out6" 2>&1 || true
+    check "add v6 /32: в файл уходит префикс, а не хост 2001:db8::" 1 \
+          "$(grep -c 'set whitelist_v6 { type ipv6_addr; flags interval; auto-merge; elements = { 2001:db8::/32 } }' "$F/etc/na_filter.nft")"
+    check "…и о широком префиксе сказано вслух" 1 "$(grep -c 'ПОЛНЫЙ обход защиты' "$F/out6")"
+    fw allow del 2001:db8::/32 >/dev/null
+    check "del v6 /32: префикс снят и из файла, и из conf" 0 "$(cat "$F/etc/na_filter.nft" "$F/etc/protect.conf" | grep -c '2001:db8::')"
 fi
 
 # ─── 8. v4.2: активные баны переживают ре-ран ────────────────────────────────

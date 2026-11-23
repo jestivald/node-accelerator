@@ -2237,9 +2237,16 @@ fam_of() {   # fam_of <адрес> → 4|6; rc=1 — не адрес
     elif [[ "$1" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ && "$1" == *:* ]]; then echo 6
     else return 1; fi
 }
-norm() { local a="$1"; a="${a%/32}"; [[ "$a" == *:* ]] && a="${a%/128}"; printf '%s' "$a"; }
+# /32 — хост только у v4: у v6 это префикс на 2^96 адресов (до v4.3 срезался у любого, и
+# `allow add 2001:db8::/32` клал в whitelist хост 2001:db8:: вместо префикса)
+norm() { local a="$1"; if [[ "$a" == *:* ]]; then a="${a%/128}"; else a="${a%/32}"; fi; printf '%s' "$a"; }
 nonempty() { grep -v '^$' || true; }   # под pipefail пустой вход — не ошибка
 conf_list() { sed -nE 's/^: "\$\{WHITELIST:?=([^}]*)\}".*/\1/p' "$CONF" 2>/dev/null | tail -1; }
+# WHITELIST в protect.conf — дословно, как задал оператор: protect режет его и по запятым, и
+# по пробелам («a, b» — естественный ввод в интерактиве) и сам срезает /32. Сравнивать надо в
+# той же нормализации: строкой целиком del не находил « b» или «b/32», адрес оставался в conf
+# (при отчёте «во всех слоях»), и ре-ран protect молча возвращал его в whitelist.
+conf_norm() { tr ', \t' '\n\n\n' | nonempty | while IFS= read -r x; do norm "$x"; echo; done | paste -sd, -; }
 conf_set() {   # conf_set <csv> — переписать WHITELIST= в protect.conf (none = пусто)
     local v="${1:-none}" tmp
     [[ -f "$CONF" ]] || { umask 077; : > "$CONF"; }
@@ -2279,7 +2286,7 @@ case "$cmd" in
             mkdir -p "$STATE_DIR"; exec 9>"$STATE_DIR/protect.lock"
             flock -n 9 || die "идёт прогон protect (лок $STATE_DIR/protect.lock) — повтори после него"
         fi
-        cur="$(conf_list)"; [[ "$cur" == none ]] && cur=""
+        cur="$(conf_list | conf_norm)"; [[ "$cur" == none ]] && cur=""
         e4="$(file_elems 4)"; e6="$(file_elems 6)"
         live_add=(); live_del=()
         for a in "$@"; do
