@@ -536,19 +536,59 @@ cs_allowlist() {
         ' "$f"
     done | sed -E 's#/32$##; s#/128$##' | sort -u
 }
-# wl_covered <адрес|сеть> <allowlist (по строке)> — прикрыт ли адрес (v4 — с учётом CIDR:
-# сеть прикрыта, если её адрес входит в сеть allowlist с префиксом не длиннее; v6 — точно)
-wl_covered() {
-    local e="$1" a pe pa
-    while IFS= read -r a; do
-        [[ -n "$a" ]] || continue
-        [[ "$a" == "$e" ]] && return 0
-        [[ "$e" == *:* || "$a" == *:* || "$a" != */* ]] && continue
-        pa="${a##*/}"; pe=32; [[ "$e" == */* ]] && pe="${e##*/}"
-        [[ "$pa" =~ ^[0-9]+$ && "$pe" =~ ^[0-9]+$ ]] && (( pa <= pe )) || continue
-        ip4_in_cidr "${e%%/*}" "$a" && return 0
-    done <<<"$2"
-    return 1
+# wl_set_elems <набор> — элементы живого whitelist (inet na_filter) так, как их печатает nft.
+# Наборы объявлены с auto-merge: соседние элементы ядро склеивает, и склейку, не выровненную в
+# префикс (три соседних адреса), nft показывает диапазоном a-b — он остаётся одним элементом
+# (nft_set_elems отдал бы только концы, и середина диапазона выпала бы из сверки).
+wl_set_elems() {
+    nft list set inet na_filter "$1" 2>/dev/null | sed -n '/elements = {/,/^[[:space:]]*}/p' \
+      | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+|-([0-9]{1,3}\.){3}[0-9]{1,3})?|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}(/[0-9]+)?' \
+      | sort -u
+}
+# wl_uncovered <проверяемые> <эталон> (оба — по элементу в строке) — элементы первого списка,
+# НЕ покрытые ОБЪЕДИНЕНИЕМ второго: v4 — интервалами (адрес, CIDR, диапазон a-b), v6 — точным
+# совпадением (интервальных v6-вайтлистов на флоте нет). Слои whitelist сверяются так, а не
+# текстом: живой набор склеен auto-merge'ем (203.0.113.4 + .5 → 203.0.113.4/31, две /25 → /24,
+# адрес внутри CIDR пропадает), а в na_filter.nft, protect.conf и allowlist CrowdSec те же адреса
+# записаны как задал оператор. До v4.3 comm объявлял склейку дрейфом: ▲ «пропадут при ребуте»,
+# «НЕ переживёт ре-ран», «не прикрыт в CrowdSec» на здоровой ноде.
+wl_uncovered() {
+    { printf '%s\n' "$2"; echo '--'; printf '%s\n' "$1"; } | awk '
+        function ip4(s,  o, i) {
+            if (split(s, o, ".") != 4) return -1
+            for (i = 1; i <= 4; i++) if (o[i] !~ /^[0-9]+$/ || o[i] + 0 > 255) return -1
+            return ((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4]
+        }
+        # rng(e): 1 — e это IPv4 (адрес, CIDR или диапазон a-b), границы — в L/H
+        function rng(e,  b, p, m) {
+            if (index(e, "-")) { if (split(e, b, "-") != 2) return 0; L = ip4(b[1]); H = ip4(b[2]); return L >= 0 && H >= L }
+            p = 32
+            if (index(e, "/")) { split(e, b, "/"); e = b[1]; if (b[2] !~ /^[0-9]+$/ || b[2] + 0 > 32) return 0; p = b[2] + 0 }
+            L = ip4(e); if (L < 0) return 0
+            m = 2 ^ (32 - p); L = int(L / m) * m; H = L + m - 1; return 1
+        }
+        $0 == "--" { sep = 1; next }
+        $0 == ""   { next }
+        !sep { if (rng($0)) { n++; lo[n] = L; hi[n] = H } else exact[$0] = 1; next }
+        { chk[++c] = $0 }
+        END {
+            # эталон: сортировка вставками (элементов — десятки) и склейка пересекающихся/соседних
+            for (i = 2; i <= n; i++) {
+                a = lo[i]; b = hi[i]
+                for (j = i - 1; j >= 1 && lo[j] > a; j--) { lo[j + 1] = lo[j]; hi[j + 1] = hi[j] }
+                lo[j + 1] = a; hi[j + 1] = b
+            }
+            k = 0
+            for (i = 1; i <= n; i++) {
+                if (k && lo[i] <= mh[k] + 1) { if (hi[i] > mh[k]) mh[k] = hi[i] }
+                else { k++; ml[k] = lo[i]; mh[k] = hi[i] }
+            }
+            for (i = 1; i <= c; i++) {
+                e = chk[i]; f = (e in exact)
+                if (!f && rng(e)) for (j = 1; j <= k; j++) if (ml[j] <= L && H <= mh[j]) { f = 1; break }
+                if (!f) print e
+            }
+        }'
 }
 
 # ─── Прочее ──────────────────────────────────────────────────────────────────
@@ -683,6 +723,12 @@ cert_scan() {
         done
         [[ "$skip" == 1 ]] && continue
         cert_retired "$cf" && continue
+        # certificates/local/ в хранилище Caddy — серты ВСТРОЕННОГО CA (`tls internal`, сайты
+        # на localhost/IP): живут 12 ч и перевыпускаются самим Caddy за треть срока, то есть
+        # ВСЕГДА «истекают в ближайшие сутки». На панели с catch-all `tls internal` это был
+        # вечный ✘ «renewal сломан?» и cert_min_days=0 в мониторинге (без активного Caddy — ▲
+        # «брошенный»). Публичным TLS они не являются; явно заданный путь смотрим как есть.
+        [[ "$src" == g && "$cf" == */caddy/certificates/local/* ]] && continue
         out="$(openssl x509 -noout -enddate -subject -nameopt RFC2253 -in "$cf" 2>/dev/null)"
         cend="$(sed -n 's/^notAfter=//p' <<<"$out")"; [[ -n "$cend" ]] || continue
         cn="$(sed -nE 's/^subject=.*CN=([^,]+).*/\1/p' <<<"$out")"
@@ -791,8 +837,9 @@ emit_json() {
     uln="$(ulimit -n 2>/dev/null || echo 0)"; [[ "$uln" =~ ^[0-9]+$ ]] || uln=0   # RLIMIT=infinity → "unlimited" сломал бы JSON-число
     minsnd="$(val net.ipv4.tcp_min_snd_mss)"; minsnd="${minsnd:-0}"
     mtuprobe="$(val net.ipv4.tcp_mtu_probing)"; mtuprobe="${mtuprobe:-0}"
-    # только established: отмирающие сокеты (TIME-WAIT и пр.) давали ложный «коллапс»
-    collapsed="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
+    # только established: отмирающие сокеты (TIME-WAIT и пр.) давали ложный «коллапс»;
+    # только поле mss: (send-MSS), а не rcvmss:/advmss: — см. секцию MSS отчёта
+    collapsed="$(ss -tin state established 2>/dev/null | grep -oE '[[:space:]]mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
     # CPU steal: окно 3 с + среднее с загрузки (секундный семпл был шумом)
     steal=0; stealb=0
     [[ -r /proc/stat ]] && read -r steal stealb <<<"$(cpu_steal_measure "$( [[ "$NA_FAST" == 1 ]] && echo 1 || echo 3)")"
@@ -907,11 +954,11 @@ emit_json() {
     # protect.conf — они не переживут ре-ран protect (−1 = conf нет, сверять не с чем)
     wdc=-1
     if [[ -f "$CONF_DIR/protect.conf" ]]; then
-        wl_live="$(nft_set_elems inet na_filter whitelist_v4 2>/dev/null | sed -E 's#/32$##' | sort -u)"
+        wl_live="$(wl_set_elems whitelist_v4 | sed -E 's#/32$##' | sort -u)"
         wl_conf="$(conf_val "$CONF_DIR/protect.conf" WHITELIST \
                    | tr ',' '\n' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
-        wdc="$(comm -23 <(printf '%s\n' "$wl_live" | grep -v '^$' | sort -u) \
-                        <(printf '%s\n' "$wl_conf" | grep -v '^$' | sort -u) 2>/dev/null | grep -c .)"
+        # покрытием, а не текстом: живой набор склеен auto-merge (см. wl_uncovered)
+        wdc="$(wl_uncovered "$wl_live" "$wl_conf" | grep -c .)"
         [[ "$wdc" =~ ^[0-9]+$ ]] || wdc=-1
     fi
     # сохранённый conf пиннит дефолты той версии, при которой ноду настраивали
@@ -954,13 +1001,10 @@ emit_json() {
     wdcs=-1
     if [[ "$fw" == true ]] && { command -v cscli >/dev/null 2>&1 || [[ -d /etc/crowdsec ]]; }; then
         wdcs=0
-        wl_all="$( { nft_set_elems inet na_filter whitelist_v4; nft_set_elems inet na_filter whitelist_v6; } 2>/dev/null \
+        wl_all="$( { wl_set_elems whitelist_v4; wl_set_elems whitelist_v6; } \
                    | sed -E 's#/32$##; s#/128$##' | sort -u)"
         csal="$(cs_allowlist)"
-        while IFS= read -r tmpv; do
-            [[ -n "$tmpv" ]] || continue
-            wl_covered "$tmpv" "$csal" || wdcs=$((wdcs+1))
-        done <<<"$wl_all"
+        wdcs="$(wl_uncovered "$wl_all" "$csal" | grep -c .)"; [[ "$wdcs" =~ ^[0-9]+$ ]] || wdcs=0
     fi
     # опубликованные через DNAT порты и защищает ли их na_filter (dnat_guard: −1 = нет ключа)
     dnp="$(dnat_ports)"
@@ -1056,10 +1100,12 @@ B
     local exts="TCPLostRetransmit TCPSlowStartRetrans TCPSynRetrans TCPTimeouts TCPSackRecovery TCPSpuriousRtxHostQueues TCPBacklogDrop TCPRcvQDrop"
     declare -A E0
     for k in $exts; do v="$(_tcpext "$k")"; E0[$k]="${v:-0}"; done
-    local qd0 qo0 qr0 rx0 tx0 eth0f=""
+    local qd0 qo0 qr0 rx0 tx0 eth0s=""
     qd0="$(_tcq "$IFACE" dropped)"; qo0="$(_tcq "$IFACE" overlimits)"; qr0="$(_tcq "$IFACE" requeues)"
     rx0="$(_softirq NET_RX)"; tx0="$(_softirq NET_TX)"
-    command -v ethtool >/dev/null 2>&1 && { eth0f="$(mktemp)"; ethtool -S "$IFACE" 2>/dev/null > "$eth0f"; }
+    # снимок NIC — в переменную, а не во временный файл: diagnose пишет на диск только
+    # diag-counters.last, а файл из mktemp, прерванный Ctrl-C на окне, оставался в /tmp
+    command -v ethtool >/dev/null 2>&1 && eth0s="$(ethtool -S "$IFACE" 2>/dev/null)"
 
     sleep "$win"
 
@@ -1119,11 +1165,11 @@ I
     printf "   qdisc: dropped +%s  overlimits +%s  requeues +%s\n" "$(( ${qd1:-0}-${qd0:-0} ))" "$(( ${qo1:-0}-${qo0:-0} ))" "$(( ${qr1:-0}-${qr0:-0} ))"
     rx1="$(_softirq NET_RX)"; tx1="$(_softirq NET_TX)"
     printf "   softirq: NET_RX +%s  NET_TX +%s\n" "$(( ${rx1:-0}-${rx0:-0} ))" "$(( ${tx1:-0}-${tx0:-0} ))"
-    if [[ -n "$eth0f" ]]; then
-        local eth1f; eth1f="$(mktemp)"; ethtool -S "$IFACE" 2>/dev/null > "$eth1f"
-        awk 'NR==FNR{a[$1]=$2;next}{if($2+0>a[$1]+0 && (($1) in a)) printf "   nic: %-30s +%d\n",$1,$2-a[$1]}' "$eth0f" "$eth1f" \
+    if [[ -n "$eth0s" ]]; then
+        local eth1s; eth1s="$(ethtool -S "$IFACE" 2>/dev/null)"
+        awk 'NR==FNR{a[$1]=$2;next}{if($2+0>a[$1]+0 && (($1) in a)) printf "   nic: %-30s +%d\n",$1,$2-a[$1]}' \
+            <(printf '%s\n' "$eth0s") <(printf '%s\n' "$eth1s") \
           | grep -iE 'drop|err|miss|fifo|nobuf|over' | head -8
-        rm -f "$eth0f" "$eth1f"
     fi
 
     title "6) Очереди и TCP-фичи"
@@ -1135,7 +1181,7 @@ I
     info "sack=$(val net.ipv4.tcp_sack) dsack=$(val net.ipv4.tcp_dsack) ts=$(val net.ipv4.tcp_timestamps) frto=$(val net.ipv4.tcp_frto) recovery=$(val net.ipv4.tcp_recovery)"
     local msnd mtup collapsed
     msnd="$(val net.ipv4.tcp_min_snd_mss)"; mtup="$(val net.ipv4.tcp_mtu_probing)"
-    collapsed="$(ss -tin 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++}END{print c+0}')"
+    collapsed="$(ss -tin 2>/dev/null | grep -oE '[[:space:]]mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++}END{print c+0}')"
     info "min_snd_mss=${msnd:-?} mtu_probing=${mtup:-?} collapsed_sockets=${collapsed:-0}"
 
     title "Вердикт"
@@ -1340,7 +1386,10 @@ else wrn "tcp_min_snd_mss = ${MINSND:-?} (при mtu_probing=1 рекоменд.
 # объявить коллапс на совершенно здоровой ноде. И смотрим долю: единичный пир с маленьким
 # MSS — это его канал, а не наша беда. Настоящий коллапс — это когда пол опущен
 # (min_snd_mss мал) или просели сразу многие соединения.
-COLLAPSED="$(ss -tin state established 2>/dev/null | grep -oE 'mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
+# Считаем ТОЛЬКО поле mss: (send-MSS — его и ужимает коллапс). В той же строке `ss -i` есть
+# advmss: и rcvmss: (оценка MSS пира по входящим; у пира с мелкими сегментами без PSH — до 88),
+# и голый 'mss:[0-9]+' ловил все три: сокет с send-MSS 1400 и rcvmss:120 шёл в «обрезанные».
+COLLAPSED="$(ss -tin state established 2>/dev/null | grep -oE '[[:space:]]mss:[0-9]+' | awk -F: '$2>0 && $2<256{c++} END{print c+0}')"
 EST_TOTAL="$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"
 [[ "${EST_TOTAL:-0}" =~ ^[0-9]+$ ]] || EST_TOTAL=0
 if [[ "${COLLAPSED:-0}" -eq 0 ]]; then
@@ -1361,8 +1410,10 @@ if [[ -n "$NIC" ]]; then
     info "NIC: $NIC   driver: ${DRV:-?}   txqueuelen: $(cat /sys/class/net/$NIC/tx_queue_len 2>/dev/null || echo '?')"
     RXQ=$(ls -d /sys/class/net/"$NIC"/queues/rx-* 2>/dev/null | wc -l | tr -d " ")
     RPS_ON=0
+    # маска на >32 CPU — группы по 32 бита через запятую («00000000,00000000»): '^0+$' её не
+    # узнавал, и выключенный RPS шёл как ✔ «RPS включён» (а юнит — как «активен»)
     for q in /sys/class/net/"$NIC"/queues/rx-*/rps_cpus; do
-        [[ -f "$q" ]] && grep -qvE '^0+$' "$q" 2>/dev/null && RPS_ON=1
+        [[ -f "$q" ]] && grep -qvE '^[0,]+$' "$q" 2>/dev/null && RPS_ON=1
     done
     [[ "$RXQ" -gt 1 ]] && info "RX-очередей: $RXQ (multi-queue)" || info "RX-очередей: $RXQ (single-queue — RPS критичен)"
     # RX-очередей не меньше, чем ядер: приём уже размазан аппаратно (RSS), RPS поверх
@@ -1494,10 +1545,11 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
     # довольна → первый ре-ран из другой сессии его молча выкинул» (issue #38).
     # Наборы na_fleet_* / na_nodeport_wl_* здесь ни при чём — у них свой жизненный цикл.
     NFT_FILE="$CONF_DIR/na_filter.nft"
-    LIVE_WL="$(nft_set_elems inet na_filter whitelist_v4 2>/dev/null | sed -E 's#/32$##' | sort -u)"
+    # сверки — покрытием, а не текстом: живой набор склеен auto-merge (см. wl_uncovered)
+    LIVE_WL="$(wl_set_elems whitelist_v4 | sed -E 's#/32$##' | sort -u)"
     if [[ -r "$NFT_FILE" ]]; then
         FILE_WL="$(awk '/set whitelist_v4/,/}/' "$NFT_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
-        DRIFT_L="$(comm -23 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$FILE_WL" | grep -v '^$' | sort -u) 2>/dev/null)"
+        DRIFT_L="$(wl_uncovered "$LIVE_WL" "$FILE_WL")"
         DRIFT="$(printf '%s\n' "$DRIFT_L" | grep -c .)"; [[ "$DRIFT" =~ ^[0-9]+$ ]] || DRIFT=0
         if [[ "$DRIFT" -gt 0 ]]; then
             wrn "в живом whitelist_v4 на $DRIFT адрес(ов) больше, чем в $NFT_FILE — они пропадут при ребуте: $(printf '%s\n' "$DRIFT_L" | paste -sd' ' -)"
@@ -1506,14 +1558,14 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
         fi
         # обратная сторона: в файле есть, в памяти нет — удалён руками на ходу; вернётся
         # после ребута или reload na-firewall (расхождение, а не авария)
-        FBACK="$(comm -13 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$FILE_WL" | grep -v '^$' | sort -u) 2>/dev/null | paste -sd' ' -)"
+        FBACK="$(wl_uncovered "$FILE_WL" "$LIVE_WL" | paste -sd' ' -)"
         [[ -n "$FBACK" ]] && info "в $NFT_FILE, но не в живом whitelist_v4: $FBACK (вернутся после ребута/reload na-firewall)"
     fi
     if [[ -f "$CONF_DIR/protect.conf" ]]; then
         # conf пишется идиомой `: "${WHITELIST:=…}"` — наивный `^WHITELIST=` не матчит
         CONF_WL="$(conf_val "$CONF_DIR/protect.conf" WHITELIST \
                    | tr ',' '\n' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sed -E 's#/32$##' | sort -u)"
-        CDRIFT_L="$(comm -23 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$CONF_WL" | grep -v '^$' | sort -u) 2>/dev/null)"
+        CDRIFT_L="$(wl_uncovered "$LIVE_WL" "$CONF_WL")"
         CDRIFT="$(printf '%s\n' "$CDRIFT_L" | grep -c .)"; [[ "$CDRIFT" =~ ^[0-9]+$ ]] || CDRIFT=0
         if [[ "$CDRIFT" -gt 0 ]]; then
             SSH_IP_NOW="$(ssh_client_ip || true)"
@@ -1526,7 +1578,7 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
         fi
         # обратная сторона: в conf есть, в памяти нет — кто-то удалил элемент руками,
         # ре-ран protect вернёт его (не авария, но расхождение стоит знать)
-        CBACK="$(comm -13 <(printf '%s\n' "$LIVE_WL" | grep -v '^$' | sort -u) <(printf '%s\n' "$CONF_WL" | grep -v '^$' | sort -u) 2>/dev/null | paste -sd' ' -)"
+        CBACK="$(wl_uncovered "$CONF_WL" "$LIVE_WL" | paste -sd' ' -)"
         [[ -n "$CBACK" ]] && info "в WHITELIST= из protect.conf, но не в живом whitelist_v4: $CBACK (вернутся ре-раном protect)"
     fi
     # 4-й слой — ЭФФЕКТИВНЫЙ allowlist CrowdSec (все s02-enrich/*.yaml с whitelist:).
@@ -1535,20 +1587,16 @@ if nft -t list table inet na_filter >/dev/null 2>&1; then
     # hub'а управления был в whitelist, но не в allowlist CrowdSec).
     if command -v cscli >/dev/null 2>&1 || [[ -d /etc/crowdsec/parsers ]]; then
         CS_AL="$(cs_allowlist)"
-        WL_ALL="$( { nft_set_elems inet na_filter whitelist_v4; nft_set_elems inet na_filter whitelist_v6; } 2>/dev/null \
+        WL_ALL="$( { wl_set_elems whitelist_v4; wl_set_elems whitelist_v6; } \
                    | sed -E 's#/32$##; s#/128$##' | sort -u)"
-        CS_MISS=""
-        while IFS= read -r _w; do
-            [[ -n "$_w" ]] || continue
-            wl_covered "$_w" "$CS_AL" || CS_MISS+="${CS_MISS:+ }$_w"
-        done <<<"$WL_ALL"
+        CS_MISS="$(wl_uncovered "$WL_ALL" "$CS_AL" | paste -sd' ' -)"
         CS_EXTRA=""
         while IFS= read -r _w; do
             [[ -n "$_w" ]] || continue
             # хабовый whitelists.yaml прикрывает приватные сети — это не дрейф
             case "$_w" in 127.*|::1|10.0.0.0/8|172.16.0.0/12|192.168.0.0/16|fe80::/10|fc00::/7) continue;; esac
-            grep -qxF -- "$_w" <<<"$WL_ALL" || CS_EXTRA+="${CS_EXTRA:+ }$_w"
-        done <<<"$CS_AL"
+            CS_EXTRA+="${CS_EXTRA:+ }$_w"
+        done < <(wl_uncovered "$CS_AL" "$WL_ALL")
         unset _w
         if [[ -n "$CS_MISS" ]] && nft list table ip crowdsec >/dev/null 2>&1; then
             wrn "whitelist na_filter не прикрыт в CrowdSec: $CS_MISS — CrowdSec может их забанить, а его bouncer режет раньше na_filter. Ре-ран protect перепишет na-whitelist.yaml (или добавь в /etc/crowdsec/parsers/s02-enrich/)"
@@ -2085,7 +2133,10 @@ if journal_volatile; then
     # журнал в RAM: «мелкий» он из-за ребута, а не из-за вытеснения — PORTSCAN тут ни при чём
     wrn "журнал volatile (только /run/log/journal, нет /var/log/journal): история не переживает ребут${JSPAN:+, сейчас ${JSPAN}ч} — ре-ран optimize (v4.2 включает Storage=persistent) или mkdir -p /var/log/journal"
 elif [[ "$JSPAN" =~ ^[0-9]+$ ]]; then
-    if [[ "$JSPAN" -lt 48 && "$UP_H" -ge 0 && $(( UP_H - JSPAN )) -le 1 ]]; then
+    # «≈» — в обе стороны. Журнал ГЛУБЖЕ аптайма помнит прошлую загрузку, и если он всё равно
+    # меньше 48 ч — это вытеснение: после ребута (2 ч аптайма, 30 ч журнала) условие в одну
+    # сторону выдавало «прошлых загрузок нет» и гасило ▲ ровно в те сутки, когда в отчёт смотрят
+    if [[ "$JSPAN" -lt 48 && "$UP_H" -ge 0 && $(( UP_H - JSPAN )) -le 1 && $(( JSPAN - UP_H )) -le 1 ]]; then
         # самая старая запись ≈ момент загрузки: журнал держит всю текущую загрузку, а
         # прошлых в нём нет (почищен/новый каталог) — это не вытеснение
         info "глубина журнала ${JSPAN}ч ≈ аптайму: журнал держит всю текущую загрузку, прошлых загрузок в нём нет"
