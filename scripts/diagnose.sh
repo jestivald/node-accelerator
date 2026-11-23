@@ -1100,10 +1100,12 @@ B
     local exts="TCPLostRetransmit TCPSlowStartRetrans TCPSynRetrans TCPTimeouts TCPSackRecovery TCPSpuriousRtxHostQueues TCPBacklogDrop TCPRcvQDrop"
     declare -A E0
     for k in $exts; do v="$(_tcpext "$k")"; E0[$k]="${v:-0}"; done
-    local qd0 qo0 qr0 rx0 tx0 eth0f=""
+    local qd0 qo0 qr0 rx0 tx0 eth0s=""
     qd0="$(_tcq "$IFACE" dropped)"; qo0="$(_tcq "$IFACE" overlimits)"; qr0="$(_tcq "$IFACE" requeues)"
     rx0="$(_softirq NET_RX)"; tx0="$(_softirq NET_TX)"
-    command -v ethtool >/dev/null 2>&1 && { eth0f="$(mktemp)"; ethtool -S "$IFACE" 2>/dev/null > "$eth0f"; }
+    # снимок NIC — в переменную, а не во временный файл: diagnose пишет на диск только
+    # diag-counters.last, а файл из mktemp, прерванный Ctrl-C на окне, оставался в /tmp
+    command -v ethtool >/dev/null 2>&1 && eth0s="$(ethtool -S "$IFACE" 2>/dev/null)"
 
     sleep "$win"
 
@@ -1163,11 +1165,11 @@ I
     printf "   qdisc: dropped +%s  overlimits +%s  requeues +%s\n" "$(( ${qd1:-0}-${qd0:-0} ))" "$(( ${qo1:-0}-${qo0:-0} ))" "$(( ${qr1:-0}-${qr0:-0} ))"
     rx1="$(_softirq NET_RX)"; tx1="$(_softirq NET_TX)"
     printf "   softirq: NET_RX +%s  NET_TX +%s\n" "$(( ${rx1:-0}-${rx0:-0} ))" "$(( ${tx1:-0}-${tx0:-0} ))"
-    if [[ -n "$eth0f" ]]; then
-        local eth1f; eth1f="$(mktemp)"; ethtool -S "$IFACE" 2>/dev/null > "$eth1f"
-        awk 'NR==FNR{a[$1]=$2;next}{if($2+0>a[$1]+0 && (($1) in a)) printf "   nic: %-30s +%d\n",$1,$2-a[$1]}' "$eth0f" "$eth1f" \
+    if [[ -n "$eth0s" ]]; then
+        local eth1s; eth1s="$(ethtool -S "$IFACE" 2>/dev/null)"
+        awk 'NR==FNR{a[$1]=$2;next}{if($2+0>a[$1]+0 && (($1) in a)) printf "   nic: %-30s +%d\n",$1,$2-a[$1]}' \
+            <(printf '%s\n' "$eth0s") <(printf '%s\n' "$eth1s") \
           | grep -iE 'drop|err|miss|fifo|nobuf|over' | head -8
-        rm -f "$eth0f" "$eth1f"
     fi
 
     title "6) Очереди и TCP-фичи"

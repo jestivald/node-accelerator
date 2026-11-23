@@ -35,7 +35,8 @@
 #       глубину журнала пропадал); серты встроенного CA Caddy (`tls internal`, 12 ч) — не
 #       вечный ✘ «renewal сломан»; слои whitelist сверяются покрытием, а не текстом (живой
 #       набор с auto-merge склеивает соседние адреса — это не дрейф); MSS-коллапс — только
-#       по полю mss:, а не rcvmss:/advmss:; маска RPS на >32 CPU (группы через запятую).
+#       по полю mss:, а не rcvmss:/advmss:; маска RPS на >32 CPU (группы через запятую);
+#       --retrans не пишет временных файлов (единственная запись — diag-counters.last).
 #
 # Не требует root/сети/nft/docker. Запуск: bash tests/diagnose-unit.sh
 set -euo pipefail
@@ -1279,6 +1280,24 @@ printf '00000000,0000000f\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
 env TERM=dumb "$WBASH" "$DIAG" > "$T/o27b.txt" 2>/dev/null || true
 grep_ok  "ненулевая маска из двух групп — ✔"               "✔  RPS включён" "$T/o27b.txt"
 printf '0\n' > "$T/sys/class/net/eth0/queues/rx-0/rps_cpus"
+
+echo "== 28. --retrans ничего не пишет на диск (v4.3) =="
+# diagnose read-only: единственная запись — diag-counters.last. --retrans снимал `ethtool -S`
+# до окна во временный файл (mktemp в /tmp) и удалял его только в конце: прерванный на окне
+# (Ctrl-C за 20 с ожидания) прогон оставлял файл. Стаб mktemp пишет журнал вызовов.
+cat > "$BIN/ethtool" <<ETH
+#!/bin/sh
+[ "\$1" = "-S" ] || exit 0
+n=\$(cat "$T/ethtool.n" 2>/dev/null || echo 0); n=\$((n+1)); echo "\$n" > "$T/ethtool.n"
+printf 'NIC statistics:\n     rx_dropped: %d\n     tx_packets: 100\n' \$(( (n-1)*5 ))
+ETH
+printf '#!/bin/sh\necho "$*" >> "%s/mktemp.calls"\nexec /usr/bin/mktemp "$@"\n' "$T" > "$BIN/mktemp"
+chmod +x "$BIN/ethtool" "$BIN/mktemp"; rm -f "$T/mktemp.calls" "$T/ethtool.n"
+env TERM=dumb "$WBASH" "$DIAG" --retrans --window 5 > "$T/o28.txt" 2>/dev/null || true
+check   "--retrans: временных файлов не создаёт (mktemp не зовётся)" 0 \
+        "$(if [ -f "$T/mktemp.calls" ]; then wc -l < "$T/mktemp.calls" | tr -d ' '; else echo 0; fi)"
+grep_ok "--retrans: дропы NIC за окно по-прежнему видны"          "nic: rx_dropped:" "$T/o28.txt"
+rm -f "$BIN/ethtool" "$BIN/mktemp" "$T/mktemp.calls" "$T/ethtool.n"
 
 echo
 echo "  прогон: $PASS ok, $FAIL fail"
