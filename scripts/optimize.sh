@@ -1179,8 +1179,25 @@ swap_size_mb() {   # "2G" / "512M" / "2048" → мегабайты (для dd-ф
 make_swapfile() {
     local size="${REMNAWAVE_SWAP_SIZE:-2G}" mb
     mb="$(swap_size_mb "$size")"
+    # голое число — мегабайты (так его читает swap_size_mb и dd-фоллбэк), а fallocate счёл бы
+    # его байтами: `REMNAWAVE_SWAP_SIZE=2048` давал файл в 2 КБ, mkswap падал, swap не создавался
+    [[ "$size" =~ ^[0-9]+$ ]] && size="${size}M"
     if [[ $'\n'"$(swapon --show=NAME --noheadings 2>/dev/null)"$'\n' == *$'\n'/swapfile$'\n'* ]]; then
         info "/swapfile уже активен — пропускаю"; return 0
+    fi
+    # Неактивный /swapfile уже лежит. Наш (метка прошлого прогона) — просто включаем. Чужой не
+    # трогаем: до v4.3 fallocate+mkswap переформатировали его, метка объявляла его нашим, и
+    # `rollback optimize` потом удалял чужой swap вместе с его строкой в fstab.
+    if [[ -e /swapfile ]]; then
+        if [[ -f "$STATE_DIR/swapfile.created" ]]; then
+            if swapon /swapfile 2>/dev/null; then
+                grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+                ok "/swapfile (создан прошлым прогоном) включён"; return 0
+            fi
+            warn "/swapfile (создан прошлым прогоном) не включился — swapon /swapfile, проверь dmesg"; return 1
+        fi
+        info "/swapfile уже есть, но не активен — чужой файл не трогаю (включить: swapon /swapfile)"
+        return 0
     fi
     if ! fallocate -l "$size" /swapfile 2>/dev/null; then
         rm -f /swapfile

@@ -727,5 +727,49 @@ expect "THP в ядре нет: rc=0" test "$rc" -eq 0
 expect_not "THP в ядре нет — ✔ не печатается" grep -q 'THP отключён' "$T/out"
 expect "…сказано, что отключать нечего" grep -q 'THP в этом ядре нет' "$T/out"
 
+# ════════════════════════════════════════════════════════════════════════════
+echo "== 8. swapfile: размер без единицы — МБ; чужой неактивный /swapfile не трогаем (v4.3) =="
+# ════════════════════════════════════════════════════════════════════════════
+SW="$T/sw8"; mkdir -p "$SW/state" "$SW/bin"; : > "$SW/fstab"
+{ awk '/^swap_size_mb\(\) \{/,/^\}/' "$OPT"; awk '/^make_swapfile\(\) \{/,/^\}/' "$OPT"; } \
+  | "$REAL_SED" -e "s#\([^R]\)/swapfile#\1$SW/swapfile#g" -e "s#/etc/fstab#$SW/fstab#g" > "$SW/fn.sh"   # не $STATE_DIR/swapfile.created
+grep -q '^make_swapfile() {' "$SW/fn.sh" || { echo "  ✘ не смог извлечь make_swapfile из optimize.sh"; fail=1; }
+# стабы: каждый вызов — в журнал; fallocate создаёт файл, swapon «включает» (STUB_SWAPON=0 — отказ)
+for c in fallocate dd mkswap swapon chmod; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\n' "$c" "$SW" > "$SW/bin/$c"
+done
+printf 'case "$1" in -l) : > "$3";; esac\n' >> "$SW/bin/fallocate"
+printf '[ "$1" = --show=NAME ] && exit 0\n[ "${STUB_SWAPON:-1}" = 1 ]\n' >> "$SW/bin/swapon"
+printf '#!/bin/sh\necho 2026-11-23T00:00:00+00:00\n' > "$SW/bin/date"   # GNU `date -Is`; на macOS BSD date
+chmod +x "$SW/bin/"*
+sw_run() {   # sw_run <REMNAWAVE_SWAP_SIZE> — вывод make_swapfile в $SW/out
+    : > "$SW/calls"
+    PATH="$SW/bin:$PATH" REMNAWAVE_SWAP_SIZE="$1" "$WBASH" -c "set -euo pipefail
+. '$REPO_ROOT/scripts/lib/common.sh'
+STATE_DIR='$SW/state'
+. '$SW/fn.sh'
+make_swapfile" > "$SW/out" 2>&1 || true
+}
+sw_run 2048
+expect "REMNAWAVE_SWAP_SIZE=2048 → fallocate -l 2048M (а не 2048 байт)" grep -q "fallocate -l 2048M $SW/swapfile" "$SW/calls"
+expect "…и это наш файл (метка)" test -f "$SW/state/swapfile.created"
+rm -f "$SW/swapfile" "$SW/state/swapfile.created"
+sw_run 2G
+expect "REMNAWAVE_SWAP_SIZE=2G — как было" grep -q "fallocate -l 2G $SW/swapfile" "$SW/calls"
+rm -f "$SW/state/swapfile.created"
+# чужой неактивный /swapfile (файл есть, метки нет)
+echo "operator-swap" > "$SW/swapfile"
+sw_run 2G
+expect_not "чужой /swapfile: fallocate не зовётся" grep -q '^fallocate' "$SW/calls"
+expect_not "чужой /swapfile: mkswap не переформатирует" grep -q '^mkswap' "$SW/calls"
+expect "чужой /swapfile: содержимое на месте" grep -qx operator-swap "$SW/swapfile"
+expect_not "чужой /swapfile: метки «наш» нет (rollback его не удалит)" test -f "$SW/state/swapfile.created"
+expect "чужой /swapfile: сказано, как включить" grep -q 'чужой файл не трогаю' "$SW/out"
+# наш (метка есть), но неактивен — только swapon
+date -Is > "$SW/state/swapfile.created"
+sw_run 2G
+expect "наш неактивный /swapfile: swapon без mkswap" grep -q "^swapon $SW/swapfile" "$SW/calls"
+expect_not "наш неактивный /swapfile: не переформатируется" grep -q '^mkswap' "$SW/calls"
+
 if [ "$fail" -ne 0 ]; then echo "OPTIMIZE-UNIT: FAIL"; exit 1; fi
 echo "OPTIMIZE-UNIT: OK (sysctl: виновник назван, резерв портов, снимок только при первом прогоне; journald 10-*, persistent; откат runtime; XanMod: Secure Boot//boot/initrd/драйвер NIC; default_iface после dev; apt ждёт лок)"
